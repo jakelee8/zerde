@@ -286,5 +286,7 @@ What they refuse, and why:
 - a JSON text that starts with a byte order mark
 
 NaN and the infinities are values in CBOR (RFC 8949 §3.3) and are read into float fields and written;
-JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteFloat`).
+JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteFloat`). A profile that
+forbids them in CBOR sets `ReadConfig.refuse_non_finite`: any NaN or infinity, in a field, a skipped
+value or a key, is then `error.NonFiniteFloat`.
 

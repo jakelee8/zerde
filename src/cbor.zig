@@ -39,6 +39,10 @@ const self_described_tag = 55799;
 pub const ReadConfig = struct {
     max_input_bytes: usize = 16 * 1024 * 1024,
     borrow_strings: bool = false,
+    /// Refuse NaN and the infinities in any float, including in skipped values and keys
+    /// (`error.NonFiniteFloat`). RFC 8949 §3.3 makes them values, so the default reads them; a
+    /// profile that forbids them turns this on.
+    refuse_non_finite: bool = false,
 };
 pub const WriteConfig = struct {
     /// Write the core deterministic encoding of RFC 8949 §4.2.1, so equal values produce equal
@@ -393,6 +397,7 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// `.integer` only (see `typed.zig`).
         pub fn readNumber(self: *Self) !Number {
             const header = try self.readHeader();
+            try self.checkFloat(header);
             return switch (header.major) {
                 0 => .{ .integer = @as(i128, @intCast(header.value)) },
                 1 => .{ .integer = -@as(i128, @intCast(header.value)) - 1 },
@@ -636,7 +641,8 @@ pub fn CborDeserializer(comptime Config: type) type {
             while (header.major == 6) header = try parseHeader(self.input, &self.index);
 
             switch (header.major) {
-                0, 1, 7 => {},
+                0, 1 => {},
+                7 => try self.checkFloat(header),
                 2, 3 => {
                     const token = try self.finishString(self.allocator, header);
                     token.deinit(self.allocator);
@@ -670,6 +676,19 @@ pub fn CborDeserializer(comptime Config: type) type {
             }
         }
 
+        /// Refuses a NaN or an infinity when the config says to: the exponent field is all ones.
+        fn checkFloat(self: *Self, header: Header) !void {
+            if (comptime !meta.hasField(Config, "refuse_non_finite")) return;
+            if (!self.cfg.refuse_non_finite or header.major != 7) return;
+            const exponent_all_ones = switch (header.ai) {
+                25 => (header.value >> 10) & 0x1f == 0x1f,
+                26 => (header.value >> 23) & 0xff == 0xff,
+                27 => (header.value >> 52) & 0x7ff == 0x7ff,
+                else => false,
+            };
+            if (exponent_all_ones) return error.NonFiniteFloat;
+        }
+
         /// Whether an indefinite-length container has another item, consuming its break if not.
         fn moreItems(self: *Self) !bool {
             if (self.index >= self.input.len) return error.UnexpectedEndOfInput;
@@ -684,6 +703,7 @@ pub fn CborDeserializer(comptime Config: type) type {
         fn recordKeyItem(self: *Self, depth: usize) anyerror!void {
             const start = self.index;
             const header = try parseHeader(self.input, &self.index);
+            try self.checkFloat(header);
             const record: KeyRecord = switch (header.major) {
                 0 => .{ .kind = .uint, .a = header.value },
                 1 => .{ .kind = .nint, .a = header.value },

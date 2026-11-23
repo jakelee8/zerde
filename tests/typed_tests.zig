@@ -870,3 +870,26 @@ test "composite keys keep their tag numbers and string lengths" {
     // ["a", "bc"] and ["ab", "c"] hold the same bytes and are different keys.
     _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0x82, 0x61, 'a', 0x62, 'b', 'c', 0x00, 0x82, 0x62, 'a', 'b', 0x61, 'c', 0x00 });
 }
+
+// ---- refuse NaN and infinity ----------------------------------------------------------------
+
+test "refuse_non_finite turns NaN and infinity into an error, wherever they are" {
+    const refuse = .{ .refuse_non_finite = true };
+    const nan_half = [_]u8{ 0xa1, 0x61, 'v', 0xf9, 0x7e, 0x00 };
+    const inf_single = [_]u8{ 0xa1, 0x61, 'v', 0xfa, 0xff, 0x80, 0x00, 0x00 };
+    const inf_double = [_]u8{ 0xa1, 0x61, 'v', 0xfb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0 };
+    for ([_][]const u8{ &nan_half, &inf_single, &inf_double }) |input| {
+        try std.testing.expectError(error.NonFiniteFloat, zerde.cbor.parseSliceWith(Real, allocator, input, .{}, refuse));
+        // The default reads them.
+        _ = try zerde.cbor.parseSliceWith(Real, allocator, input, .{}, .{});
+    }
+    // In a skipped value, in a skipped key, and in a dynamic value.
+    try std.testing.expectError(error.NonFiniteFloat, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x61, 'x', 0x81, 0xf9, 0x7c, 0x00 }, .{}, refuse));
+    try std.testing.expectError(error.NonFiniteFloat, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0xf9, 0x7e, 0x00, 0x01 }, .{}, refuse));
+    try std.testing.expectError(error.NonFiniteFloat, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x81, 0xf9, 0x7e, 0x00, 0x01 }, .{}, refuse));
+    // Finite floats of every width are fine.
+    const ok = try zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xf9, 0x3e, 0x00 }, .{}, refuse);
+    try std.testing.expectEqual(@as(f64, 1.5), ok.v);
+    _ = try zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xfa, 0x7f, 0x7f, 0xff, 0xff }, .{}, refuse);
+    _ = try zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xfb, 0x7f, 0xef, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, .{}, refuse);
+}

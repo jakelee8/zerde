@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added CBOR `ReadConfig.refuse_non_finite`: NaN and infinity anywhere in the input are `error.NonFiniteFloat`
 - added `field_order` to the typed-layer config (`.declaration`, `.length_first`, `.bytewise`, `.encoded_key`), settable per call or per type; `.length_first` and `.bytewise` are for text keys, `.encoded_key` is the bytewise order of the encoded keys
 - added CBOR `WriteConfig.deterministic`: the core deterministic encoding of RFC 8949 §4.2.1 (definite-length maps, keys in the bytewise order of their encoded form, which is right for integer and mixed keys as well as text, shortest exact float width, canonical NaN)
 - added `zerde.ByteString`, a variable-length byte string: a CBOR byte string, MessagePack `bin`, BSON binary, and a JSON string in the configured `bytes` encoding; `[]const u8` stays text

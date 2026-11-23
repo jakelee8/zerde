@@ -87,6 +87,13 @@ MUTANTS = [
     ("msgpack.zig", ".integer => castIntValue(T, try self.decodeInteger(tag)),\n                else", ".integer => castIntValue(T, try self.decodeInteger(tag)),\n                .float => castIntValue(T, @as(i128, @intFromFloat(try self.decodeFloat(tag)))),\n                else"),
     ("msgpack.zig", ".float => try typed.narrowFloat(T, try self.decodeFloat(tag)),", ".float => @as(T, @floatCast(try self.decodeFloat(tag))),"),
     ("bson.zig", "self.pending_type orelse return if (self.stack_len == 0 and self.index == 0) .object else error.UnexpectedType;", "self.pending_type orelse return error.UnexpectedType;"),
+    # CBOR refuse_non_finite
+    ("cbor.zig", "25 => (header.value >> 10) & 0x1f == 0x1f,", "25 => false,"),
+    ("cbor.zig", "26 => (header.value >> 23) & 0xff == 0xff,", "26 => false,"),
+    ("cbor.zig", "27 => (header.value >> 52) & 0x7ff == 0x7ff,", "27 => false,"),
+    ("cbor.zig", "                7 => try self.checkFloat(header),", "                7 => {},"),
+    ("cbor.zig", "            const header = try parseHeader(self.input, &self.index);\n            try self.checkFloat(header);\n            const record", "            const header = try parseHeader(self.input, &self.index);\n            const record"),
+    ("cbor.zig", "            const header = try self.readHeader();\n            try self.checkFloat(header);", "            const header = try self.readHeader();"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
