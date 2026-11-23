@@ -77,6 +77,9 @@ pub fn JsonSerializer(comptime Config: type) type {
 
         const Self = @This();
 
+        /// A tagged union is a string or a one-entry object (see `typed.zig`).
+        pub const supports_unions = true;
+
         fn init(writer: *std.Io.Writer, cfg: Config) Self {
             return .{
                 .writer = writer,
@@ -101,7 +104,10 @@ pub fn JsonSerializer(comptime Config: type) type {
             try self.writer.print("{}", .{value});
         }
 
+        /// JSON has no NaN or infinity (RFC 8259 §6), so a float that is neither finite is
+        /// refused instead of written as `nan` or `inf`, which no JSON parser accepts.
         pub fn emitFloat(self: *Self, value: anytype) !void {
+            if (!std.math.isFinite(value)) return error.NonFiniteFloat;
             try self.writer.print("{}", .{value});
         }
 
@@ -111,7 +117,11 @@ pub fn JsonSerializer(comptime Config: type) type {
 
         pub fn emitBytes(self: *Self, value: []const u8) !void {
             switch (bytesEncoding(Config, self.cfg)) {
-                .string => try writeEscapedString(self.writer, value),
+                .string => {
+                    // The raw-string encoding is exact only for UTF-8; any other bytes would write invalid JSON.
+                    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+                    try writeEscapedString(self.writer, value);
+                },
                 .base64 => {
                     try self.writer.writeByte('"');
                     try std.base64.standard.Encoder.encodeWriter(self.writer, value);
@@ -233,6 +243,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
 
         const Self = @This();
 
+        /// A tagged union is a string or a one-entry object (see `typed.zig`).
+        pub const supports_unions = true;
+
         fn initBorrowed(input: []const u8, cfg: Config) Self {
             return .{
                 .input = input,
@@ -327,21 +340,12 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return self.parser.parseNumberToken();
         }
 
+        /// An integer field takes an integer literal only: `1.0` and `1e2` are floats, so they are a
+        /// type error even when their value is whole.
         pub fn readInt(self: *Self, comptime T: type) !T {
             self.parser.skipWhitespace();
             const parsed = try self.parser.parseNumberSlice();
-
-            if (parsed.is_float) {
-                const value = std.fmt.parseFloat(f64, parsed.slice) catch return error.InvalidNumber;
-                const rounded = @round(value);
-                if (rounded != value) return error.UnexpectedType;
-
-                return switch (@typeInfo(T)) {
-                    .comptime_int => @as(T, @intFromFloat(rounded)),
-                    .int => std.math.cast(T, @as(i128, @intFromFloat(rounded))) orelse error.IntegerOverflow,
-                    else => error.UnsupportedType,
-                };
-            }
+            if (parsed.is_float) return error.UnexpectedType;
 
             return switch (@typeInfo(T)) {
                 .comptime_int => std.fmt.parseInt(i128, parsed.slice, 10) catch return error.InvalidNumber,
@@ -358,18 +362,15 @@ pub fn JsonDeserializer(comptime Config: type) type {
             };
         }
 
+        /// A float field takes any number literal. One too large for `T` is `error.FloatOutOfRange`:
+        /// `1e999` must not become infinity, which JSON cannot write and a field cannot mean.
         pub fn readFloat(self: *Self, comptime T: type) !T {
             self.parser.skipWhitespace();
             const parsed = try self.parser.parseNumberSlice();
 
-            if (!parsed.is_float) {
-                const integer = std.fmt.parseInt(i128, parsed.slice, 10) catch return error.InvalidNumber;
-                return @as(T, @floatFromInt(integer));
-            }
-
             return switch (@typeInfo(T)) {
-                .comptime_float => @as(T, @floatCast(std.fmt.parseFloat(f64, parsed.slice) catch return error.InvalidNumber)),
-                .float => std.fmt.parseFloat(T, parsed.slice) catch return error.InvalidNumber,
+                .comptime_float => @as(T, @floatCast(try parseFiniteFloat(f64, parsed.slice))),
+                .float => try parseFiniteFloat(T, parsed.slice),
                 else => error.UnsupportedType,
             };
         }
@@ -462,7 +463,8 @@ pub fn JsonDeserializer(comptime Config: type) type {
             switch (try self.peekKind()) {
                 .null => try self.readNull(),
                 .bool => _ = try self.readBool(),
-                .number => _ = try self.readNumber(),
+                // Skipping checks the grammar and nothing more: a number too large for any type is still JSON.
+                .number => _ = try self.parser.parseNumberSlice(),
                 .bytes => {
                     const token = try self.readString(allocator);
                     token.deinit(allocator);
@@ -586,6 +588,15 @@ fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
     return 16 * 1024 * 1024;
 }
 
+/// Parses a number literal as a float. A literal too large for `T` would round to infinity, which
+/// JSON has no way to write and no field means, so it is `error.FloatOutOfRange`. One too small
+/// rounds to zero or a subnormal, a loss of precision RFC 8259 §6 leaves to the implementation.
+fn parseFiniteFloat(comptime T: type, slice: []const u8) error{ InvalidNumber, FloatOutOfRange }!T {
+    const value = std.fmt.parseFloat(T, slice) catch return error.InvalidNumber;
+    if (std.math.isInf(value)) return error.FloatOutOfRange;
+    return value;
+}
+
 fn effectiveBorrowStrings(cfg: anytype) bool {
     if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return cfg.borrow_strings;
     return false;
@@ -609,13 +620,15 @@ const Parser = struct {
         InvalidUnicodeEscape,
         InvalidUnicodeSurrogate,
         InvalidStringCharacter,
+        InvalidUtf8,
+        FloatOutOfRange,
     };
 
     // Shared token parser for both direct typed reads and recursive skipping.
     fn parseNumberToken(self: *Parser) Error!Number {
         const parsed = try self.parseNumberSlice();
         if (parsed.is_float) {
-            return .{ .float = std.fmt.parseFloat(f64, parsed.slice) catch return error.InvalidNumber };
+            return .{ .float = try parseFiniteFloat(f64, parsed.slice) };
         }
         return .{ .integer = std.fmt.parseInt(i128, parsed.slice, 10) catch return error.InvalidNumber };
     }
@@ -673,6 +686,13 @@ const Parser = struct {
         };
     }
 
+    /// A string's raw bytes between escapes must be UTF-8. Each run is checked alone, which is
+    /// enough: an escape is ASCII, so no code point spans two runs.
+    fn validUtf8(bytes: []const u8) Error![]const u8 {
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+        return bytes;
+    }
+
     // Plain strings borrow from the input; escaped strings allocate rewritten bytes.
     fn parseStringToken(self: *Parser, allocator: Allocator) Error!StringToken {
         if (self.consume() != '"') return error.UnexpectedToken;
@@ -688,19 +708,19 @@ const Parser = struct {
                 '"' => {
                     if (builder.items.len == 0) {
                         return .{
-                            .bytes = self.input[start .. self.index - 1],
+                            .bytes = try validUtf8(self.input[start .. self.index - 1]),
                             .allocated = false,
                         };
                     }
 
-                    try builder.appendSlice(allocator, self.input[start .. self.index - 1]);
+                    try builder.appendSlice(allocator, try validUtf8(self.input[start .. self.index - 1]));
                     return .{
                         .bytes = try builder.toOwnedSlice(allocator),
                         .allocated = true,
                     };
                 },
                 '\\' => {
-                    try builder.appendSlice(allocator, self.input[start .. self.index - 1]);
+                    try builder.appendSlice(allocator, try validUtf8(self.input[start .. self.index - 1]));
                     try self.appendEscape(allocator, &builder);
                     builder_owned_here = false;
                     return self.finishEscapedString(allocator, builder);
@@ -720,14 +740,14 @@ const Parser = struct {
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
                 '"' => {
-                    try builder.appendSlice(allocator, self.input[chunk_start .. self.index - 1]);
+                    try builder.appendSlice(allocator, try validUtf8(self.input[chunk_start .. self.index - 1]));
                     return .{
                         .bytes = try builder.toOwnedSlice(allocator),
                         .allocated = true,
                     };
                 },
                 '\\' => {
-                    try builder.appendSlice(allocator, self.input[chunk_start .. self.index - 1]);
+                    try builder.appendSlice(allocator, try validUtf8(self.input[chunk_start .. self.index - 1]));
                     try self.appendEscape(allocator, &builder);
                     chunk_start = self.index;
                 },

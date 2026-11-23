@@ -321,7 +321,6 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
             const tag = try self.readByte();
             return switch (classify(tag)) {
                 .integer => castIntValue(T, try self.decodeInteger(tag)),
-                .float => castFloatToInt(T, try self.decodeFloat(tag)),
                 else => error.UnexpectedType,
             };
         }
@@ -329,8 +328,8 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
         pub fn readFloat(self: *Self, comptime T: type) !T {
             const tag = try self.readByte();
             return switch (classify(tag)) {
-                .integer => @as(T, @floatFromInt(try self.decodeInteger(tag))),
-                .float => @as(T, @floatCast(try self.decodeFloat(tag))),
+                .integer => try typed.narrowFloat(T, @floatFromInt(try self.decodeInteger(tag))),
+                .float => try typed.narrowFloat(T, try self.decodeFloat(tag)),
                 else => error.UnexpectedType,
             };
         }
@@ -868,11 +867,6 @@ fn castIntValue(comptime T: type, raw: i128) !T {
     };
 }
 
-fn castFloatToInt(comptime T: type, raw: f64) !T {
-    const rounded = @round(raw);
-    if (rounded != raw) return error.UnexpectedType;
-    return castIntValue(T, @as(i128, @intFromFloat(rounded)));
-}
 
 fn encodeFieldName(comptime name: []const u8) [fieldNameEncodedLen(name)]u8 {
     var buffer: [fieldNameEncodedLen(name)]u8 = undefined;

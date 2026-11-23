@@ -366,6 +366,16 @@ pub fn build(b: *std.Build) void {
     });
     test_modules.append(b.allocator, property_tests_mod) catch @panic("OOM");
 
+    const typed_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/typed_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zerde", .module = tests_root_mod },
+        },
+    });
+    test_modules.append(b.allocator, typed_tests_mod) catch @panic("OOM");
+
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run zerde tests");

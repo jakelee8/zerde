@@ -74,6 +74,45 @@ const MixedDoc = struct {
     role: Role,
 };
 
+const ByteStringDoc = struct {
+    id: u8,
+    data: zerde.ByteString,
+};
+
+const ShapeDoc = union(enum) {
+    empty,
+    circle: u32,
+    rect: struct { w: u16, h: u16 },
+};
+
+const IntegerKeysDoc = struct {
+    first: u8,
+    second: u8,
+    third: u8,
+
+    pub const serde = .{
+        .fields = .{
+            .first = .{ .key = 1 },
+            .second = .{ .key = -1 },
+            .third = .{ .rename = "a" },
+        },
+    };
+};
+
+const NullableDoc = struct {
+    must: ?u8,
+
+    pub const serde = .{
+        .fields = .{
+            .must = .{ .optional = .nullable },
+        },
+    };
+};
+
+const PatchDoc = struct {
+    end: ??u8,
+};
+
 pub fn expectRoundTripMatches(comptime case_name: []const u8, input: []const u8) !void {
     if (comptime std.mem.eql(u8, case_name, "null.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, ?bool, case_name, input, .{}, .{});
     if (comptime std.mem.eql(u8, case_name, "true.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, bool, case_name, input, .{}, .{});
@@ -102,6 +141,15 @@ pub fn expectRoundTripMatches(comptime case_name: []const u8, input: []const u8)
     if (comptime std.mem.eql(u8, case_name, "optional_null.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, OptionalDoc, case_name, input, .{}, .{});
     if (comptime std.mem.eql(u8, case_name, "optional_omitted.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, OptionalDoc, case_name, input, .{ .omit_null_fields = true }, .{});
     if (comptime std.mem.eql(u8, case_name, "mixed_scalars.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, MixedDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_byte_string.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, ByteStringDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "union_unit.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, ShapeDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "union_payload.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, ShapeDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "union_struct_payload.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, ShapeDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_integer_keys.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, IntegerKeysDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_nullable.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, NullableDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_patch_null.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, PatchDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_patch_absent.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, PatchDoc, case_name, input, .{}, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_patch_value.cbor")) return corpus.expectBinaryRoundTrip(zerde.cbor, PatchDoc, case_name, input, .{}, .{});
 
     @compileError("unregistered CBOR corpus case: " ++ case_name);
 }

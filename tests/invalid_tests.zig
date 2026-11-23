@@ -11,6 +11,20 @@ const NameDoc = struct {
     name: []const u8,
 };
 
+const FloatDoc = struct {
+    value: f64,
+};
+
+const BlobDoc = struct {
+    id: u8,
+    data: zerde.ByteString,
+};
+
+/// Reads one field and skips the rest, so a fixture can put its fault in a field nobody asked for.
+const ProbeDoc = struct {
+    a: ?u8 = null,
+};
+
 test "invalid json corpus: wrong_type.json" {
     try invalid.expectTextParseFails(zerde.json, CountDoc, "wrong_type.json", @embedFile("corpus_invalid/json/wrong_type.json"), .{}, .{});
 }
@@ -73,4 +87,56 @@ test "invalid bin corpus: invalid_bool_tag.bin" {
 
 test "invalid bin corpus: truncated_string.bin" {
     try invalid.expectBinaryParseFails(zerde.bin, []const u8, "truncated_string.bin", @embedFile("corpus_invalid/bin/truncated_string.bin"), .{}, .{});
+}
+
+test "invalid cbor corpus: bytes_for_text.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, NameDoc, "bytes_for_text.cbor", @embedFile("corpus_invalid/cbor/bytes_for_text.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: text_for_bytes.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, BlobDoc, "text_for_bytes.cbor", @embedFile("corpus_invalid/cbor/text_for_bytes.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: invalid_utf8_text.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, NameDoc, "invalid_utf8_text.cbor", @embedFile("corpus_invalid/cbor/invalid_utf8_text.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: float_for_int.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, CountDoc, "float_for_int.cbor", @embedFile("corpus_invalid/cbor/float_for_int.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: duplicate_unknown_key.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, ProbeDoc, "duplicate_unknown_key.cbor", @embedFile("corpus_invalid/cbor/duplicate_unknown_key.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: tagged_value.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, CountDoc, "tagged_value.cbor", @embedFile("corpus_invalid/cbor/tagged_value.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: length_beyond_input.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, []const u16, "length_beyond_input.cbor", @embedFile("corpus_invalid/cbor/length_beyond_input.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: invalid_simple_value.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, ProbeDoc, "invalid_simple_value.cbor", @embedFile("corpus_invalid/cbor/invalid_simple_value.cbor"), .{}, .{});
+}
+
+test "invalid cbor corpus: nesting_too_deep.cbor" {
+    try invalid.expectBinaryParseFails(zerde.cbor, ProbeDoc, "nesting_too_deep.cbor", @embedFile("corpus_invalid/cbor/nesting_too_deep.cbor"), .{}, .{});
+}
+
+test "invalid json corpus: invalid_utf8.json" {
+    try invalid.expectTextParseFails(zerde.json, NameDoc, "invalid_utf8.json", @embedFile("corpus_invalid/json/invalid_utf8.json"), .{}, .{});
+}
+
+test "invalid json corpus: float_for_int.json" {
+    try invalid.expectTextParseFails(zerde.json, CountDoc, "float_for_int.json", @embedFile("corpus_invalid/json/float_for_int.json"), .{}, .{});
+}
+
+test "invalid json corpus: number_overflow.json" {
+    try invalid.expectTextParseFails(zerde.json, FloatDoc, "number_overflow.json", @embedFile("corpus_invalid/json/number_overflow.json"), .{}, .{});
+}
+
+test "invalid json corpus: nesting_too_deep.json" {
+    try invalid.expectTextParseFails(zerde.json, ProbeDoc, "nesting_too_deep.json", @embedFile("corpus_invalid/json/nesting_too_deep.json"), .{}, .{});
 }

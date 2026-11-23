@@ -104,6 +104,7 @@ When adding invalid fixtures:
 - property-style roundtrip fuzzing for the supported typed formats
 - parser hardening fuzzers seeded from `tests/corpus_invalid/<format>`
 - invalid-input tests that assert parse failure without leaks
+- typed-layer behaviour tests for the formats that carry untrusted bodies (`tests/typed_tests.zig`): byte strings, unions, optional fields, integer keys, strict and lenient input, and duplicate keys
 
 When changing parser behavior or adding a new format, keep the valid corpus,
 invalid corpus, and fuzz coverage aligned.

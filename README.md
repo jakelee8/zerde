@@ -70,7 +70,7 @@ pub fn main() !void {
 | JSON | yes | yes | yes | yes | Fully typed fast path, benchmarked against `std.json` |
 | ZON | yes | yes | yes | no | Typed ZON path, benchmarked against `std.zon`; slice parse currently owns decoded strings |
 | TOML | yes | yes | yes | yes | Practical TOML subset centered on scalars, arrays, tables, and arrays-of-tables |
-| CBOR | yes | yes | yes | yes | Definite-length writer; read accepts definite and indefinite arrays/maps |
+| CBOR | yes | yes | yes | yes | Definite-length writer, or the deterministic encoding of RFC 8949 §4.2.1; read accepts any well-formed CBOR |
 | YAML | yes | yes | yes | yes | Practical block-YAML subset with block mappings, block sequences, and flow scalar arrays |
 
 ## WebAssembly / WASI
@@ -168,22 +168,29 @@ Supported typed-layer options today:
 - `rename_all`
 - `omit_null_fields`
 - `deny_unknown_fields`
-- `field_order`: `.declaration`, `.length_first` or `.bytewise`; unset, the format chooses
+- `field_order`: `.declaration`, `.length_first`, `.bytewise` or `.encoded_key`; unset, the format chooses
 - per-field `rename`
+- per-field `key`: an integer map key, for formats that allow one (CBOR)
+- per-field `optional`: `.lenient` (the default), `.nullable` or `.absent`; see [Optional fields](#optional-fields)
 
 Format-level options are passed as the last argument:
 
 - CBOR `WriteConfig.deterministic` writes the core deterministic encoding of RFC 8949 §4.2.1:
-  definite-length maps, fields in `length_first` order, and the shortest exact float width.
-  Equal values then produce equal bytes, so the output can be hashed or signed. Asking a
-  deterministic write for another `field_order` is a compile error. The default write uses
-  indefinite maps in declaration order.
+  definite-length maps, fields in the bytewise order of their encoded keys (`field_order`
+  `.encoded_key`, which for any mix of text and integer keys is the order §4.2.1 defines), and the
+  shortest exact float width. Equal values then produce equal bytes, so the output can be hashed or
+  signed. Asking a deterministic write for another `field_order` is a compile error. The default write
+  uses indefinite maps in declaration order.
 - JSON `WriteConfig.bytes` and `ReadConfig.bytes` choose how a `[N]u8` field is carried:
   `.string` (the default, raw bytes in a string), `.base64` (padded, RFC 4648 §4) or
   `.base64url` (unpadded, RFC 4648 §5). Reader and writer must agree.
 
-Byte fields: a `[N]u8` field is a native byte string in CBOR, MessagePack, BSON and the binary
-format. A `[]const u8` field is always a text string in every format.
+Byte fields: a `[N]u8` field and a `zerde.ByteString` (`struct { bytes: []const u8 }`, for a length
+known only at run time) are native byte strings in CBOR, MessagePack, BSON and the binary format. A
+`[]const u8` field is always a text string in every format. A byte string is read only from a byte
+string and text only from text, in CBOR, MessagePack and BSON; in JSON, which has no byte type, a byte
+field is read in the configured `bytes` encoding. The `.string` encoding writes the raw bytes, so it
+refuses bytes that are not UTF-8.
 
 ```zig
 // The same value always encodes to the same bytes.
@@ -225,3 +232,50 @@ pub fn main() !void {
     }, .{});
 }
 ```
+
+### Unions
+
+A tagged union (`union(enum)`) is written in CBOR and JSON as its variant name when the variant has no
+payload, and as a map of one entry, the name and the payload, otherwise. The name follows `rename_all`
+and per-field `rename` like a struct field. Reading takes only those two forms: one entry, a known
+name, and a bare name only for a variant without a payload. Other formats do not support unions and
+say so at compile time.
+
+### Optional fields
+
+A plain `?T` field reads an absent field and `null` alike, and is written as `null` or, with
+`omit_null_fields`, left out. Three more cases are expressed in the type or per field:
+
+- `.fields = .{ .x = .{ .optional = .nullable } }`: the field must be present and may be `null`; it is
+  always written. An absent field is `error.MissingField`.
+- `.fields = .{ .x = .{ .optional = .absent } }`: the field may be absent but not `null`; it is never
+  written as `null`. An explicit `null` is `error.UnexpectedType`.
+- a nested optional, `??T`, as a struct field: absent is the outer `null`, an explicit `null` is
+  `.{ null }`, and the two are written differently (left out, or `null`). Outside a struct field a nested
+  optional is a compile error.
+
+### What the CBOR and JSON readers accept
+
+Both readers accept any well-formed input, whatever form the encoder chose. For CBOR that is
+RFC 8949 §5.3: non-minimal heads, any float width, unsorted maps, and indefinite-length arrays, maps and
+strings. Output stays deterministic: reading changes nothing about what a value writes as. What they
+refuse is what makes a value ambiguous:
+
+- text that is not UTF-8; a byte string for a text field or the reverse; a chunk of an indefinite string
+  of the wrong type (CBOR)
+- a float for an integer field, even `1.0`; a number too large for its float field (`1e999` is
+  `error.FloatOutOfRange`, not infinity)
+- more than 128 open containers (`error.CborNestingTooDeep`, `error.JsonNestingTooDeep`), so a hostile
+  input cannot exhaust the stack; and a CBOR length that claims more items than the input has bytes
+- a CBOR map with two equal keys (`error.DuplicateField`), checked in every map including those in
+  skipped values; keys compare by value, so `1` and `1.0`, or text and bytes, are different keys.
+  A key that is an array, map or tagged item is compared by its encoded bytes only
+- a CBOR tag other than 55799 (self-described CBOR) around a value a typed field reads
+  (`error.UnexpectedTag`); a skipped value may carry any tag
+
+NaN and the infinities are values in CBOR (RFC 8949 §3.3) and are read into float fields and written;
+JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteFloat`). JSON object
+members repeated in a field the type does not read are skipped; a repeated member the type does read is
+`error.DuplicateField`. A struct reads text and integer keys; a key of another type is skipped with
+its value. A dynamic `Value` holds text keys only.
+

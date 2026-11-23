@@ -107,6 +107,10 @@ fn makeBinaryHarness(comptime Format: type) type {
 const json_invalid_corpus: []const []const u8 = &.{
     @embedFile("corpus_invalid/json/wrong_type.json"),
     @embedFile("corpus_invalid/json/truncated_object.json"),
+    @embedFile("corpus_invalid/json/invalid_utf8.json"),
+    @embedFile("corpus_invalid/json/float_for_int.json"),
+    @embedFile("corpus_invalid/json/number_overflow.json"),
+    @embedFile("corpus_invalid/json/nesting_too_deep.json"),
 };
 
 const zon_invalid_corpus: []const []const u8 = &.{
@@ -127,6 +131,15 @@ const yaml_invalid_corpus: []const []const u8 = &.{
 const cbor_invalid_corpus: []const []const u8 = &.{
     @embedFile("corpus_invalid/cbor/wrong_type.cbor"),
     @embedFile("corpus_invalid/cbor/truncated_string.cbor"),
+    @embedFile("corpus_invalid/cbor/bytes_for_text.cbor"),
+    @embedFile("corpus_invalid/cbor/text_for_bytes.cbor"),
+    @embedFile("corpus_invalid/cbor/invalid_utf8_text.cbor"),
+    @embedFile("corpus_invalid/cbor/float_for_int.cbor"),
+    @embedFile("corpus_invalid/cbor/duplicate_unknown_key.cbor"),
+    @embedFile("corpus_invalid/cbor/tagged_value.cbor"),
+    @embedFile("corpus_invalid/cbor/length_beyond_input.cbor"),
+    @embedFile("corpus_invalid/cbor/invalid_simple_value.cbor"),
+    @embedFile("corpus_invalid/cbor/nesting_too_deep.cbor"),
 };
 
 const msgpack_invalid_corpus: []const []const u8 = &.{

@@ -2,8 +2,18 @@
 
 ## Unreleased
 
-- added `field_order` to the typed-layer config (`.declaration`, `.length_first`, `.bytewise`), settable per call or per type
-- added CBOR `WriteConfig.deterministic`: the core deterministic encoding of RFC 8949 §4.2.1 (definite-length maps, `length_first` keys, shortest exact float width, canonical NaN)
+- added `field_order` to the typed-layer config (`.declaration`, `.length_first`, `.bytewise`, `.encoded_key`), settable per call or per type; `.length_first` and `.bytewise` are for text keys, `.encoded_key` is the bytewise order of the encoded keys
+- added CBOR `WriteConfig.deterministic`: the core deterministic encoding of RFC 8949 §4.2.1 (definite-length maps, keys in the bytewise order of their encoded form, which is right for integer and mixed keys as well as text, shortest exact float width, canonical NaN)
+- added `zerde.ByteString`, a variable-length byte string: a CBOR byte string, MessagePack `bin`, BSON binary, and a JSON string in the configured `bytes` encoding; `[]const u8` stays text
+- added tagged unions (`union(enum)`) for CBOR and JSON: the variant name for a variant without a payload, else a one-entry map of name and payload; other formats refuse a union at compile time
+- added per-field `key` (an integer map key, CBOR) and `optional` (`.lenient`, `.nullable`, `.absent`), and nested optional struct fields (`??T`), so an absent field can differ from `null`
+- added CBOR support for indefinite-length byte and text strings on read, and for tag 55799 (self-described CBOR)
+- CBOR and JSON readers accept any well-formed input (RFC 8949 §5.3, RFC 8259) and keep writing the same bytes; a text string must be UTF-8 (`error.InvalidUtf8`), a CBOR map may not repeat a key (`error.DuplicateField`, also in skipped values), a CBOR tag other than 55799 around a typed value is `error.UnexpectedTag`, nesting is bounded at 128 open containers (`error.CborNestingTooDeep`; a skipped CBOR value used to recurse without a bound), and a CBOR length cannot claim more items than the input has bytes
+- an integer field no longer accepts a float with a whole value (`1.0`, `1e2`, CBOR `0xf93c00`): CBOR, JSON, MessagePack and the typed layer return `error.UnexpectedType`; it also removes a safety panic on `1e300`
+- a float field refuses a finite number too large for its type (`error.FloatOutOfRange`) instead of rounding to infinity: JSON `1e999`, a CBOR double read into `f32`, a MessagePack double read into `f32`
+- JSON no longer converts a number it skips, so a number too large for any type in a skipped field is fine; the JSON writer refuses NaN and infinity (`error.NonFiniteFloat`) and the `.string` byte encoding refuses bytes that are not UTF-8 (`error.InvalidUtf8`)
+- a byte field is read only from a byte string, and a text field only from text: CBOR no longer reads a byte string as text or the reverse, and the typed layer, MessagePack and BSON no longer read text into a byte field (`[N]u8`, `zerde.ByteString`)
+- a dynamic `Value` read from CBOR holds a byte string as bytes; it was read as text
 - added JSON `WriteConfig.bytes` and `ReadConfig.bytes` to carry `[N]u8` fields as `.string`, `.base64` or `.base64url`
 - CBOR writes `[N]u8` fields as byte strings, as MessagePack, BSON and the binary format do; they were text strings, which RFC 8949 requires to be UTF-8
 - named `ReadConfig` values (for example `json.ReadConfig{ .borrow_strings = true }`) compile; only anonymous literals did

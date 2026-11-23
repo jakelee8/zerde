@@ -368,10 +368,6 @@ pub fn BsonDeserializer(comptime Config: type) type {
                     .bytes = try self.readBinaryBytes(),
                     .allocated = false,
                 },
-                .string => .{
-                    .bytes = try self.readStringBytes(),
-                    .allocated = false,
-                },
                 else => error.UnexpectedType,
             };
         }

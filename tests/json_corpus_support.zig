@@ -131,6 +131,31 @@ const DeepMix = struct {
     checkpoints: [3]u16,
 };
 
+const ByteStringDoc = struct {
+    id: u8,
+    data: zerde.ByteString,
+};
+
+const ShapeDoc = union(enum) {
+    empty,
+    circle: u32,
+    rect: struct { w: u16, h: u16 },
+};
+
+const NullableDoc = struct {
+    must: ?u8,
+
+    pub const serde = .{
+        .fields = .{
+            .must = .{ .optional = .nullable },
+        },
+    };
+};
+
+const PatchDoc = struct {
+    end: ??u8,
+};
+
 pub fn expectRoundTripMatches(comptime case_name: []const u8, input: []const u8) !void {
     if (comptime std.mem.eql(u8, case_name, "null.json")) return expectCase(?bool, case_name, input, .{});
     if (comptime std.mem.eql(u8, case_name, "true.json")) return expectCase(bool, case_name, input, .{});
@@ -187,6 +212,14 @@ pub fn expectRoundTripMatches(comptime case_name: []const u8, input: []const u8)
     if (comptime std.mem.eql(u8, case_name, "object_escaped_fields.json")) return expectCase(EscapedFields, case_name, input, .{});
     if (comptime std.mem.eql(u8, case_name, "object_unicode_fields.json")) return expectCase(UnicodeFields, case_name, input, .{});
     if (comptime std.mem.eql(u8, case_name, "object_deep_mix.json")) return expectCase(DeepMix, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_byte_string.json")) return expectCase(ByteStringDoc, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "union_unit.json")) return expectCase(ShapeDoc, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "union_payload.json")) return expectCase(ShapeDoc, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "union_struct_payload.json")) return expectCase(ShapeDoc, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_nullable.json")) return expectCase(NullableDoc, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_patch_null.json")) return expectCase(PatchDoc, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_patch_absent.json")) return expectCase(PatchDoc, case_name, input, .{});
+    if (comptime std.mem.eql(u8, case_name, "object_optional_patch_value.json")) return expectCase(PatchDoc, case_name, input, .{});
 
     @compileError("unregistered JSON corpus case: " ++ case_name);
 }
