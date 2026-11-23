@@ -141,14 +141,21 @@ pub fn effectiveFieldOrder(comptime T: type, comptime cfg: anytype, comptime pol
 /// Field name precedence is: call-site field override, type field override, then rename_all.
 pub fn effectiveFieldName(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) []const u8 {
     if (comptime fieldOverrideHas(cfg, field_name, "rename")) {
-        return fieldOverride(cfg, field_name, "rename");
+        return validName(field_name, fieldOverride(cfg, field_name, "rename"));
     }
 
     if (comptime @hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, "rename")) {
-        return fieldOverride(T.serde, field_name, "rename");
+        return validName(field_name, fieldOverride(T.serde, field_name, "rename"));
     }
 
     return applyCase(field_name, effectiveRenameAll(T, cfg));
+}
+
+/// A wire name is text in every format, and the readers skip validating a key that equals a declared
+/// name; both hold only if a declared name is UTF-8, so an invalid `rename` is a compile error.
+fn validName(comptime field_name: []const u8, comptime name: []const u8) []const u8 {
+    if (!std.unicode.utf8ValidateSlice(name)) @compileError("the wire name of field `" ++ field_name ++ "` is not valid UTF-8");
+    return name;
 }
 
 /// A field's wire key. A field override `.key = <integer>` makes it an integer key; otherwise the
@@ -156,7 +163,7 @@ pub fn effectiveFieldName(comptime T: type, comptime field_name: []const u8, com
 pub fn effectiveFieldKey(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) FieldKey {
     @setEvalBranchQuota(20_000);
     if (comptime fieldOverrideHas(cfg, field_name, "key")) return .{ .integer = fieldOverride(cfg, field_name, "key") };
-    if (comptime fieldOverrideHas(cfg, field_name, "rename")) return .{ .text = fieldOverride(cfg, field_name, "rename") };
+    if (comptime fieldOverrideHas(cfg, field_name, "rename")) return .{ .text = validName(field_name, fieldOverride(cfg, field_name, "rename")) };
     if (comptime @hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, "key")) {
         return .{ .integer = fieldOverride(T.serde, field_name, "key") };
     }

@@ -655,6 +655,7 @@ test {
     _ = @import("bson.zig");
     _ = @import("meta.zig");
     _ = @import("typed.zig");
+    _ = @import("value.zig");
     _ = @import("cbor.zig");
     _ = @import("json.zig");
     _ = @import("msgpack.zig");

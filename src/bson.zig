@@ -313,7 +313,8 @@ pub fn BsonDeserializer(comptime Config: type) type {
         }
 
         pub fn peekKind(self: *Self) !ValueKind {
-            const tag = self.pending_type orelse return error.UnexpectedType;
+            // A BSON root is always a document, which has no type byte of its own.
+            const tag = self.pending_type orelse return if (self.stack_len == 0 and self.index == 0) .object else error.UnexpectedType;
             return switch (tag) {
                 .null => .null,
                 .bool => .bool,

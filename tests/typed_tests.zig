@@ -830,3 +830,43 @@ test "a dynamic value reads a CBOR byte string as bytes" {
     try std.testing.expectEqualSlices(u8, "hi", value.array[0].bytes.bytes);
     try std.testing.expectEqualSlices(u8, "hi", value.array[1].string.bytes);
 }
+
+test "float keys are equal by RFC 8949 section 5.6.1" {
+    // 0.0 and -0.0 are the same key, in any widths.
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0xf9, 0x00, 0x00, 0x00, 0xf9, 0x80, 0x00, 0x00 });
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0xf9, 0x00, 0x00, 0x00, 0xfb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x00 });
+    // NaNs are the same key when their significands match once widened, whatever the width or sign.
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0xf9, 0x7e, 0x00, 0x00, 0xfa, 0x7f, 0xc0, 0x00, 0x00, 0x00 });
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0xf9, 0x7e, 0x00, 0x00, 0xf9, 0xfe, 0x00, 0x00 });
+    // With different payloads they are different keys.
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0xf9, 0x7e, 0x00, 0x00, 0xf9, 0x7e, 0x01, 0x00 });
+    // Infinities of opposite sign differ, and so do 0.0 and 1.0.
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0xf9, 0x7c, 0x00, 0x00, 0xf9, 0xfc, 0x00, 0x00 });
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0xf9, 0x00, 0x00, 0x00, 0xf9, 0x3c, 0x00, 0x00 });
+}
+
+test "array, map and tag keys are equal by value, not by spelling" {
+    // [1] three ways.
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0x81, 0x01, 0x00, 0x81, 0x18, 0x01, 0x00 });
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0x81, 0x01, 0x00, 0x9f, 0x01, 0xff, 0x00 });
+    // {1:1, 2:2} in two orders, one of them indefinite.
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0xa2, 0x01, 0x01, 0x02, 0x02, 0x00, 0xbf, 0x02, 0x02, 0x01, 0x01, 0xff, 0x00 });
+    // A float zero inside a key, and a tagged key spelled two ways.
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0x81, 0xf9, 0x00, 0x00, 0x00, 0x81, 0xf9, 0x80, 0x00, 0x00 });
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0xc1, 0x01, 0x00, 0xc1, 0x18, 0x01, 0x00 });
+    // A text key inside a key, chunked.
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0x81, 0x61, 'x', 0x00, 0x81, 0x7f, 0x61, 'x', 0xff, 0x00 });
+    // Different values are different keys: [1] and [2], [1] and [1.0], a tagged and an untagged key.
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0x81, 0x01, 0x00, 0x81, 0x02, 0x00 });
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0x81, 0x01, 0x00, 0x81, 0xf9, 0x3c, 0x00, 0x00 });
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0xc1, 0x01, 0x00, 0x01, 0x00 });
+    // Two maps that differ in one value.
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0xa1, 0x01, 0x01, 0x00, 0xa1, 0x01, 0x02, 0x00 });
+}
+
+test "composite keys keep their tag numbers and string lengths" {
+    // Tag 1 and tag 2 around 1 are different keys.
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0xc1, 0x01, 0x00, 0xc2, 0x01, 0x00 });
+    // ["a", "bc"] and ["ab", "c"] hold the same bytes and are different keys.
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0x82, 0x61, 'a', 0x62, 'b', 'c', 0x00, 0x82, 0x62, 'a', 'b', 0x61, 'c', 0x00 });
+}

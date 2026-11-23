@@ -256,26 +256,35 @@ A plain `?T` field reads an absent field and `null` alike, and is written as `nu
 
 ### What the CBOR and JSON readers accept
 
-Both readers accept any well-formed input, whatever form the encoder chose. For CBOR that is
-RFC 8949 §5.3: non-minimal heads, any float width, unsorted maps, and indefinite-length arrays, maps and
-strings. Output stays deterministic: reading changes nothing about what a value writes as. What they
-refuse is what makes a value ambiguous:
+Both readers accept the well-formed forms of their format that a typed value can hold, whatever
+encoding the encoder chose. For CBOR that is RFC 8949 §5.3: non-minimal heads, any float width,
+unsorted maps, and indefinite-length arrays, maps and strings. Output stays deterministic: reading
+changes nothing about what a value writes as. The readers do **not** accept every well-formed input.
+What they refuse, and why:
 
 - text that is not UTF-8; a byte string for a text field or the reverse; a chunk of an indefinite string
-  of the wrong type (CBOR)
+  of the wrong type (CBOR). In JSON this includes a lone surrogate escape such as `"\udc00"`, which is
+  grammatical (RFC 8259 §8.2) but has no UTF-8 form (`error.InvalidUnicodeSurrogate`)
 - a float for an integer field, even `1.0`; a number too large for its float field (`1e999` is
   `error.FloatOutOfRange`, not infinity)
 - more than 128 open containers (`error.CborNestingTooDeep`, `error.JsonNestingTooDeep`), so a hostile
   input cannot exhaust the stack; and a CBOR length that claims more items than the input has bytes
 - a CBOR map with two equal keys (`error.DuplicateField`), checked in every map including those in
-  skipped values; keys compare by value, so `1` and `1.0`, or text and bytes, are different keys.
-  A key that is an array, map or tagged item is compared by its encoded bytes only
+  skipped values. Keys are equal as RFC 8949 §5.6.1 defines it: `1` and `1.0` are different keys, `0.0`
+  and `-0.0` are the same, NaNs are the same when their significands match, and arrays, maps and tagged
+  keys compare by value, so two spellings of one key are one key
 - a CBOR tag other than 55799 (self-described CBOR) around a value a typed field reads
   (`error.UnexpectedTag`); a skipped value may carry any tag
+- a JSON object member repeated in a field the type reads (`error.DuplicateField`); RFC 8259 §4 allows
+  repeated names, so this is a policy, and one that has not been settled. A repeated member in a field
+  the type does not read is skipped
+- in a dynamic `Value`: a JSON number that is not a finite double or an integer within 128 bits
+  (`error.InvalidNumber`, `error.FloatOutOfRange`); a CBOR map key that is not text
+  (`error.UnexpectedType`), a tag (`error.UnexpectedTag`), and a simple value other than false, true and
+  null (`error.UnexpectedToken`). A struct reads text and integer keys and skips a key of another type
+  with its value
+- a JSON text that starts with a byte order mark
 
 NaN and the infinities are values in CBOR (RFC 8949 §3.3) and are read into float fields and written;
-JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteFloat`). JSON object
-members repeated in a field the type does not read are skipped; a repeated member the type does read is
-`error.DuplicateField`. A struct reads text and integer keys; a key of another type is skipped with
-its value. A dynamic `Value` holds text keys only.
+JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteFloat`).
 

@@ -148,6 +148,9 @@ const KeyKind = enum(u8) { uint, nint, bytes, text, simple, float, raw };
 /// string or `raw` key the offset of its bytes (in the input, or in `key_bytes` when `pooled`) with
 /// its length in `b`. A key that is an array, map or tagged item is compared by its encoded bytes,
 /// so two encodings of one such key are not seen as equal; scalars and strings are compared by value.
+/// One entry of a map being put in canonical form: its bytes in `key_bytes`, key first.
+const CanonicalEntry = struct { start: usize, key_end: usize, end: usize };
+
 const KeyRecord = struct {
     kind: KeyKind,
     pooled: bool = false,
@@ -676,7 +679,8 @@ pub fn CborDeserializer(comptime Config: type) type {
         }
 
         /// Reads one map key of any type and records it. A key that is an array, map or tagged item
-        /// is skipped, which checks the maps inside it too.
+        /// is skipped, which checks the maps inside it too, then recorded in canonical form so two
+        /// spellings of one key are the same key.
         fn recordKeyItem(self: *Self, depth: usize) anyerror!void {
             const start = self.index;
             const header = try parseHeader(self.input, &self.index);
@@ -689,16 +693,107 @@ pub fn CborDeserializer(comptime Config: type) type {
                     return self.recordString(if (header.major == 3) .text else .bytes, token);
                 },
                 7 => switch (header.ai) {
-                    25, 26, 27 => .{ .kind = .float, .a = canonicalFloatBits(header) },
+                    25, 26, 27 => .{ .kind = .float, .a = keyFloatBits(header.ai, header.value) },
                     else => .{ .kind = .simple, .a = if (header.ai == 24) header.value else header.ai },
                 },
                 else => blk: {
                     self.index = start;
                     try self.skipItem(depth);
-                    break :blk .{ .kind = .raw, .a = start, .b = self.index - start };
+                    const end = self.index;
+                    self.index = start;
+                    const offset = self.key_bytes.items.len;
+                    try self.canonicalItem();
+                    std.debug.assert(self.index == end);
+                    break :blk .{ .kind = .raw, .pooled = true, .a = offset, .b = self.key_bytes.items.len - offset };
                 },
             };
             try self.keys.append(self.allocator, record);
+        }
+
+        /// Appends the canonical form of the well-formed item at `index` to `key_bytes`: shortest
+        /// heads, definite lengths, every float as a double with RFC 8949 section 5.6.1 equality
+        /// (zeros equal, NaNs by significand), and map entries sorted by their canonical keys.
+        /// `skipItem` has already bounded the nesting and refused repeated keys.
+        fn canonicalItem(self: *Self) anyerror!void {
+            const header = try parseHeader(self.input, &self.index);
+            switch (header.major) {
+                0, 1 => try self.appendHead(header.major, header.value),
+                2, 3 => {
+                    const token = try self.finishString(self.allocator, header);
+                    defer token.deinit(self.allocator);
+                    try self.appendHead(header.major, token.bytes.len);
+                    try self.key_bytes.appendSlice(self.allocator, token.bytes);
+                },
+                4 => {
+                    const start = self.key_bytes.items.len;
+                    var count: u64 = 0;
+                    if (header.indefinite) {
+                        while (try self.moreItems()) : (count += 1) try self.canonicalItem();
+                    } else {
+                        while (count < header.value) : (count += 1) try self.canonicalItem();
+                    }
+                    try self.insertHead(start, 4, count);
+                },
+                5 => try self.canonicalMap(header),
+                6 => {
+                    try self.appendHead(6, header.value);
+                    try self.canonicalItem();
+                },
+                else => switch (header.ai) {
+                    25, 26, 27 => {
+                        try self.key_bytes.append(self.allocator, 0xfb);
+                        var be: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &be, keyFloatBits(header.ai, header.value), .big);
+                        try self.key_bytes.appendSlice(self.allocator, &be);
+                    },
+                    else => try self.appendHead(7, header.value),
+                },
+            }
+        }
+
+        fn canonicalMap(self: *Self, header: Header) anyerror!void {
+            var entries: std.ArrayList(CanonicalEntry) = .empty;
+            defer entries.deinit(self.allocator);
+            const start = self.key_bytes.items.len;
+            if (header.indefinite) {
+                while (try self.moreItems()) try self.canonicalEntry(&entries);
+            } else {
+                var count: u64 = 0;
+                while (count < header.value) : (count += 1) try self.canonicalEntry(&entries);
+            }
+
+            const Sort = struct {
+                bytes: []const u8,
+                fn less(ctx: @This(), a: CanonicalEntry, b: CanonicalEntry) bool {
+                    return std.mem.lessThan(u8, ctx.bytes[a.start..a.key_end], ctx.bytes[b.start..b.key_end]);
+                }
+            };
+            std.sort.pdq(CanonicalEntry, entries.items, Sort{ .bytes = self.key_bytes.items }, Sort.less);
+
+            var sorted: std.ArrayList(u8) = .empty;
+            defer sorted.deinit(self.allocator);
+            for (entries.items) |entry| try sorted.appendSlice(self.allocator, self.key_bytes.items[entry.start..entry.end]);
+            self.key_bytes.items.len = start;
+            try self.appendHead(5, entries.items.len);
+            try self.key_bytes.appendSlice(self.allocator, sorted.items);
+        }
+
+        fn canonicalEntry(self: *Self, entries: *std.ArrayList(CanonicalEntry)) anyerror!void {
+            const start = self.key_bytes.items.len;
+            try self.canonicalItem();
+            const key_end = self.key_bytes.items.len;
+            try self.canonicalItem();
+            try entries.append(self.allocator, .{ .start = start, .key_end = key_end, .end = self.key_bytes.items.len });
+        }
+
+        fn appendHead(self: *Self, major: u8, value: u64) !void {
+            var head: [9]u8 = undefined;
+            try self.key_bytes.appendSlice(self.allocator, head[0..writeHead(&head, major, value)]);
+        }
+
+        fn insertHead(self: *Self, at: usize, major: u8, value: u64) !void {
+            var head: [9]u8 = undefined;
+            try self.key_bytes.insertSlice(self.allocator, at, head[0..writeHead(&head, major, value)]);
         }
 
         fn recordText(self: *Self, token: StringToken) !void {
@@ -764,15 +859,31 @@ pub fn CborDeserializer(comptime Config: type) type {
     };
 }
 
-/// The bits of a float key as an f64, with every NaN the same: two floats are the same key when
-/// they are the same value, whatever width the encoder gave them.
-fn canonicalFloatBits(header: Header) u64 {
-    const wide: f64 = switch (header.ai) {
-        25 => @floatCast(@as(f16, @bitCast(@as(u16, @intCast(header.value))))),
-        26 => @floatCast(@as(f32, @bitCast(@as(u32, @intCast(header.value))))),
-        else => @bitCast(header.value),
+/// The bits that stand for a float key, widened to a double. RFC 8949 section 5.6.1: two floats are
+/// the same key when they are numerically equal, so -0.0 is 0.0, and two NaNs are the same key when
+/// they have the same significand after zero-extension to 64 bits (their sign is not compared).
+fn keyFloatBits(ai: u8, value: u64) u64 {
+    const sig_bits: u6 = switch (ai) {
+        25 => 10,
+        26 => 23,
+        else => 52,
     };
-    return if (std.math.isNan(wide)) 0x7ff8_0000_0000_0000 else @bitCast(wide);
+    const exp_bits: u6 = switch (ai) {
+        25 => 5,
+        26 => 8,
+        else => 11,
+    };
+    const significand = value & ((@as(u64, 1) << sig_bits) - 1);
+    const exponent = (value >> sig_bits) & ((@as(u64, 1) << exp_bits) - 1);
+    if (exponent == (@as(u64, 1) << exp_bits) - 1 and significand != 0) {
+        return (@as(u64, 0x7ff) << 52) | (significand << (52 - sig_bits));
+    }
+    const wide: f64 = switch (ai) {
+        25 => @floatCast(@as(f16, @bitCast(@as(u16, @intCast(value))))),
+        26 => @floatCast(@as(f32, @bitCast(@as(u32, @intCast(value))))),
+        else => @bitCast(value),
+    };
+    return if (wide == 0) 0 else @bitCast(wide);
 }
 
 pub fn serialize(writer: *std.Io.Writer, value: anytype) !void {
@@ -1284,6 +1395,7 @@ test "reader deserialize reads from a fixed CBOR input" {
 
 test "simple value 23 is not treated as cbor null" {
     var deserializer = try sliceDeserializer(std.testing.allocator, &.{0xf7}, .{});
+    defer deserializer.deinit(std.testing.allocator);
     try std.testing.expectError(error.UnexpectedToken, deserializer.peekKind());
 }
 
