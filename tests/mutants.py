@@ -259,6 +259,17 @@ MUTANTS = [
     ("reflect.zig", "                .wire = meta.effectiveFieldKey(T, name, cfg),\n                .type = PayloadType,", "                .wire = .{ .text = name },\n                .type = PayloadType,"),
     ("reflect.zig", "return .{ .repr = meta.effectiveEnumRepr(T, cfg), .values = &final };", "return .{ .repr = .name, .values = &final };"),
     ("reflect.zig", "        const order = typed.structFieldOrder(T, Format, info, cfg, policy);", "        const order = typed.structFieldOrder(T, Format, info, cfg, meta.FieldOrderPolicy{});"),
+    # Bulk scans. Not mutated: the calls from the JSON and CBOR backends, which only make them faster.
+    ("bulk.zig", "if (hasZero(word ^ (ones * '\"')) or hasZero(word ^ (ones * '\\\\')) or hasBelow(word, 0x20)) break;", "if (hasZero(word ^ (ones * '\\\\')) or hasBelow(word, 0x20)) break;"),
+    ("bulk.zig", "if (hasZero(word ^ (ones * '\"')) or hasZero(word ^ (ones * '\\\\')) or hasBelow(word, 0x20)) break;", "if (hasZero(word ^ (ones * '\"')) or hasBelow(word, 0x20)) break;"),
+    ("bulk.zig", "if (hasZero(word ^ (ones * '\"')) or hasZero(word ^ (ones * '\\\\')) or hasBelow(word, 0x20)) break;", "if (hasZero(word ^ (ones * '\"')) or hasZero(word ^ (ones * '\\\\'))) break;"),
+    ("bulk.zig", "        if (c == '\"' or c == '\\\\' or c < 0x20) return i;\n    }\n    return bytes.len;", "        if (c == '\"' or c == '\\\\') return i;\n    }\n    return bytes.len;"),
+    ("bulk.zig", "        if (end + 8 > bytes.len) end = bytes.len;\n", "        _ = 0;\n"),
+    ("bulk.zig", "        if (!std.unicode.utf8ValidateSlice(bytes[i..end])) return false;\n        i = end;", "        i = end;"),
+    ("bulk.zig", "        if (at > start) try writer.writeAll(bytes[start..at]);", "        _ = 0;"),
+    ("bulk.zig", "            0x08 => try writer.writeAll(\"\\\\b\"),", "            0x08 => try writer.writeAll(\"\\\\f\"),"),
+    ("bulk.zig", "hex[c >> 4], hex[c & 0xf] }", "hex[c & 0xf], hex[c >> 4] }"),
+    ("bulk.zig", "        start = at + 1;\n    }\n}", "        start = at;\n    }\n}"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

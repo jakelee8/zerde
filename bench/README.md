@@ -21,8 +21,10 @@ paths.
 - `bench/yaml.zig`: YAML benchmark entrypoint
 - `bench/zon.zig`: ZON benchmark entrypoint
 - `bench/common.zig`: shared scenarios, payload builders, and benchmark loops
+- `bench/bulk.zig`: string-scan benchmark entrypoint
 - `bench/BIN.md`: running binary benchmark history
 - `bench/BSON.md`: running BSON benchmark history
+- `bench/BULK.md`: running string-scan benchmark history
 - `bench/CBOR.md`: running CBOR benchmark history
 - `bench/JSON.md`: running JSON benchmark history
 - `bench/MSGPACK.md`: running MessagePack benchmark history
@@ -44,6 +46,12 @@ Run binary only:
 
 ```sh
 zig build bench-bin -Doptimize=ReleaseFast
+```
+
+Run the string-scan benchmark:
+
+```sh
+zig build bench-bulk -Doptimize=ReleaseFast
 ```
 
 Run JSON only:

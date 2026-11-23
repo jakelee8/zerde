@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const diagnostic_mod = @import("diagnostic.zig");
 const typed = @import("typed.zig");
 const meta = @import("meta.zig");
+const bulk = @import("bulk.zig");
 const Number = typed.Number;
 const StringToken = typed.StringToken;
 const ValueKind = typed.ValueKind;
@@ -1205,7 +1206,7 @@ pub fn parseSliceAliasedWith(
 fn writeBytesText(writer: *std.Io.Writer, encoding: BytesEncoding, value: []const u8) !void {
     switch (encoding) {
         .string => {
-            if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+            if (!bulk.validUtf8(value)) return error.InvalidUtf8;
             try writeEscapedString(writer, value);
         },
         .base64 => {
@@ -1227,7 +1228,9 @@ fn readLimitFlag(cfg: anytype, comptime name: []const u8, default: bool) bool {
 }
 
 pub fn writeEscapedString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try std.json.Stringify.encodeJsonString(bytes, .{}, writer);
+    try writer.writeByte('"');
+    try bulk.writeEscaped(writer, bytes);
+    try writer.writeByte('"');
 }
 
 fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
@@ -1386,7 +1389,7 @@ const Parser = struct {
     /// A string's raw bytes between escapes must be UTF-8. Each run is checked alone, which is
     /// enough: an escape is ASCII, so no code point spans two runs.
     fn validUtf8(bytes: []const u8) Error![]const u8 {
-        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+        if (!bulk.validUtf8(bytes)) return error.InvalidUtf8;
         return bytes;
     }
 
@@ -1409,6 +1412,7 @@ const Parser = struct {
         errdefer if (builder_owned_here) builder.deinit(allocator);
 
         while (true) {
+            self.index = bulk.findStringSpecial(self.input, self.index);
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
                 '"' => {
@@ -1443,6 +1447,7 @@ const Parser = struct {
 
         var chunk_start = self.index;
         while (true) {
+            self.index = bulk.findStringSpecial(self.input, self.index);
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
                 '"' => {

@@ -33,6 +33,8 @@ pub const DiagnosticPathSegment = diagnostic_impl.PathSegment;
 
 /// Reflection over schema types, for generators; see `reflect.zig`.
 pub const reflect = @import("reflect.zig");
+/// Word-at-a-time scans over strings, used by the JSON and CBOR backends.
+pub const bulk = @import("bulk.zig");
 pub const bin = bin_impl;
 pub const bson = bson_impl;
 pub const cbor = cbor_impl;
@@ -662,6 +664,7 @@ test {
     _ = @import("meta.zig");
     _ = @import("typed.zig");
     _ = @import("reflect.zig");
+    _ = @import("bulk.zig");
     _ = @import("value.zig");
     _ = @import("cbor.zig");
     _ = @import("json.zig");

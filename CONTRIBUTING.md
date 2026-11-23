@@ -48,6 +48,7 @@ Run a single benchmark family:
 
 ```sh
 zig build bench-bin -Doptimize=ReleaseFast
+zig build bench-bulk -Doptimize=ReleaseFast
 zig build bench-bson -Doptimize=ReleaseFast
 zig build bench-memory -Doptimize=ReleaseFast
 zig build bench-msgpack -Doptimize=ReleaseFast
@@ -105,6 +106,8 @@ When adding invalid fixtures:
 - parser hardening fuzzers seeded from `tests/corpus_invalid/<format>`
 - invalid-input tests that assert parse failure without leaks
 - typed-layer behaviour tests for the formats that carry untrusted bodies (`tests/typed_tests.zig`): byte strings, unions, optional fields, integer keys, strict and lenient input, and duplicate keys
+
+`tests/mutants.py` removes or weakens one guard at a time and checks that `zig build test` fails. Add a mutant for each new guard and run `python3 tests/mutants.py` (or `python3 tests/mutants.py 12 13` for some) before committing; do not commit while it runs, because it edits `src/`.
 
 When changing parser behavior or adding a new format, keep the valid corpus,
 invalid corpus, and fuzz coverage aligned.

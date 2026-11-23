@@ -9,7 +9,7 @@ Project conventions for automated changes:
 - keep `.github/workflows/ci.yml` validating native lib, wasm lib, tests, examples, the transcoder CLI, and `zig build bench-build`
 - keep `.github/workflows/release.yml` aligned with the documented release process and tag conventions
 - benchmark workflow lives in `bench/README.md`
-- benchmark history lives in `bench/BIN.md`, `bench/BSON.md`, `bench/CBOR.md`, `bench/JSON.md`, `bench/MEMORY.md`, `bench/MSGPACK.md`, `bench/TOML.md`, `bench/WASM.md`, `bench/YAML.md`, and `bench/ZON.md`
+- benchmark history lives in `bench/BIN.md`, `bench/BSON.md`, `bench/BULK.md`, `bench/CBOR.md`, `bench/JSON.md`, `bench/MEMORY.md`, `bench/MSGPACK.md`, `bench/TOML.md`, `bench/WASM.md`, `bench/YAML.md`, and `bench/ZON.md`
 - benchmark timing is implemented with `zBench`; keep the scenario workloads and fairness policy stable unless you are intentionally changing benchmark behavior
 - add benchmark log entries only for real benchmark-affecting changes, newest first, with sections named `## YYYY-MM-DD - <hash>`
 - corpus roundtrip fixtures live in `tests/corpus/<format>` and should stay in canonical output form
@@ -20,4 +20,5 @@ Project conventions for automated changes:
 - wasm examples live in `examples/` and should keep building with `zig build examples`
 - the transcoder CLI lives in `bin/` and should keep building with `zig build transcode`
 - keep `README.md`, `bench/README.md`, and `CONTRIBUTING.md` aligned with the current workflow
+- `tests/mutants.py` lists the mutants (a removed or weakened guard) the tests must kill; add one for each new guard, and run it before committing, never while committing
 - keep this file updated when repo conventions change

@@ -448,6 +448,9 @@ pub fn build(b: *std.Build) void {
     const run_bench_json = b.addRunArtifact(bench_exe);
     run_bench_json.addArg("json");
 
+    const run_bench_bulk = b.addRunArtifact(bench_exe);
+    run_bench_bulk.addArg("bulk");
+
     const run_bench_memory = b.addRunArtifact(bench_exe);
     run_bench_memory.addArg("memory");
 
@@ -480,6 +483,9 @@ pub fn build(b: *std.Build) void {
 
     const bench_json_step = b.step("bench-json", "Run JSON benchmark against std.json");
     bench_json_step.dependOn(&run_bench_json.step);
+
+    const bench_bulk_step = b.step("bench-bulk", "Run the word-at-a-time string scans against the standard library");
+    bench_bulk_step.dependOn(&run_bench_bulk.step);
 
     const bench_memory_step = b.step("bench-memory", "Run zerde allocation benchmark across formats");
     bench_memory_step.dependOn(&run_bench_memory.step);

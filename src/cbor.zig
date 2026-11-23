@@ -23,6 +23,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const typed = @import("typed.zig");
 const meta = @import("meta.zig");
+const bulk = @import("bulk.zig");
 const Number = typed.Number;
 const StringToken = typed.StringToken;
 const ValueKind = typed.ValueKind;
@@ -666,7 +667,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                         if (header.value > self.max_string_len) return error.StringTooLong;
                         const raw = try self.takeBytes(header.value);
                         if (typed.matchStructFieldIndex(T, cfg, raw)) |index| return .{ .field_index = index };
-                        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
+                        if (!bulk.validUtf8(raw)) return error.InvalidUtf8;
                         try self.recordText(.{ .bytes = raw, .allocated = false });
                         return .unknown;
                     }
@@ -838,7 +839,7 @@ pub fn CborDeserializer(comptime Config: type) type {
             if (!header.indefinite) {
                 if (header.value > self.max_string_len) return error.StringTooLong;
                 const raw = try self.takeBytes(header.value);
-                if (is_text and !std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
+                if (is_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
                 return .{ .bytes = raw, .allocated = false };
             }
 
@@ -854,7 +855,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;
                 if (chunk.value > self.max_string_len - assembled.items.len) return error.StringTooLong;
                 const raw = try self.takeBytes(chunk.value);
-                if (is_text and !std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
+                if (is_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
                 try assembled.appendSlice(allocator, raw);
             }
             return .{ .bytes = try assembled.toOwnedSlice(allocator), .allocated = true };

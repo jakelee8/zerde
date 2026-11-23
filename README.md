@@ -395,6 +395,16 @@ or write takes (`.{}` for none), because call-site overrides and `rename_all` ch
 A description is shallow: a field carries its `type`, and a generator describes that in turn, so recursive
 types need no care. `tests/typed_tests.zig` builds a small declaration generator from it.
 
+### Bulk string scans
+
+The JSON and CBOR backends find the end of a string, escape text and validate UTF-8 over runs of
+bytes (`zerde.bulk`), with 64-bit integer operations only, so they behave the same on every target and
+a WebAssembly build without `simd128` gets the same speedup. Escaping is a run at a time and writes
+exactly what `std.json.Stringify` writes. UTF-8 validation uses the standard library's validator where
+that skips ASCII in vector chunks (native, or WebAssembly with SIMD) and the word-at-a-time one
+(`validUtf8Words`) elsewhere. `zig build bench-bulk -Doptimize=ReleaseFast` compares them; numbers are in
+[`bench/BULK.md`](bench/BULK.md).
+
 ### Raw items
 
 A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked
