@@ -260,6 +260,8 @@ MUTANTS = [
     ("typed.zig", "if (comptime hasMax(bounds) and @hasDecl(DeserializerType, \"readByteTokenMax\"))", "if (comptime false and @hasDecl(DeserializerType, \"readByteTokenMax\"))"),
     ("cbor.zig", "if (max < saved) self.max_string_len = max;\n            return self.readString(allocator)", "return self.readString(allocator)"),
     ("cbor.zig", "if (err == error.StringTooLong and max < saved) error.LengthOutOfBounds else err;\n        }\n\n        /// `readByteToken`", "err;\n        }\n\n        /// `readByteToken`"),
+    ("cbor.zig", "    if (!bulk.validUtf8(value)) return error.InvalidUtf8;\n    try writeMajorValue(writer, 3, value.len);", "    try writeMajorValue(writer, 3, value.len);"),
+    ("json.zig", "    if (!bulk.validUtf8(bytes)) return error.InvalidUtf8;\n    try writeQuoted(writer, bytes);", "    try writeQuoted(writer, bytes);"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

@@ -1895,7 +1895,9 @@ fn writePreferredFloat(writer: *std.Io.Writer, value: anytype) !void {
     return writeFloat(writer, wide);
 }
 
+/// A text string is UTF-8 (RFC 8949 §3.1): bytes that are not would write output no reader accepts.
 fn writeTextString(writer: *std.Io.Writer, value: []const u8) !void {
+    if (!bulk.validUtf8(value)) return error.InvalidUtf8;
     try writeMajorValue(writer, 3, value.len);
     try writer.writeAll(value);
 }

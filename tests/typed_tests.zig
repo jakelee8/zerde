@@ -2601,3 +2601,28 @@ test "a chunked string is refused at its bound before it is joined" {
     try std.testing.expectEqualStrings("ab", ok.s);
     try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith(Capped, allocator, &.{ 0xa1, 0x61, 's', 0x7f, 0x62, 'a', 'b', 0xff }, .{}, .{ .max_string_len = 1 }));
 }
+
+test "a writer refuses text that is not UTF-8 in either format, so its output reads back" {
+    const Text = struct { s: []const u8 };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.cbor, &out.writer, Text{ .s = "\xff" }, .{}, .{ .deterministic = true }));
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.cbor, &out.writer, Text{ .s = "ok\xc3" }, .{}, .{}));
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.json, &out.writer, Text{ .s = "\xff" }, .{}, .{}));
+    // A key is text too.
+    const Keyed2 = struct {
+        f: u8,
+        pub const serde = .{ .fields = .{ .f = .{ .rename = "k" } } };
+    };
+    try zerde.serializeWith(zerde.json, &out.writer, Keyed2{ .f = 1 }, .{}, .{});
+    // The value writers and encode hooks too.
+    var cbor = zerde.cbor.valueWriter(allocator, &out.writer, .{});
+    defer cbor.deinit();
+    try std.testing.expectError(error.InvalidUtf8, cbor.writeText("\xed\xa0\x80"));
+    var json = zerde.json.valueWriter(allocator, &out.writer, .{});
+    defer json.deinit();
+    try std.testing.expectError(error.InvalidUtf8, json.writeText("\xc0\xaf"));
+    // Valid multi-byte text passes.
+    try zerde.serializeWith(zerde.cbor, &out.writer, Text{ .s = "h\xc3\xa9 \xe2\x82\xac" }, .{}, .{});
+    try zerde.serializeWith(zerde.json, &out.writer, Text{ .s = "h\xc3\xa9 \xe2\x82\xac" }, .{}, .{});
+}

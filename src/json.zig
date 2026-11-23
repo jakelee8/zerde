@@ -1217,7 +1217,7 @@ fn writeBytesText(writer: *std.Io.Writer, encoding: BytesEncoding, value: []cons
     switch (encoding) {
         .string => {
             if (!bulk.validUtf8(value)) return error.InvalidUtf8;
-            try writeEscapedString(writer, value);
+            try writeQuoted(writer, value);
         },
         .base64 => {
             try writer.writeByte('"');
@@ -1238,6 +1238,12 @@ fn readLimitFlag(cfg: anytype, comptime name: []const u8, default: bool) bool {
 }
 
 pub fn writeEscapedString(writer: *std.Io.Writer, bytes: []const u8) !void {
+    if (!bulk.validUtf8(bytes)) return error.InvalidUtf8;
+    try writeQuoted(writer, bytes);
+}
+
+/// A string literal for text already known to be UTF-8.
+fn writeQuoted(writer: *std.Io.Writer, bytes: []const u8) !void {
     try writer.writeByte('"');
     try bulk.writeEscaped(writer, bytes);
     try writer.writeByte('"');
