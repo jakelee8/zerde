@@ -1,9 +1,11 @@
 //! CBOR backend for the typed walk.
 //!
-//! This backend writes arrays with definite lengths and structs as indefinite
-//! maps so field omission stays cheap. Text fields default to CBOR text strings;
-//! the read path also accepts byte strings for `[]const u8` to stay interoperable
-//! with common CBOR producers.
+//! This backend writes arrays with definite lengths and, by default, structs as
+//! indefinite maps in declaration order. `WriteConfig.deterministic` selects the
+//! core deterministic encoding of RFC 8949 §4.2.1 instead. Text fields default
+//! to CBOR text strings and `[N]u8` arrays are byte strings; the read path also
+//! accepts byte strings for `[]const u8` to stay interoperable with common CBOR
+//! producers.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,7 +20,25 @@ pub const ReadConfig = struct {
     max_input_bytes: usize = 16 * 1024 * 1024,
     borrow_strings: bool = false,
 };
-pub const WriteConfig = struct {};
+pub const WriteConfig = struct {
+    /// Write the core deterministic encoding of RFC 8949 §4.2.1, so equal values produce equal
+    /// bytes that can be hashed or signed: definite-length maps, struct fields in `length_first`
+    /// order, and each float in the shortest of half, single and double precision that keeps its
+    /// value, with NaN as `0xf97e00`. Integers and lengths are always written in their shortest
+    /// form. Asking for another `field_order` is a compile error.
+    deterministic: bool = false,
+};
+
+/// Field order of a write with `cfg`: `length_first`, and required, when it is deterministic.
+pub fn fieldOrderPolicy(comptime cfg: anytype) meta.FieldOrderPolicy {
+    if (effectiveDeterministic(cfg)) return .{ .default = .length_first, .required = true };
+    return .{};
+}
+
+fn effectiveDeterministic(comptime cfg: anytype) bool {
+    if (comptime meta.hasField(@TypeOf(cfg), "deterministic")) return @field(cfg, "deterministic");
+    return false;
+}
 pub const ParseError = anyerror;
 
 const ContainerKind = enum {
@@ -39,8 +59,8 @@ const Header = struct {
     indefinite: bool,
 };
 
-pub fn serializer(writer: *std.Io.Writer, comptime cfg: anytype) CborSerializer(@TypeOf(cfg)) {
-    return CborSerializer(@TypeOf(cfg)).init(writer, cfg);
+pub fn serializer(writer: *std.Io.Writer, comptime cfg: anytype) CborSerializer(@TypeOf(cfg), effectiveDeterministic(cfg)) {
+    return CborSerializer(@TypeOf(cfg), effectiveDeterministic(cfg)).init(writer, cfg);
 }
 
 pub fn readerDeserializer(allocator: Allocator, reader: *std.Io.Reader, comptime cfg: anytype) !CborDeserializer(@TypeOf(cfg)) {
@@ -53,7 +73,8 @@ pub fn sliceDeserializer(allocator: Allocator, input: []const u8, comptime cfg: 
     return CborDeserializer(@TypeOf(cfg)).initBorrowed(input, cfg);
 }
 
-pub fn CborSerializer(comptime Config: type) type {
+/// `deterministic` is a type parameter, so the default write carries no runtime branch for it.
+pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type {
     return struct {
         writer: *std.Io.Writer,
         cfg: Config,
@@ -81,6 +102,7 @@ pub fn CborSerializer(comptime Config: type) type {
         }
 
         pub fn emitFloat(self: *Self, value: anytype) !void {
+            if (deterministic) return writePreferredFloat(self.writer, value);
             try writeFloat(self.writer, value);
         }
 
@@ -88,13 +110,24 @@ pub fn CborSerializer(comptime Config: type) type {
             try writeTextString(self.writer, value);
         }
 
+        pub fn emitBytes(self: *Self, value: []const u8) !void {
+            try writeMajorValue(self.writer, 2, value.len);
+            try self.writer.writeAll(value);
+        }
+
         pub fn emitEnum(self: *Self, comptime _: type, value: anytype) !void {
             try writeTextString(self.writer, @tagName(value));
         }
 
-        pub fn beginStruct(self: *Self, comptime T: type) !void {
+        /// A deterministic map states its length; any other map is indefinite, which keeps the
+        /// default encoding byte-identical to earlier releases.
+        pub fn beginStructSized(self: *Self, comptime T: type, field_count: usize) !void {
             _ = T;
-            try self.writer.writeByte(0xbf);
+            if (deterministic) {
+                try writeMajorValue(self.writer, 5, field_count);
+            } else {
+                try self.writer.writeByte(0xbf);
+            }
         }
 
         pub fn structPassCount(comptime T: type) usize {
@@ -125,7 +158,7 @@ pub fn CborSerializer(comptime Config: type) type {
 
         pub fn endStruct(self: *Self, comptime T: type) !void {
             _ = T;
-            try self.writer.writeByte(0xff);
+            if (!deterministic) try self.writer.writeByte(0xff);
         }
 
         pub fn beginArray(self: *Self, comptime Child: type, len: usize) !void {
@@ -623,6 +656,23 @@ fn writeFloat(writer: *std.Io.Writer, value: anytype) !void {
     }
 }
 
+/// RFC 8949 §4.1 preferred serialization: the shortest of half, single and double precision that
+/// keeps the value exactly, and the canonical quiet NaN `0xf97e00` for every NaN.
+fn writePreferredFloat(writer: *std.Io.Writer, value: anytype) !void {
+    const wide: f64 = switch (@typeInfo(@TypeOf(value))) {
+        .comptime_float => value,
+        .float => |info| if (info.bits <= 64) @floatCast(value) else return error.UnsupportedType,
+        else => return error.UnsupportedType,
+    };
+    if (std.math.isNan(wide)) return writer.writeAll(&.{ 0xf9, 0x7e, 0x00 });
+
+    const half: f16 = @floatCast(wide);
+    if (@as(f64, half) == wide) return writeFloat(writer, half);
+    const single: f32 = @floatCast(wide);
+    if (@as(f64, single) == wide) return writeFloat(writer, single);
+    return writeFloat(writer, wide);
+}
+
 fn writeTextString(writer: *std.Io.Writer, value: []const u8) !void {
     try writeMajorValue(writer, 3, value.len);
     try writer.writeAll(value);
@@ -666,8 +716,8 @@ fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
     return (ReadConfig{}).max_input_bytes;
 }
 
-fn effectiveBorrowStrings(comptime cfg: anytype) bool {
-    if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return @field(cfg, "borrow_strings");
+fn effectiveBorrowStrings(cfg: anytype) bool {
+    if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return cfg.borrow_strings;
     return false;
 }
 
@@ -931,4 +981,123 @@ test "indefinite length is rejected for invalid major types" {
         error.InvalidAdditionalInfo,
         parseSlice(u8, std.testing.allocator, &.{0x1f}),
     );
+}
+
+test "a fixed byte array is written as a byte string and read back" {
+    const Example = struct {
+        digest: [3]u8,
+    };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, Example{ .digest = .{ 0xff, 0x00, 0x80 } }, .{}, .{});
+
+    // Map head, "digest" as text, then a 3-byte bstr (0x43): not a text string, which must be UTF-8.
+    try std.testing.expectEqualSlices(u8, &.{ 0xbf, 0x66, 'd', 'i', 'g', 'e', 's', 't', 0x43, 0xff, 0x00, 0x80, 0xff }, out.written());
+    const decoded = try parseSlice(Example, std.testing.allocator, out.written());
+    try std.testing.expectEqualDeep([_]u8{ 0xff, 0x00, 0x80 }, decoded.digest);
+}
+
+test "deterministic writes a definite map with length-first keys" {
+    const Example = struct {
+        zeta: u8,
+        id: u8,
+        alpha: u8,
+        beta: u8,
+    };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, Example{ .zeta = 1, .id = 2, .alpha = 3, .beta = 4 }, .{}, .{ .deterministic = true });
+
+    // Four pairs (0xa4); "id" before "beta" before "zeta" (length 4, bytewise) before "alpha".
+    try std.testing.expectEqualSlices(u8, &.{
+        0xa4,
+        0x62,
+        'i',
+        'd',
+        0x02,
+        0x64,
+        'b',
+        'e',
+        't',
+        'a',
+        0x04,
+        0x64,
+        'z',
+        'e',
+        't',
+        'a',
+        0x01,
+        0x65,
+        'a',
+        'l',
+        'p',
+        'h',
+        'a',
+        0x03,
+    }, out.written());
+}
+
+test "deterministic orders by wire name and counts omitted fields out" {
+    const Example = struct {
+        long_name: u8,
+        b: ?u8,
+
+        pub const serde = .{ .rename_all = .camelCase };
+    };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, Example{ .long_name = 7, .b = null }, .{ .omit_null_fields = true }, WriteConfig{ .deterministic = true });
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x68, 'l', 'o', 'n', 'g', 'N', 'a', 'm', 'e', 0x07 }, out.written());
+}
+
+test "deterministic output does not depend on declaration order" {
+    const Forward = struct { a: u8, bb: u8, ccc: u8 };
+    const Backward = struct { ccc: u8, bb: u8, a: u8 };
+
+    var forward: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer forward.deinit();
+    var backward: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer backward.deinit();
+    try serializeWith(&forward.writer, Forward{ .a = 1, .bb = 2, .ccc = 3 }, .{}, .{ .deterministic = true });
+    try serializeWith(&backward.writer, Backward{ .ccc = 3, .bb = 2, .a = 1 }, .{}, .{ .deterministic = true });
+    try std.testing.expectEqualSlices(u8, forward.written(), backward.written());
+}
+
+test "deterministic writes each float in its shortest exact width" {
+    const cases = [_]struct { value: f64, bytes: []const u8 }{
+        .{ .value = 1.5, .bytes = &.{ 0xf9, 0x3e, 0x00 } },
+        .{ .value = -0.0, .bytes = &.{ 0xf9, 0x80, 0x00 } },
+        .{ .value = std.math.inf(f64), .bytes = &.{ 0xf9, 0x7c, 0x00 } },
+        .{ .value = std.math.nan(f64), .bytes = &.{ 0xf9, 0x7e, 0x00 } },
+        .{ .value = 100000.0, .bytes = &.{ 0xfa, 0x47, 0xc3, 0x50, 0x00 } },
+        .{ .value = 1.1, .bytes = &.{ 0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a } },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try serializeWith(&out.writer, case.value, .{}, .{ .deterministic = true });
+        try std.testing.expectEqualSlices(u8, case.bytes, out.written());
+    }
+}
+
+test "the default write keeps indefinite maps in declaration order" {
+    const Example = struct { zeta: u8, id: u8 };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, Example{ .zeta = 1, .id = 2 }, .{}, .{});
+    try std.testing.expectEqualSlices(u8, &.{ 0xbf, 0x64, 'z', 'e', 't', 'a', 0x01, 0x62, 'i', 'd', 0x02, 0xff }, out.written());
+}
+
+test "a field order from the call site applies to the default write" {
+    const Example = struct { zeta: u8, id: u8 };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, Example{ .zeta = 1, .id = 2 }, .{ .field_order = .bytewise }, .{});
+    try std.testing.expectEqualSlices(u8, &.{ 0xbf, 0x62, 'i', 'd', 0x02, 0x64, 'z', 'e', 't', 'a', 0x01, 0xff }, out.written());
 }

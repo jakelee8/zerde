@@ -744,8 +744,8 @@ fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
     return (ReadConfig{}).max_input_bytes;
 }
 
-fn effectiveBorrowStrings(comptime cfg: anytype) bool {
-    if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return @field(cfg, "borrow_strings");
+fn effectiveBorrowStrings(cfg: anytype) bool {
+    if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return cfg.borrow_strings;
     return false;
 }
 

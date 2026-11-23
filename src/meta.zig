@@ -14,11 +14,35 @@ pub const FieldCase = enum {
     kebab_case,
 };
 
+/// The order struct fields are written in.
+///
+/// Reading accepts fields in any order whatever this says.
+pub const FieldOrder = enum {
+    /// Source declaration order.
+    declaration,
+    /// Shorter wire name first, then bytewise. For text keys this is the order of RFC 8949 §4.2.1
+    /// (bytewise order of the encoded keys) and of the length-first ordering in §4.2.3.
+    length_first,
+    /// Bytewise order of the wire names. For ASCII names this is the order of RFC 8785 (JSON
+    /// Canonicalization Scheme), which sorts by UTF-16 code unit.
+    bytewise,
+};
+
+/// A format's field order: the order it uses when neither the call site nor the type names one,
+/// and whether it requires that order. A deterministic encoding requires its order, so asking such
+/// a format for another order is a compile error instead of output that only looks deterministic.
+pub const FieldOrderPolicy = struct {
+    default: FieldOrder = .declaration,
+    required: bool = false,
+};
+
 /// Cross-format serde policy. Individual formats can add their own config on top.
 pub const SerdeConfig = struct {
     rename_all: FieldCase = .unchanged,
     omit_null_fields: bool = false,
     deny_unknown_fields: bool = false,
+    /// Field order on write. Null lets the format choose (`FieldOrderPolicy.default`).
+    field_order: ?FieldOrder = null,
 };
 
 pub const JsonConfig = SerdeConfig;
@@ -77,6 +101,20 @@ pub fn effectiveDenyUnknownFields(comptime T: type, comptime cfg: anytype) bool 
     if (comptime cfgHasField(cfg, "deny_unknown_fields")) return @field(cfg, "deny_unknown_fields");
     if (comptime serdeHasField(T, "deny_unknown_fields")) return @field(T.serde, "deny_unknown_fields");
     return false;
+}
+
+/// Field order precedence is: call site, then the type's `serde`, then the format's default.
+///
+/// A format that requires its order rejects any other at compile time.
+pub fn effectiveFieldOrder(comptime T: type, comptime cfg: anytype, comptime policy: FieldOrderPolicy) FieldOrder {
+    const from_call: ?FieldOrder = comptime if (cfgHasField(cfg, "field_order")) @field(cfg, "field_order") else null;
+    const from_type: ?FieldOrder = comptime if (serdeHasField(T, "field_order")) @field(T.serde, "field_order") else null;
+    const order: FieldOrder = if (from_call) |call| call else if (from_type) |declared| declared else policy.default;
+    if (policy.required and order != policy.default) {
+        @compileError("this format writes fields in " ++ @tagName(policy.default) ++ " order; " ++ @typeName(T) ++
+            " asks for " ++ @tagName(order));
+    }
+    return order;
 }
 
 /// Field name precedence is: call-site field override, type field override, then rename_all.

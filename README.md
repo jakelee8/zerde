@@ -168,7 +168,30 @@ Supported typed-layer options today:
 - `rename_all`
 - `omit_null_fields`
 - `deny_unknown_fields`
+- `field_order`: `.declaration`, `.length_first` or `.bytewise`; unset, the format chooses
 - per-field `rename`
+
+Format-level options are passed as the last argument:
+
+- CBOR `WriteConfig.deterministic` writes the core deterministic encoding of RFC 8949 §4.2.1:
+  definite-length maps, fields in `length_first` order, and the shortest exact float width.
+  Equal values then produce equal bytes, so the output can be hashed or signed. Asking a
+  deterministic write for another `field_order` is a compile error. The default write uses
+  indefinite maps in declaration order.
+- JSON `WriteConfig.bytes` and `ReadConfig.bytes` choose how a `[N]u8` field is carried:
+  `.string` (the default, raw bytes in a string), `.base64` (padded, RFC 4648 §4) or
+  `.base64url` (unpadded, RFC 4648 §5). Reader and writer must agree.
+
+Byte fields: a `[N]u8` field is a native byte string in CBOR, MessagePack, BSON and the binary
+format. A `[]const u8` field is always a text string in every format.
+
+```zig
+// The same value always encodes to the same bytes.
+try zerde.serializeWith(zerde.cbor, &out.writer, spec, .{}, zerde.cbor.WriteConfig{ .deterministic = true });
+
+// A digest as base64 in JSON.
+try zerde.serializeWith(zerde.json, &out.writer, record, .{}, .{ .bytes = .base64 });
+```
 
 Example:
 

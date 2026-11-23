@@ -13,12 +13,32 @@ const StringToken = typed.StringToken;
 const ValueKind = typed.ValueKind;
 
 pub const FieldCase = meta.FieldCase;
+
+/// How a `[N]u8` field is carried in JSON, which has no byte type.
+pub const BytesEncoding = enum {
+    /// A JSON string holding the raw bytes. Exact only for valid UTF-8.
+    string,
+    /// Padded standard base64 (RFC 4648 §4), as JSON Schema's `contentEncoding: base64`.
+    base64,
+    /// Unpadded URL-safe base64 (RFC 4648 §5), as JOSE (RFC 7515) and URL path segments use.
+    base64url,
+};
+
 /// Reader-side limits and aliasing policy.
 pub const ReadConfig = struct {
     max_input_bytes: usize = 16 * 1024 * 1024,
     borrow_strings: bool = false,
+    /// Must match the writer's `bytes`; a base64 field that does not decode is `error.InvalidBytes`.
+    bytes: BytesEncoding = .string,
 };
-pub const WriteConfig = struct {};
+pub const WriteConfig = struct {
+    bytes: BytesEncoding = .string,
+};
+
+fn bytesEncoding(comptime Config: type, cfg: Config) BytesEncoding {
+    if (comptime meta.hasField(Config, "bytes")) return cfg.bytes;
+    return .string;
+}
 pub const ParseError = anyerror;
 
 const ContainerKind = enum {
@@ -87,6 +107,22 @@ pub fn JsonSerializer(comptime Config: type) type {
 
         pub fn emitString(self: *Self, value: []const u8) !void {
             try writeEscapedString(self.writer, value);
+        }
+
+        pub fn emitBytes(self: *Self, value: []const u8) !void {
+            switch (bytesEncoding(Config, self.cfg)) {
+                .string => try writeEscapedString(self.writer, value),
+                .base64 => {
+                    try self.writer.writeByte('"');
+                    try std.base64.standard.Encoder.encodeWriter(self.writer, value);
+                    try self.writer.writeByte('"');
+                },
+                .base64url => {
+                    try self.writer.writeByte('"');
+                    try std.base64.url_safe_no_pad.Encoder.encodeWriter(self.writer, value);
+                    try self.writer.writeByte('"');
+                },
+            }
         }
 
         pub fn beginStruct(self: *Self, comptime T: type) !void {
@@ -233,6 +269,23 @@ pub fn JsonDeserializer(comptime Config: type) type {
 
         pub fn errorLocation(self: *Self) diagnostic_mod.Location {
             return diagnostic_mod.locationFromOffset(self.input, self.parser.index);
+        }
+
+        /// Reads a `[N]u8` field in the configured `ReadConfig.bytes` encoding.
+        pub fn readByteToken(self: *Self, allocator: Allocator) !StringToken {
+            const token = try self.readString(allocator);
+            const codec = switch (bytesEncoding(Config, self.cfg)) {
+                .string => return token,
+                .base64 => std.base64.standard.Decoder,
+                .base64url => std.base64.url_safe_no_pad.Decoder,
+            };
+            defer token.deinit(allocator);
+
+            const decoded_len = codec.calcSizeForSlice(token.bytes) catch return error.InvalidBytes;
+            const buffer = try allocator.alloc(u8, decoded_len);
+            errdefer allocator.free(buffer);
+            codec.decode(buffer, token.bytes) catch return error.InvalidBytes;
+            return .{ .bytes = buffer, .allocated = true };
         }
 
         // The typed layer uses this to branch for optionals, enums, and skipping.
@@ -533,8 +586,8 @@ fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
     return 16 * 1024 * 1024;
 }
 
-fn effectiveBorrowStrings(comptime cfg: anytype) bool {
-    if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return @field(cfg, "borrow_strings");
+fn effectiveBorrowStrings(cfg: anytype) bool {
+    if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return cfg.borrow_strings;
     return false;
 }
 
@@ -880,4 +933,64 @@ test "reader and writer entrypoints work" {
         "{\"service_name\":\"api\",\"port\":8080}",
         out.written(),
     );
+}
+
+test "a fixed byte array is a raw string by default" {
+    const Example = struct { tag: [2]u8 };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, Example{ .tag = "ok".* }, .{}, .{});
+    try std.testing.expectEqualStrings("{\"tag\":\"ok\"}", out.written());
+
+    const decoded = try parseSlice(Example, std.testing.allocator, out.written());
+    try std.testing.expectEqualDeep("ok".*, decoded.tag);
+}
+
+test "a fixed byte array round-trips as padded standard base64" {
+    const Example = struct { digest: [4]u8 };
+    const value = Example{ .digest = .{ 0xfb, 0xff, 0x00, 0x3e } };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, value, .{}, WriteConfig{ .bytes = .base64 });
+    try std.testing.expectEqualStrings("{\"digest\":\"+/8APg==\"}", out.written());
+
+    const decoded = try parseSliceWith(Example, std.testing.allocator, out.written(), .{}, .{ .bytes = .base64 });
+    try std.testing.expectEqualDeep(value, decoded);
+}
+
+test "a fixed byte array round-trips as unpadded url-safe base64" {
+    const Example = struct { digest: [4]u8 };
+    const value = Example{ .digest = .{ 0xfb, 0xff, 0x00, 0x3e } };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, value, .{}, .{ .bytes = .base64url });
+    try std.testing.expectEqualStrings("{\"digest\":\"-_8APg\"}", out.written());
+
+    const decoded = try parseSliceWith(Example, std.testing.allocator, out.written(), .{}, ReadConfig{ .bytes = .base64url });
+    try std.testing.expectEqualDeep(value, decoded);
+}
+
+test "a base64 field that does not decode is refused" {
+    const Example = struct { digest: [4]u8 };
+    try std.testing.expectError(
+        error.InvalidBytes,
+        parseSliceWith(Example, std.testing.allocator, "{\"digest\":\"not base64!\"}", .{}, .{ .bytes = .base64 }),
+    );
+}
+
+test "a type can ask for bytewise field order" {
+    const Example = struct {
+        zeta: u8,
+        alpha: u8,
+
+        pub const serde = .{ .field_order = .bytewise };
+    };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serializeWith(&out.writer, Example{ .zeta = 1, .alpha = 2 }, .{}, .{});
+    try std.testing.expectEqualStrings("{\"alpha\":2,\"zeta\":1}", out.written());
 }

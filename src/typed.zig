@@ -63,7 +63,53 @@ pub fn free(allocator: Allocator, value: anytype) void {
 pub fn serialize(comptime Format: type, writer: *std.Io.Writer, value: anytype, comptime serde_cfg: anytype, comptime format_cfg: anytype) !void {
     var serializer = Format.serializer(writer, format_cfg);
     defer if (@hasDecl(@TypeOf(serializer), "deinit")) serializer.deinit();
-    try serializeValue(&serializer, value, serde_cfg);
+    try serializeValue(&serializer, value, serde_cfg, comptime fieldOrderPolicy(Format, format_cfg));
+}
+
+/// The format's field order for this write. A format declares `fieldOrderPolicy` when its config
+/// can change the order, as deterministic CBOR does; every other format writes declaration order.
+fn fieldOrderPolicy(comptime Format: type, comptime format_cfg: anytype) meta.FieldOrderPolicy {
+    if (@hasDecl(Format, "fieldOrderPolicy")) return Format.fieldOrderPolicy(format_cfg);
+    return .{};
+}
+
+/// Indexes of `T`'s fields in the order they are written.
+fn structFieldOrder(
+    comptime T: type,
+    comptime info: std.builtin.Type.Struct,
+    comptime cfg: anytype,
+    comptime policy: meta.FieldOrderPolicy,
+) [info.field_names.len]usize {
+    const count = info.field_names.len;
+    var order: [count]usize = undefined;
+    for (0..count) |index| order[index] = index;
+    const field_order = meta.effectiveFieldOrder(T, cfg, policy);
+    if (field_order == .declaration) return order;
+
+    // Resolve wire names once: the sort compares O(n^2) pairs, and resolving a name inside the
+    // comparison exceeds the comptime branch quota on small structs.
+    var names: [count][]const u8 = undefined;
+    for (0..count) |index| names[index] = meta.effectiveFieldName(T, info.field_names[index], cfg);
+
+    // Insertion sort: stable, and field counts are small.
+    var i: usize = 1;
+    while (i < count) : (i += 1) {
+        var j = i;
+        while (j > 0 and nameLess(field_order, names[order[j]], names[order[j - 1]])) : (j -= 1) {
+            const swap = order[j - 1];
+            order[j - 1] = order[j];
+            order[j] = swap;
+        }
+    }
+    return order;
+}
+
+fn nameLess(comptime field_order: meta.FieldOrder, a: []const u8, b: []const u8) bool {
+    return switch (field_order) {
+        .declaration => false,
+        .length_first => if (a.len != b.len) a.len < b.len else std.mem.lessThan(u8, a, b),
+        .bytewise => std.mem.lessThan(u8, a, b),
+    };
 }
 
 /// Entry point used by `root.zig` once a format-specific deserializer has been created.
@@ -81,7 +127,7 @@ pub fn deserializeWithDiagnostics(
     return deserializeValue(T, allocator, deserializer, cfg, diagnostics, true);
 }
 
-fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !void {
+fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, comptime order_policy: meta.FieldOrderPolicy) !void {
     const T = @TypeOf(value);
     const SerializerType = @TypeOf(serializer.*);
     switch (@typeInfo(T)) {
@@ -92,13 +138,13 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !v
             if (@hasDecl(SerializerType, "beginOptional")) {
                 if (value) |child| {
                     try serializer.beginOptional(true);
-                    try serializeValue(serializer, child, cfg);
+                    try serializeValue(serializer, child, cfg, order_policy);
                 } else {
                     try serializer.beginOptional(false);
                 }
             } else {
                 if (value) |child| {
-                    try serializeValue(serializer, child, cfg);
+                    try serializeValue(serializer, child, cfg, order_policy);
                 } else {
                     try serializer.emitNull();
                 }
@@ -128,7 +174,7 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !v
             try serializer.beginArray(info.child, value.len);
             for (value, 0..) |item, index| {
                 try serializer.beginArrayItem(info.child, index);
-                try serializeValue(serializer, item, cfg);
+                try serializeValue(serializer, item, cfg, order_policy);
                 try serializer.endArrayItem(info.child, index);
             }
             try serializer.endArray(info.child, value.len);
@@ -147,12 +193,12 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !v
                 try serializer.beginArray(info.child, value.len);
                 for (value, 0..) |item, index| {
                     try serializer.beginArrayItem(info.child, index);
-                    try serializeValue(serializer, item, cfg);
+                    try serializeValue(serializer, item, cfg, order_policy);
                     try serializer.endArrayItem(info.child, index);
                 }
                 try serializer.endArray(info.child, value.len);
             },
-            .one => try serializeValue(serializer, value.*, cfg),
+            .one => try serializeValue(serializer, value.*, cfg, order_policy),
             else => @compileError("zerde cannot serialize pointer type " ++ @typeName(T)),
         },
         .@"struct" => |info| {
@@ -179,9 +225,12 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !v
             } else {
                 try serializer.beginStruct(T);
             }
+            const field_order = comptime structFieldOrder(T, info, cfg, order_policy);
             inline for (0..pass_count) |pass| {
-                inline for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attrs| {
-                    if (field_attrs.@"comptime") {
+                inline for (field_order) |field_index| {
+                    const field_name = info.field_names[field_index];
+                    const field_type = info.field_types[field_index];
+                    if (info.field_attrs[field_index].@"comptime") {
                         @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field_name);
                     }
 
@@ -196,7 +245,7 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !v
                             else
                                 try serializer.beginStructField(T, emitted_name, field_type);
                             if (emit_value) {
-                                try serializeValue(serializer, field_value, cfg);
+                                try serializeValue(serializer, field_value, cfg, order_policy);
                             }
                             try serializer.endStructField(T, emitted_name, field_type);
                         }

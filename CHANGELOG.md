@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- added `field_order` to the typed-layer config (`.declaration`, `.length_first`, `.bytewise`), settable per call or per type
+- added CBOR `WriteConfig.deterministic`: the core deterministic encoding of RFC 8949 §4.2.1 (definite-length maps, `length_first` keys, shortest exact float width, canonical NaN)
+- added JSON `WriteConfig.bytes` and `ReadConfig.bytes` to carry `[N]u8` fields as `.string`, `.base64` or `.base64url`
+- CBOR writes `[N]u8` fields as byte strings, as MessagePack, BSON and the binary format do; they were text strings, which RFC 8949 requires to be UTF-8
+- named `ReadConfig` values (for example `json.ReadConfig{ .borrow_strings = true }`) compile; only anonymous literals did
 - ported the library, tests, examples, transcoder CLI, and benchmark harness to Zig 0.17.0; `minimum_zig_version` is now `0.17.0`
 - adapted the typed reflection layer to the 0.17 `@typeInfo` shape (`field_names`, `field_types`, `field_attrs`, `attrs.@"const"`)
 - adapted the ZON backend to the 0.17 `std.zig.Ast`, `Zoir`, and `std.zon.Serializer` signatures
