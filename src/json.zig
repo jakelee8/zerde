@@ -121,6 +121,62 @@ pub fn JsonSerializer(comptime Config: type) type {
             try writeEscapedString(self.writer, value);
         }
 
+        /// Where the writer is in an extras object (see `beginExtras`).
+        pub const ExtrasCursor = struct {
+            bytes: []const u8,
+            pos: usize,
+        };
+
+        /// Starts walking an extras object: JSON text as a read leaves it, `{"key":value,...}`.
+        pub fn beginExtras(self: *Self, bytes: []const u8) !ExtrasCursor {
+            _ = self;
+            if (bytes.len == 0) return .{ .bytes = bytes, .pos = 0 };
+            var parser: Parser = .{ .input = bytes };
+            parser.skipWhitespace();
+            if (parser.consume() != '{') return error.UnexpectedToken;
+            return .{ .bytes = bytes, .pos = parser.index };
+        }
+
+        /// Writes the members of an extras object after the declared ones, each as it is. None may
+        /// repeat a declared member.
+        pub fn finishExtras(self: *Self, cursor: *ExtrasCursor, comptime declared: []const meta.FieldKey) !void {
+            if (cursor.bytes.len == 0) return;
+            var parser: Parser = .{ .input = cursor.bytes, .index = cursor.pos };
+            parser.skipWhitespace();
+            if (parser.peek() == '}') return;
+            while (true) {
+                parser.skipWhitespace();
+                const key_start = parser.index;
+                try parser.skipStringTrusted();
+                const key = cursor.bytes[key_start..parser.index];
+                inline for (declared) |member| {
+                    switch (member) {
+                        .text => |name| if (rawKeyIs(key, name)) return error.DuplicateField,
+                        .integer => {},
+                    }
+                }
+                parser.skipWhitespace();
+                if (parser.consume() != ':') return error.UnexpectedToken;
+                parser.skipWhitespace();
+                const value_start = parser.index;
+                try parser.skipValueTrusted(0);
+
+                const container = self.current();
+                if (container.kind != .object) return error.InvalidJsonState;
+                if (!container.first) try self.writer.writeByte(',') else container.first = false;
+                try self.writer.writeAll(key);
+                try self.writer.writeByte(':');
+                try self.writer.writeAll(cursor.bytes[value_start..parser.index]);
+
+                parser.skipWhitespace();
+                switch (parser.consume() orelse return error.UnexpectedEndOfInput) {
+                    ',' => {},
+                    '}' => return,
+                    else => return error.UnexpectedToken,
+                }
+            }
+        }
+
         /// Writes JSON text that was read as `zerde.Raw`, unchanged.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try self.writer.writeAll(value);
@@ -254,6 +310,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
         max_depth: usize = 128,
         max_items: usize = std.math.maxInt(usize),
         items: usize = 0,
+        /// Members collected for an extras field, innermost struct last; see `captureExtra`.
+        extras: std.ArrayList(ExtraEntry) = .empty,
+        extra_keys: std.ArrayList(u8) = .empty,
 
         const Self = @This();
 
@@ -285,6 +344,8 @@ pub fn JsonDeserializer(comptime Config: type) type {
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
+            self.extras.deinit(allocator);
+            self.extra_keys.deinit(allocator);
             if (self.owns_input) allocator.free(@constCast(self.input));
         }
 
@@ -486,6 +547,45 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return key;
         }
 
+        /// Where the extras of a struct begin, so a struct read inside another keeps its own.
+        pub fn extrasMark(self: *Self) usize {
+            return self.extras.items.len;
+        }
+
+        /// Takes the member whose value is next: `key` is its decoded name, and the value is checked
+        /// and kept as the text it was read from.
+        pub fn captureExtra(self: *Self, allocator: Allocator, key: []const u8) !void {
+            self.parser.skipWhitespace();
+            const start = self.parser.index;
+            try self.skipValue(allocator);
+            const key_start = self.extra_keys.items.len;
+            try self.extra_keys.appendSlice(allocator, key);
+            try self.extras.append(allocator, .{ .key_start = key_start, .key_len = key.len, .value_start = start, .value_end = self.parser.index });
+        }
+
+        /// Ends the extras since `mark` as one object, its members in input order and each value as
+        /// it was read, owned by the caller. With none it is null, or `{}` when `want_empty`.
+        pub fn finishExtras(self: *Self, allocator: Allocator, mark: usize, want_empty: bool) !?[]u8 {
+            const entries = self.extras.items[mark..];
+            defer {
+                if (entries.len != 0) self.extra_keys.items.len = entries[0].key_start;
+                self.extras.items.len = mark;
+            }
+            if (entries.len == 0 and !want_empty) return null;
+
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            errdefer out.deinit();
+            try out.writer.writeByte('{');
+            for (entries, 0..) |entry, index| {
+                if (index != 0) try out.writer.writeByte(',');
+                try writeEscapedString(&out.writer, self.extra_keys.items[entry.key_start..][0..entry.key_len]);
+                try out.writer.writeByte(':');
+                try out.writer.writeAll(self.input[entry.value_start..entry.value_end]);
+            }
+            try out.writer.writeByte('}');
+            return try out.toOwnedSlice();
+        }
+
         /// The next value as the text it was read from, without the whitespace around it.
         pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
             self.parser.skipWhitespace();
@@ -596,6 +696,7 @@ pub fn parseSliceWith(
     comptime read_cfg: anytype,
 ) ParseError!T {
     var deserializer = try sliceDeserializer(allocator, input, read_cfg);
+    defer deserializer.deinit(allocator);
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
@@ -618,6 +719,7 @@ pub fn parseSliceAliasedWith(
         .max_input_bytes = effectiveMaxInputBytes(read_cfg),
         .borrow_strings = true,
     });
+    defer deserializer.deinit(allocator);
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
@@ -630,6 +732,48 @@ pub fn writeEscapedString(writer: *std.Io.Writer, bytes: []const u8) !void {
 fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
     if (comptime meta.hasField(@TypeOf(cfg), "max_input_bytes")) return @field(cfg, "max_input_bytes");
     return 16 * 1024 * 1024;
+}
+
+/// One member collected for an extras field: its key in `extra_keys`, its value in the input.
+const ExtraEntry = struct { key_start: usize, key_len: usize, value_start: usize, value_end: usize };
+
+/// Whether the string literal `raw` (quotes included) decodes to `name`.
+fn rawKeyIs(raw: []const u8, name: []const u8) bool {
+    var i: usize = 1;
+    var n: usize = 0;
+    while (i + 1 < raw.len) {
+        var buffer: [4]u8 = undefined;
+        var piece: []const u8 = raw[i..][0..1];
+        if (raw[i] == '\\') {
+            i += 1;
+            switch (raw[i]) {
+                '"', '\\', '/' => piece = raw[i..][0..1],
+                'b' => piece = "\x08",
+                'f' => piece = "\x0c",
+                'n' => piece = "\n",
+                'r' => piece = "\r",
+                't' => piece = "\t",
+                'u' => {
+                    var scan: Parser = .{ .input = raw, .index = i + 1 };
+                    const first = scan.parseHex4() catch return false;
+                    var code: u21 = first;
+                    i += 4;
+                    if (std.unicode.utf16IsHighSurrogate(first)) {
+                        scan.index += 2; // the `\u` of the low half
+                        const second = scan.parseHex4() catch return false;
+                        code = std.unicode.utf16DecodeSurrogatePair(&.{ first, second }) catch return false;
+                        i += 6;
+                    }
+                    piece = buffer[0 .. std.unicode.utf8Encode(code, &buffer) catch return false];
+                },
+                else => return false,
+            }
+        }
+        if (n + piece.len > name.len or !std.mem.eql(u8, piece, name[n..][0..piece.len])) return false;
+        n += piece.len;
+        i += 1;
+    }
+    return n == name.len;
 }
 
 /// Parses a number literal as a float. A literal too large for `T` would round to infinity, which
@@ -673,6 +817,7 @@ const Parser = struct {
         InvalidUtf8,
         FloatOutOfRange,
         StringTooLong,
+        JsonNestingTooDeep,
     };
 
     // Shared token parser for both direct typed reads and recursive skipping.
@@ -865,6 +1010,55 @@ const Parser = struct {
             };
         }
         return value;
+    }
+
+    /// Steps over a string literal that is already known to be valid.
+    fn skipStringTrusted(self: *Parser) Error!void {
+        if (self.consume() != '"') return error.UnexpectedToken;
+        while (true) {
+            switch (self.consume() orelse return error.UnexpectedEndOfInput) {
+                '"' => return,
+                '\\' => _ = self.consume() orelse return error.UnexpectedEndOfInput,
+                else => {},
+            }
+        }
+    }
+
+    /// Steps over a value that is already known to be valid, without checking it again. Too deep
+    /// nesting is an error, not a trap.
+    fn skipValueTrusted(self: *Parser, depth: usize) Error!void {
+        if (depth > 128) return error.JsonNestingTooDeep;
+        self.skipWhitespace();
+        switch (self.peek() orelse return error.UnexpectedEndOfInput) {
+            '"' => try self.skipStringTrusted(),
+            '{', '[' => {
+                const object = self.consume().? == '{';
+                self.skipWhitespace();
+                if (self.peek() == (if (object) @as(u8, '}') else ']')) {
+                    _ = self.consume();
+                    return;
+                }
+                while (true) {
+                    if (object) {
+                        self.skipWhitespace();
+                        try self.skipStringTrusted();
+                        self.skipWhitespace();
+                        if (self.consume() != ':') return error.UnexpectedToken;
+                    }
+                    try self.skipValueTrusted(depth + 1);
+                    self.skipWhitespace();
+                    switch (self.consume() orelse return error.UnexpectedEndOfInput) {
+                        ',' => {},
+                        '}', ']' => return,
+                        else => return error.UnexpectedToken,
+                    }
+                }
+            },
+            't' => try self.consumeLiteral("true"),
+            'f' => try self.consumeLiteral("false"),
+            'n' => try self.consumeLiteral("null"),
+            else => _ = try self.parseNumberSlice(),
+        }
     }
 
     fn consumeLiteral(self: *Parser, comptime expected: []const u8) Error!void {

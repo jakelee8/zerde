@@ -316,6 +316,22 @@ const Revision = struct {
 };
 ```
 
+### Extras
+
+A struct can collect the members it does not declare: `pub const serde = .{ .extras = "rest" }` names a
+field of type `zerde.Raw` (an empty map when there are none) or `?zerde.Raw` (null when there are none).
+The extras are one map item of the format, and the field is not a member itself, so a key spelled `rest`
+is just another extra. Unknown members go to it instead of being skipped or refused by
+`deny_unknown_fields`; their keys must be text (`error.UnexpectedType` otherwise) and their values are
+checked and kept as read, by the read's mode and limits. A declared member never lands in it.
+
+In CBOR the map is definite with its keys in ascending order, so strict input gives canonical extras and
+the writer merges them among the declared members in key order (`field_order` `.encoded_key`); in the
+default write they follow the declared members. In JSON the object keeps the input order and its
+members follow the declared ones. An extras entry that repeats a declared member is
+`error.DuplicateField` on write, so no output has a member twice. A `Raw` built by hand must be in the
+form a read leaves: a definite CBOR map in key order, or a JSON object.
+
 ### Raw items
 
 A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked

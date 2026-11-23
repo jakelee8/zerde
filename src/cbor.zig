@@ -246,6 +246,50 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             try self.writer.writeAll(value);
         }
 
+        /// How many entries an extras map holds, for the head of the map it joins.
+        pub fn extrasCount(self: *Self, bytes: []const u8) !usize {
+            _ = self;
+            return @intCast((try extrasHead(bytes)).remaining);
+        }
+
+        /// Starts walking an extras map: a definite map as a read leaves it, its keys definite text
+        /// in ascending order. The entries are written as they are.
+        pub fn beginExtras(self: *Self, bytes: []const u8) !ExtrasCursor {
+            _ = self;
+            return try extrasHead(bytes);
+        }
+
+        /// Writes the entries whose key sorts before `encoded`, the encoded key of the next declared
+        /// member, so the whole map stays in key order. An entry with that very key repeats a member.
+        pub fn emitExtrasBefore(self: *Self, cursor: *ExtrasCursor, comptime encoded: []const u8) !void {
+            while (cursor.remaining > 0) {
+                const entry = try extrasEntry(cursor.bytes, cursor.pos);
+                const key = cursor.bytes[cursor.pos..entry.key_end];
+                switch (std.mem.order(u8, key, encoded)) {
+                    .lt => {},
+                    .eq => return error.DuplicateField,
+                    .gt => return,
+                }
+                try self.writer.writeAll(cursor.bytes[cursor.pos..entry.end]);
+                cursor.pos = entry.end;
+                cursor.remaining -= 1;
+            }
+        }
+
+        /// Writes the entries left. None may repeat a declared member.
+        pub fn finishExtras(self: *Self, cursor: *ExtrasCursor, comptime declared: []const meta.FieldKey) !void {
+            while (cursor.remaining > 0) {
+                const entry = try extrasEntry(cursor.bytes, cursor.pos);
+                const key = cursor.bytes[cursor.pos..entry.key_end];
+                inline for (declared) |member| {
+                    if (std.mem.eql(u8, key, comptime encodeKey(member))) return error.DuplicateField;
+                }
+                try self.writer.writeAll(cursor.bytes[cursor.pos..entry.end]);
+                cursor.pos = entry.end;
+                cursor.remaining -= 1;
+            }
+        }
+
         /// Writes an item that was read as `zerde.Raw`, unchanged.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try self.writer.writeAll(value);
@@ -342,6 +386,11 @@ pub fn CborDeserializer(comptime Config: type) type {
         max_items: usize = std.math.maxInt(usize),
         max_string_len: usize = std.math.maxInt(usize),
         items: usize = 0,
+        /// The span of the last key that matched no field, for `unknownKey`.
+        last_key: [2]usize = .{ 0, 0 },
+        /// Members collected for an extras field, innermost struct last; see `captureExtra`.
+        extras: std.ArrayList(ExtraEntry) = .empty,
+        extra_keys: std.ArrayList(u8) = .empty,
         stack: [max_nesting]Container = undefined,
         stack_len: usize = 0,
         /// Keys of the maps being read, innermost last, for the duplicate check.
@@ -385,6 +434,8 @@ pub fn CborDeserializer(comptime Config: type) type {
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.keys.deinit(allocator);
             self.key_bytes.deinit(allocator);
+            self.extras.deinit(allocator);
+            self.extra_keys.deinit(allocator);
             if (self.owns_input) allocator.free(@constCast(self.input));
         }
 
@@ -592,6 +643,7 @@ pub fn CborDeserializer(comptime Config: type) type {
             const frame = self.current();
             const start = self.index;
             const result = try self.lookupKey(T, cfg, start);
+            if (result == .unknown) self.last_key = .{ start, self.index };
             var previous: [2]usize = .{ frame.prev_key_start, frame.prev_key_end };
             try self.checkKeyOrder(&previous, start);
             frame.prev_key_start = previous[0];
@@ -632,6 +684,63 @@ pub fn CborDeserializer(comptime Config: type) type {
                     return .unknown;
                 },
             }
+        }
+
+        /// The text of the key that `nextObjectFieldIndex` just reported as unknown. A key of another
+        /// type is `error.UnexpectedType`: extras are text-keyed.
+        pub fn unknownKey(self: *Self, allocator: Allocator) !StringToken {
+            const saved = self.index;
+            defer self.index = saved;
+            self.index = self.last_key[0];
+            const header = try parseHeader(self.input, &self.index);
+            if (header.major != 3) return error.UnexpectedType;
+            return self.finishString(allocator, header);
+        }
+
+        /// Where the extras of a struct begin, so a struct read inside another keeps its own.
+        pub fn extrasMark(self: *Self) usize {
+            return self.extras.items.len;
+        }
+
+        /// Takes the member whose value is next: `key` is its text, and the value is checked and kept
+        /// as the bytes it was read from.
+        pub fn captureExtra(self: *Self, allocator: Allocator, key: []const u8) !void {
+            const start = self.index;
+            try self.skipItem(self.stack_len);
+            const key_start = self.extra_keys.items.len;
+            try self.extra_keys.appendSlice(allocator, key);
+            try self.extras.append(allocator, .{ .key_start = key_start, .key_len = key.len, .value_start = start, .value_end = self.index });
+        }
+
+        /// Ends the extras since `mark` as one definite map, its keys in ascending order of their
+        /// encoded form and each value as it was read, owned by the caller. With none it is null, or an
+        /// empty map when `want_empty`.
+        pub fn finishExtras(self: *Self, allocator: Allocator, mark: usize, want_empty: bool) !?[]u8 {
+            const entries = self.extras.items[mark..];
+            defer {
+                if (entries.len != 0) self.extra_keys.items.len = entries[0].key_start;
+                self.extras.items.len = mark;
+            }
+            if (entries.len == 0 and !want_empty) return null;
+            std.sort.pdq(ExtraEntry, entries, self, extraLessThan);
+
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            var head: [9]u8 = undefined;
+            try out.appendSlice(allocator, head[0..writeHead(&head, 5, entries.len)]);
+            for (entries) |entry| {
+                try out.appendSlice(allocator, head[0..writeHead(&head, 3, entry.key_len)]);
+                try out.appendSlice(allocator, self.extra_keys.items[entry.key_start..][0..entry.key_len]);
+                try out.appendSlice(allocator, self.input[entry.value_start..entry.value_end]);
+            }
+            return try out.toOwnedSlice(allocator);
+        }
+
+        fn extraLessThan(self: *Self, a: ExtraEntry, b: ExtraEntry) bool {
+            const x = self.extra_keys.items[a.key_start..][0..a.key_len];
+            const y = self.extra_keys.items[b.key_start..][0..b.key_len];
+            if (x.len != y.len) return x.len < y.len;
+            return std.mem.lessThan(u8, x, y);
         }
 
         pub fn skipValue(self: *Self, allocator: Allocator) !void {
@@ -1039,6 +1148,79 @@ fn keyFloatBits(ai: u8, value: u64) u64 {
         else => @bitCast(value),
     };
     return if (wide == 0) 0 else @bitCast(wide);
+}
+
+/// One member collected for an extras field: its key in `extra_keys`, its value in the input.
+const ExtraEntry = struct { key_start: usize, key_len: usize, value_start: usize, value_end: usize };
+
+/// Where the writer is in an extras map: a definite map as a read leaves it.
+pub const ExtrasCursor = struct {
+    bytes: []const u8,
+    pos: usize,
+    remaining: u64,
+};
+
+fn extrasHead(bytes: []const u8) !ExtrasCursor {
+    if (bytes.len == 0) return .{ .bytes = bytes, .pos = 0, .remaining = 0 };
+    var index: usize = 0;
+    const header = try parseHeader(bytes, &index);
+    if (header.major != 5 or header.indefinite) return error.UnexpectedType;
+    return .{ .bytes = bytes, .pos = index, .remaining = header.value };
+}
+
+/// Where the entry at `pos` of an extras map ends, and where its key does.
+fn extrasEntry(bytes: []const u8, pos: usize) !struct { key_end: usize, end: usize } {
+    var index = pos;
+    try skipTrusted(bytes, &index, 0);
+    const key_end = index;
+    try skipTrusted(bytes, &index, 0);
+    return .{ .key_end = key_end, .end = index };
+}
+
+/// Steps over one item that is already known to be well-formed, without validating it again.
+/// A malformed or too deeply nested item is an error, not a trap.
+fn skipTrusted(input: []const u8, index: *usize, depth: usize) !void {
+    if (depth > max_nesting) return error.CborNestingTooDeep;
+    var header = try parseHeader(input, index);
+    while (header.major == 6) header = try parseHeader(input, index);
+    switch (header.major) {
+        0, 1, 7 => {},
+        2, 3 => {
+            if (header.indefinite) {
+                while (true) {
+                    if (index.* >= input.len) return error.UnexpectedEndOfInput;
+                    if (input[index.*] == 0xff) {
+                        index.* += 1;
+                        break;
+                    }
+                    const chunk = try parseHeader(input, index);
+                    if (chunk.value > input.len - index.*) return error.UnexpectedEndOfInput;
+                    index.* += @intCast(chunk.value);
+                }
+            } else {
+                if (header.value > input.len - index.*) return error.UnexpectedEndOfInput;
+                index.* += @intCast(header.value);
+            }
+        },
+        else => {
+            const per: u64 = if (header.major == 5) 2 else 1;
+            if (header.indefinite) {
+                while (true) {
+                    if (index.* >= input.len) return error.UnexpectedEndOfInput;
+                    if (input[index.*] == 0xff) {
+                        index.* += 1;
+                        break;
+                    }
+                    var step: u64 = 0;
+                    while (step < per) : (step += 1) try skipTrusted(input, index, depth + 1);
+                }
+            } else {
+                if (header.value > input.len - index.*) return error.UnexpectedEndOfInput;
+                var count: u64 = 0;
+                while (count < header.value * per) : (count += 1) try skipTrusted(input, index, depth + 1);
+            }
+        },
+    }
 }
 
 pub fn serialize(writer: *std.Io.Writer, value: anytype) !void {

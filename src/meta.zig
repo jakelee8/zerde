@@ -55,6 +55,19 @@ pub const OptionalPolicy = enum {
 /// `.integer`.
 pub const EnumRepr = enum { name, integer };
 
+/// The struct field that collects the members the type does not declare, named by `serde.extras`
+/// (a string): `pub const serde = .{ .extras = "rest" }`. Null when the type has none.
+pub fn extrasField(comptime T: type) ?[]const u8 {
+    if (comptime serdeHasField(T, "extras")) return @field(T.serde, "extras");
+    return null;
+}
+
+/// Whether `name` is `T`'s extras field, which is not a member of the wire form.
+pub fn isExtrasField(comptime T: type, comptime name: []const u8) bool {
+    const extras = comptime extrasField(T) orelse return false;
+    return std.mem.eql(u8, extras, name);
+}
+
 /// A field's bounds, from the field overrides `min_len`, `max_len` (text, bytes, raw and array
 /// length) and `min`, `max` (integer range). The reader checks them; the writer does not, since a
 /// sender does not re-validate its own output.

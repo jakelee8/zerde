@@ -299,16 +299,24 @@ fn serializeValue(
             }
             if (info.is_tuple) @compileError("tuple structs are not supported: " ++ @typeName(T));
 
+            // The extras field is not a member: its entries are members of this struct's map.
+            const extras_name = comptime meta.extrasField(T);
+            if (comptime extras_name != null and !@hasDecl(SerializerType, "beginExtras")) {
+                @compileError("format " ++ @typeName(SerializerType) ++ " cannot write extras: " ++ @typeName(T));
+            }
+            const extras_bytes: []const u8 = if (comptime extras_name) |name| extrasBytes(@field(value, name)) else &.{};
+
             // TOML uses two passes so scalars appear before nested tables; JSON stays at one pass.
             const pass_count = comptime SerializerType.structPassCount(T);
             if (@hasDecl(SerializerType, "beginStructSized")) {
-                var field_count: usize = 0;
+                var field_count: usize = if (comptime extras_name != null) try serializer.extrasCount(extras_bytes) else 0;
                 inline for (0..pass_count) |pass| {
                     inline for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attrs| {
                         if (field_attrs.@"comptime") {
                             @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field_name);
                         }
 
+                        if (comptime meta.isExtrasField(T, field_name)) continue;
                         if (SerializerType.includeStructField(T, field_type, pass)) {
                             if (!omitField(T, field_name, field_type, cfg, @field(value, field_name))) field_count += 1;
                         }
@@ -319,6 +327,9 @@ fn serializeValue(
                 try serializer.beginStruct(T);
             }
             const field_order = comptime structFieldOrder(T, Format, info, cfg, order_policy);
+            var extras = if (comptime extras_name != null) try serializer.beginExtras(extras_bytes) else {};
+            // In key order the extras are merged among the declared members; otherwise they follow them.
+            const merge_extras = comptime extras_name != null and meta.effectiveFieldOrder(T, cfg, order_policy) == .encoded_key;
             inline for (0..pass_count) |pass| {
                 inline for (field_order) |field_index| {
                     const field_name = info.field_names[field_index];
@@ -327,10 +338,14 @@ fn serializeValue(
                         @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field_name);
                     }
 
+                    if (comptime meta.isExtrasField(T, field_name)) continue;
                     if (SerializerType.includeStructField(T, field_type, pass)) {
                         const field_value = @field(value, field_name);
                         // Omission is decided by the typed layer so formats do not duplicate that policy.
                         if (!omitField(T, field_name, field_type, cfg, field_value)) {
+                            if (comptime merge_extras) {
+                                try serializer.emitExtrasBefore(&extras, comptime Format.encodeKey(meta.effectiveFieldKey(T, field_name, cfg)));
+                            }
                             const emit_value = switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
                                 .text => |emitted_name| if (@hasDecl(SerializerType, "beginStructFieldValue"))
                                     try serializer.beginStructFieldValue(T, emitted_name, field_type, field_value)
@@ -358,9 +373,33 @@ fn serializeValue(
                     }
                 }
             }
+            if (comptime extras_name != null) try serializer.finishExtras(&extras, comptime declaredKeys(T, info, cfg));
             try serializer.endStruct(T);
         },
         else => @compileError("zerde cannot serialize " ++ @typeName(T)),
+    }
+}
+
+/// The bytes of an extras field, which is `Raw` or `?Raw`; none for a null.
+fn extrasBytes(extras: anytype) []const u8 {
+    return switch (@typeInfo(@TypeOf(extras))) {
+        .optional => if (extras) |raw| raw.bytes else &.{},
+        else => extras.bytes,
+    };
+}
+
+/// The wire keys of every declared member, which an extras entry must not repeat.
+fn declaredKeys(comptime T: type, comptime info: std.builtin.Type.Struct, comptime cfg: anytype) []const meta.FieldKey {
+    comptime {
+        var keys: [info.field_names.len]meta.FieldKey = undefined;
+        var count: usize = 0;
+        for (info.field_names) |field_name| {
+            if (meta.isExtrasField(T, field_name)) continue;
+            keys[count] = meta.effectiveFieldKey(T, field_name, cfg);
+            count += 1;
+        }
+        const final = keys[0..count].*;
+        return &final;
     }
 }
 
@@ -831,13 +870,24 @@ fn deserializeStruct(
     var seen: [info.field_names.len]bool = @splat(false);
     errdefer freePartialStruct(T, allocator, &result, &seen, borrowed_strings);
 
+    // The members the type does not declare go to its extras field, when it has one.
+    const extras_name = comptime meta.extrasField(T);
+    if (comptime extras_name != null) checkExtrasField(T, info, DeserializerType);
+    const extras_mark = if (comptime extras_name != null) deserializer.extrasMark() else {};
+
     if (@hasDecl(DeserializerType, "nextObjectFieldIndex")) {
         while (true) {
             switch (try deserializer.nextObjectFieldIndex(T, cfg)) {
                 .end => break,
                 .unknown => {
-                    if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
-                    try deserializer.skipValue(allocator);
+                    if (comptime extras_name != null) {
+                        const key = try deserializer.unknownKey(allocator);
+                        defer key.deinit(allocator);
+                        try deserializer.captureExtra(allocator, key.bytes);
+                    } else {
+                        if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
+                        try deserializer.skipValue(allocator);
+                    }
                 },
                 .field_index => |field_index| {
                     inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
@@ -851,6 +901,7 @@ fn deserializeStruct(
             }
         }
 
+        if (comptime extras_name != null) try storeExtras(T, info, allocator, deserializer, extras_mark, &result, &seen);
         try fillMissingFields(T, info, cfg, &result, &seen);
         try checkStruct(T, &result);
         return result;
@@ -868,15 +919,57 @@ fn deserializeStruct(
                 }
             }
         } else {
-            // Unknown-field policy also lives at the typed layer so every format behaves the same way.
-            if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
-            try deserializer.skipValue(allocator);
+            if (comptime extras_name != null) {
+                try deserializer.captureExtra(allocator, object_field.bytes);
+            } else {
+                // Unknown-field policy also lives at the typed layer so every format behaves the same way.
+                if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
+                try deserializer.skipValue(allocator);
+            }
         }
     }
 
+    if (comptime extras_name != null) try storeExtras(T, info, allocator, deserializer, extras_mark, &result, &seen);
     try fillMissingFields(T, info, cfg, &result, &seen);
     try checkStruct(T, &result);
     return result;
+}
+
+/// The extras field holds one map item, as `zerde.Raw`, or `?zerde.Raw` that is null when there is none.
+fn checkExtrasField(comptime T: type, comptime info: std.builtin.Type.Struct, comptime DeserializerType: type) void {
+    if (!@hasDecl(DeserializerType, "captureExtra")) {
+        @compileError("format " ++ @typeName(DeserializerType) ++ " cannot collect extras: " ++ @typeName(T));
+    }
+    const name = comptime meta.extrasField(T).?;
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, name)) {
+            if (field_type != Raw and field_type != ?Raw) {
+                @compileError("the extras field must be zerde.Raw or ?zerde.Raw: " ++ @typeName(T) ++ "." ++ name);
+            }
+            return;
+        }
+    }
+    @compileError("serde.extras names no field: " ++ @typeName(T) ++ "." ++ name);
+}
+
+/// Ends the extras of the struct just read and stores them in the extras field.
+fn storeExtras(
+    comptime T: type,
+    comptime info: std.builtin.Type.Struct,
+    allocator: Allocator,
+    deserializer: anytype,
+    mark: anytype,
+    result: *T,
+    seen: *[info.field_names.len]bool,
+) anyerror!void {
+    const name = comptime meta.extrasField(T).?;
+    inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
+        if (comptime std.mem.eql(u8, field_name, name)) {
+            const owned = try deserializer.finishExtras(allocator, mark, field_type == Raw);
+            @field(result.*, field_name) = if (field_type == Raw) .{ .bytes = owned.? } else if (owned) |bytes| .{ .bytes = bytes } else null;
+            seen[i] = true;
+        }
+    }
 }
 
 /// A type's own `check` runs once the struct is built, for rules across fields. Its error is
@@ -1041,6 +1134,7 @@ fn matchStructFieldIndexInfo(
     actual: []const u8,
 ) ?usize {
     inline for (info.field_names, 0..) |field_name, i| {
+        if (comptime meta.isExtrasField(T, field_name)) continue;
         switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
             .text => |expected| if (expected.len == actual.len and std.mem.eql(u8, actual, expected)) return i,
             .integer => {},
@@ -1055,6 +1149,7 @@ pub fn matchStructFieldIndexInteger(comptime T: type, comptime cfg: anytype, act
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("field index matching requires a struct type");
     inline for (info.@"struct".field_names, 0..) |field_name, i| {
+        if (comptime meta.isExtrasField(T, field_name)) continue;
         switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
             .text => {},
             .integer => |expected| if (expected == actual) return i,

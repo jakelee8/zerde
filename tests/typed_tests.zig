@@ -1370,3 +1370,240 @@ test "an indefinite array stops growing at its bound, and bin checks too" {
     try zerde.bin.serialize(&out.writer, Range{ .lo = 5, .label = "x", .hi = 1 });
     try std.testing.expectError(error.Invalid, zerde.bin.parseSlice(Range, allocator, out.written()));
 }
+
+// ---- extras ----------------------------------------------------------------------------------------------
+
+const WithExtras = struct {
+    id: u8,
+    name: []const u8,
+    rest: zerde.Raw,
+
+    pub const serde = .{ .extras = "rest" };
+};
+
+const MaybeExtras = struct {
+    id: u8,
+    rest: ?zerde.Raw = null,
+
+    pub const serde = .{ .extras = "rest", .deny_unknown_fields = true };
+};
+
+test "CBOR extras collect the unknown members as one map in key order" {
+    // id, name, then z, a and bb in that order, which is not key order.
+    const input = [_]u8{ 0xa5, 0x62, 'i', 'd', 0x01, 0x61, 'z', 0x81, 0x01, 0x64, 'n', 'a', 'm', 'e', 0x61, 'n', 0x61, 'a', 0xf5, 0x62, 'b', 'b', 0x61, 'x' };
+    const decoded = try zerde.cbor.parseSlice(WithExtras, allocator, &input);
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa3, 0x61, 'a', 0xf5, 0x61, 'z', 0x81, 0x01, 0x62, 'b', 'b', 0x61, 'x' }, decoded.rest.bytes);
+    try std.testing.expectEqual(@as(u8, 1), decoded.id);
+    // Written back, the extras are merged among the declared members in key order.
+    try expectCborBytes(&.{
+        0xa5,
+        0x61,
+        'a',
+        0xf5,
+        0x61,
+        'z',
+        0x81,
+        0x01,
+        0x62,
+        'b',
+        'b',
+        0x61,
+        'x',
+        0x62,
+        'i',
+        'd',
+        0x01,
+        0x64,
+        'n',
+        'a',
+        'm',
+        'e',
+        0x61,
+        'n',
+    }, decoded, .{}, .{ .deterministic = true });
+    // And a deterministic read of that output reads it back as the same bytes.
+    var out = try writeCbor(decoded, .{}, .{ .deterministic = true });
+    defer out.deinit();
+    const again = try zerde.cbor.parseSliceWith(WithExtras, allocator, out.written(), .{}, .{ .mode = .strict });
+    defer zerde.free(allocator, again);
+    try std.testing.expectEqualSlices(u8, decoded.rest.bytes, again.rest.bytes);
+}
+
+test "without unknown members the extras are an empty map, or null for an optional" {
+    const input = [_]u8{ 0xa2, 0x62, 'i', 'd', 0x01, 0x64, 'n', 'a', 'm', 'e', 0x61, 'n' };
+    const decoded = try zerde.cbor.parseSlice(WithExtras, allocator, &input);
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqualSlices(u8, &.{0xa0}, decoded.rest.bytes);
+    try expectCborBytes(&input, decoded, .{}, .{ .deterministic = true });
+    const maybe = try zerde.cbor.parseSlice(MaybeExtras, allocator, &.{ 0xa1, 0x62, 'i', 'd', 0x01 });
+    try std.testing.expectEqual(@as(?zerde.Raw, null), maybe.rest);
+    try expectCborBytes(&.{ 0xa1, 0x62, 'i', 'd', 0x01 }, maybe, .{}, .{ .deterministic = true });
+    // The default write puts the extras after the declared members.
+    const extra = try zerde.cbor.parseSlice(MaybeExtras, allocator, &.{ 0xa2, 0x61, 'a', 0x05, 0x62, 'i', 'd', 0x01 });
+    defer zerde.free(allocator, extra);
+    try expectCborBytes(&.{ 0xbf, 0x62, 'i', 'd', 0x01, 0x61, 'a', 0x05, 0xff }, extra, .{}, .{});
+}
+
+test "extras never hold a declared key, and an extras entry that repeats one is refused on write" {
+    // The extras field's own name is an ordinary unknown key.
+    const named = try zerde.cbor.parseSlice(MaybeExtras, allocator, &.{ 0xa2, 0x62, 'i', 'd', 0x01, 0x64, 'r', 'e', 's', 't', 0x07 });
+    defer zerde.free(allocator, named);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x64, 'r', 'e', 's', 't', 0x07 }, named.rest.?.bytes);
+    // An entry for `id` built by hand cannot be written, in any order.
+    const clash = MaybeExtras{ .id = 1, .rest = .{ .bytes = &.{ 0xa1, 0x62, 'i', 'd', 0x02 } } };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.cbor, &out.writer, clash, .{}, .{ .deterministic = true }));
+    try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.cbor, &out.writer, clash, .{}, .{}));
+    // The same key twice in the input is refused on read, extras or not.
+    try expectCborError(MaybeExtras, error.DuplicateField, &.{ 0xa3, 0x62, 'i', 'd', 0x01, 0x61, 'a', 0x00, 0x61, 'a', 0x01 });
+}
+
+test "extras are checked as the read's mode and limits say" {
+    // A key that is not text cannot be an extras key.
+    try expectCborError(WithExtras, error.UnexpectedType, &.{ 0xa3, 0x62, 'i', 'd', 0x01, 0x64, 'n', 'a', 'm', 'e', 0x61, 'n', 0x05, 0x00 });
+    // Strict refuses a non-deterministic value kept in extras; lenient keeps it as it is.
+    const loose = [_]u8{ 0xa3, 0x62, 'i', 'd', 0x01, 0x64, 'n', 'a', 'm', 'e', 0x61, 'n', 0x61, 'x', 0x9f, 0x01, 0xff };
+    const kept = try zerde.cbor.parseSlice(WithExtras, allocator, &loose);
+    defer zerde.free(allocator, kept);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'x', 0x9f, 0x01, 0xff }, kept.rest.bytes);
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.cbor.parseSliceWith(WithExtras, allocator, &loose, .{}, .{ .mode = .strict }));
+    // Limits count inside it.
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(WithExtras, allocator, &loose, .{}, .{ .max_depth = 1 }));
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceWith(WithExtras, allocator, &loose, .{}, .{ .max_items = 7 }));
+}
+
+test "a struct with extras inside another keeps its own" {
+    const Outer = struct {
+        inner: WithExtras,
+        tag: u8,
+        rest: zerde.Raw,
+
+        pub const serde = .{ .extras = "rest" };
+    };
+    // Outer extras "p", then the inner struct with its own extras "q", then "tag", then outer extras "o".
+    const input = [_]u8{
+        0xa4,
+        0x61,
+        'p',
+        0x01,
+        0x65,
+        'i',
+        'n',
+        'n',
+        'e',
+        'r',
+        0xa3,
+        0x62,
+        'i',
+        'd',
+        0x01,
+        0x64,
+        'n',
+        'a',
+        'm',
+        'e',
+        0x61,
+        'n',
+        0x61,
+        'q',
+        0x02,
+        0x63,
+        't',
+        'a',
+        'g',
+        0x03,
+        0x61,
+        'o',
+        0x04,
+    };
+    const decoded = try zerde.cbor.parseSlice(Outer, allocator, &input);
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'q', 0x02 }, decoded.inner.rest.bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa2, 0x61, 'o', 0x04, 0x61, 'p', 0x01 }, decoded.rest.bytes);
+    try std.testing.expectEqual(@as(u8, 3), decoded.tag);
+}
+
+test "JSON extras keep their members in input order, with values as read" {
+    const input = "{\"id\":1,\"z\" : [ 1 , 2 ],\"name\":\"n\",\"k\\u00e9\":{ \"x\" : null }}";
+    const decoded = try zerde.json.parseSlice(WithExtras, allocator, input);
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqualStrings("{\"z\":[ 1 , 2 ],\"k\xc3\xa9\":{ \"x\" : null }}", decoded.rest.bytes);
+    try expectJsonText("{\"id\":1,\"name\":\"n\",\"z\":[ 1 , 2 ],\"k\xc3\xa9\":{ \"x\" : null }}", decoded, .{}, .{});
+    // No unknown members: `{}`, or null; both write nothing.
+    const none = try zerde.json.parseSlice(WithExtras, allocator, "{\"id\":1,\"name\":\"n\"}");
+    defer zerde.free(allocator, none);
+    try std.testing.expectEqualStrings("{}", none.rest.bytes);
+    try expectJsonText("{\"id\":1,\"name\":\"n\"}", none, .{}, .{});
+    const maybe = try zerde.json.parseSlice(MaybeExtras, allocator, "{\"id\":1}");
+    try expectJsonText("{\"id\":1}", maybe, .{}, .{});
+}
+
+test "a JSON extras member that repeats a declared one is refused, however it is escaped" {
+    for ([_][]const u8{ "{\"id\":2}", "{\"\\u0069d\":2}", "{\"x\":1,\"i\\u0064\":2}", "{\"\\u0069\\u0064\":2}" }) |rest| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const clash = MaybeExtras{ .id = 1, .rest = .{ .bytes = rest } };
+        try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.json, &out.writer, clash, .{}, .{}));
+    }
+    // Close but not equal is fine.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try zerde.serializeWith(zerde.json, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = "{\"idx\":2,\"i\":3,\"\\u00e9\":4}" } }, .{}, .{});
+    try std.testing.expectEqualStrings("{\"id\":1,\"idx\":2,\"i\":3,\"\\u00e9\":4}", out.written());
+    // A repeated key in the input is still refused as a duplicate.
+    try expectJsonError(MaybeExtras, error.DuplicateField, "{\"id\":1,\"id\":2}");
+}
+
+test "JSON extras are checked while they are read" {
+    try expectJsonError(WithExtras, error.UnexpectedToken, "{\"id\":1,\"name\":\"n\",\"x\":{\"a\":}}");
+    try expectJsonError(WithExtras, error.InvalidUtf8, "{\"id\":1,\"name\":\"n\",\"x\":\"\xff\"}");
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(WithExtras, allocator, "{\"id\":1,\"name\":\"n\",\"x\":[[1]]}", .{}, .{ .max_depth = 2 }));
+}
+
+test "extras keys are written escaped, and a malformed extras item is an error" {
+    const decoded = try zerde.json.parseSlice(MaybeExtras, allocator, "{\"id\":1,\"a\\\"b\":1,\"c\\nd\":2}");
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqualStrings("{\"a\\\"b\":1,\"c\\nd\":2}", decoded.rest.?.bytes);
+    try expectJsonText("{\"id\":1,\"a\\\"b\":1,\"c\\nd\":2}", decoded, .{}, .{});
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    // A Raw that is not a map cannot be extras.
+    try std.testing.expectError(error.UnexpectedType, zerde.serializeWith(zerde.cbor, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = &.{0x01} } }, .{}, .{}));
+    try std.testing.expectError(error.UnexpectedType, zerde.serializeWith(zerde.cbor, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = &.{ 0xbf, 0xff } } }, .{}, .{}));
+    try std.testing.expectError(error.UnexpectedEndOfInput, zerde.serializeWith(zerde.cbor, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = &.{ 0xa1, 0x61 } } }, .{}, .{}));
+    try std.testing.expectError(error.UnexpectedToken, zerde.serializeWith(zerde.json, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = "[1]" } }, .{}, .{}));
+}
+
+test "extras that sort after a declared member are written after it" {
+    // "zz" sorts after "id" and before "name"; "name2" after "name".
+    const input = [_]u8{ 0xa4, 0x62, 'i', 'd', 0x01, 0x64, 'n', 'a', 'm', 'e', 0x61, 'n', 0x62, 'z', 'z', 0x02, 0x65, 'n', 'a', 'm', 'e', '2', 0x03 };
+    const decoded = try zerde.cbor.parseSlice(WithExtras, allocator, &input);
+    defer zerde.free(allocator, decoded);
+    try expectCborBytes(&.{
+        0xa4,
+        0x62,
+        'i',
+        'd',
+        0x01,
+        0x62,
+        'z',
+        'z',
+        0x02,
+        0x64,
+        'n',
+        'a',
+        'm',
+        'e',
+        0x61,
+        'n',
+        0x65,
+        'n',
+        'a',
+        'm',
+        'e',
+        '2',
+        0x03,
+    }, decoded, .{}, .{ .deterministic = true });
+}

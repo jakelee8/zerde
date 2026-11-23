@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- added `serde.extras` (CBOR and JSON): a `zerde.Raw` or `?zerde.Raw` field collects the unknown text-keyed members as one map, merged back in key order on write; an entry that repeats a declared member is `error.DuplicateField`
+- `json.sliceDeserializer` now allocates while collecting extras, so a caller that uses it directly must call `deinit` on the result (as for `cbor.sliceDeserializer`); `parseSlice*` already does
 - added field bounds (`min_len`, `max_len`, `min`, `max` in `serde.fields`; `error.LengthOutOfBounds`, `error.ValueOutOfRange`), checked before allocation where the length is known, and a struct-level `check` run after a read
 - added `zerde.Raw`: a field kept as the bytes of one validated CBOR item or JSON value (checked by the read's mode and limits, written back unchanged)
 - added CBOR `ReadConfig.mode` (`.lenient`, `.strict`): strict accepts only RFC 8949 §4.2.1/§4.2.2 deterministic encoding (`error.NonDeterministicEncoding`, tags refused); added `max_depth`, `max_items` and `max_string_len` limits to the CBOR and JSON readers (`error.TooManyItems`, `error.StringTooLong`)
