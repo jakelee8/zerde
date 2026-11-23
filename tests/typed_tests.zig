@@ -2510,3 +2510,24 @@ fn describeStruct(comptime T: type) []const u8 {
 test "a generator can be written against the reflection alone" {
     try std.testing.expectEqualStrings("{ 0: bytes; 1: bytes; 2: string; 3: number; 4: other; labels: array; nick: maybe; patch: maybe; meta: other; wired: other; }", comptime describeStruct(Described));
 }
+
+test "a JSON encode hook refuses NaN and nests no deeper than 128" {
+    const Nan = struct {
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            _ = self;
+            try encoder.writeFloat(std.math.nan(f64));
+        }
+    };
+    const Deep = struct {
+        depth: usize,
+
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            for (0..self.depth) |_| try encoder.beginArray(1);
+        }
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.NonFiniteFloat, zerde.serializeWith(zerde.json, &out.writer, Nan{}, .{}, .{}));
+    try zerde.serializeWith(zerde.json, &out.writer, Deep{ .depth = 128 }, .{}, .{});
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.serializeWith(zerde.json, &out.writer, Deep{ .depth = 129 }, .{}, .{}));
+}
