@@ -29,6 +29,31 @@ The current large case produces a JSON document of about `107.58 MiB`.
 
 Runs before `8a3a0a9` used the older simpler payload, so they are not directly comparable to the newer mixed-payload runs.
 
+## 2026-11-23 - 4881395
+
+Changes since previous run:
+
+- strings are checked for UTF-8 on every path, integer fields refuse `1.0` and `1e2`, float fields refuse an overflowing number, skipped numbers are no longer converted, and the writer checks that a float is finite
+
+Environment for this entry only (not the machine above): `Linux x86_64`, Zig `0.17.1`. "Before" is `6e4bf79` built and run on the same machine in the same session, so only the two columns of this entry compare with each other. One run each, `zig build bench-json -Doptimize=ReleaseFast`.
+
+| Operation | Scenario | Before zerde ns/op | After zerde ns/op | Change |
+| --- | --- | ---: | ---: | ---: |
+| parse | small | 12493.67 | 13486.23 | +7.9% |
+| parse | medium | 3833978.95 | 3663706.54 | -4.4% |
+| parse | large | 403884062.45 | 385666066.25 | -4.5% |
+| write | small | 9476.61 | 8526.60 | -10.0% |
+| write | medium | 2621730.71 | 2860680.71 | +9.1% |
+| write | large | 251300831.55 | 238833656.78 | -5.0% |
+| roundtrip | small | 23812.16 | 21550.11 | -9.5% |
+| roundtrip | medium | 6113220.87 | 6559989.84 | +7.3% |
+| roundtrip | large | 636839147.98 | 611484324.65 | -4.0% |
+
+Notes:
+
+- the write path moved by up to 10% in both directions on code that changed by one comparison, so changes under about 10% are inside this machine's run-to-run noise
+- no parse or write regression stands out; a repeat run on the benchmark machine would settle the small parse case
+
 ## 2026-04-21 - a7c1073
 
 Changes since previous run:

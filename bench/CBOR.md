@@ -28,6 +28,33 @@ Current scenarios:
 
 The current large case produces a canonical CBOR document of about `76.22 MiB`, with write outputs of about `76.22 MiB` for `zerde` and `75.28 MiB` for `zbor`.
 
+## 2026-11-23 - 4881395
+
+Changes since previous run:
+
+- reads validate text as UTF-8, check a length against the bytes left, record unknown map keys for a duplicate check, and match a struct key before validating it; the map is read through `nextObjectFieldIndex` with integer keys
+- an integer field refuses a float, tags other than 55799 are refused, and a skipped value is walked with a depth bound
+
+Environment for this entry only (not the machine above): `Linux x86_64`, Zig `0.17.1`. "Before" is `6e4bf79` built and run on the same machine in the same session, so only the two columns of this entry compare with each other. One run each, `zig build bench-cbor -Doptimize=ReleaseFast`.
+
+| Operation | Scenario | Before zerde ns/op | After zerde ns/op | Change |
+| --- | --- | ---: | ---: | ---: |
+| parse | small | 6064.34 | 7205.65 | +18.8% |
+| parse | medium | 1681485.84 | 1659759.61 | -1.3% |
+| parse | large | 193767058.05 | 175726440.29 | -9.3% |
+| write | small | 2962.43 | 2604.94 | -12.1% |
+| write | medium | 757547.02 | 783635.11 | +3.4% |
+| write | large | 85328802.81 | 84677747.56 | -0.8% |
+| roundtrip | small | 9619.30 | 9936.19 | +3.3% |
+| roundtrip | medium | 2833846.68 | 2422839.82 | -14.5% |
+| roundtrip | large | 279455937.58 | 258466240.68 | -7.5% |
+
+Notes:
+
+- the write path moved by up to 12% on code that did not change for this payload, so changes under about 12% are inside this machine's run-to-run noise
+- the small parse case is the one that may have slowed (+18.8%, outside that noise), and the medium and large cases do not show it; the likely cause is the per-string UTF-8 check and per-document setup, which weigh most on a small document [INFERENCE: not profiled]
+- the payload has no unknown keys, so the duplicate check records nothing; a repeat run on the benchmark machine would settle the small parse case
+
 ## 2026-04-20 - 49d8ca8
 
 Changes since previous run:
