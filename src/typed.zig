@@ -17,8 +17,21 @@ pub const Error = Allocator.Error || error{
     MissingField,
     DuplicateField,
     IntegerOverflow,
+    /// A finite input does not fit the target float type, so narrowing would give an infinity.
+    FloatOutOfRange,
     InvalidEnumTag,
     LengthMismatch,
+};
+
+/// A variable-length byte string.
+///
+/// `[]const u8` is text and `[N]u8` is a fixed-length byte string, so a byte string whose length
+/// is only known at run time needs its own type for the format to tell the two apart. It is
+/// written as a CBOR byte string, a MessagePack `bin`, a BSON binary and a JSON string in the
+/// configured `bytes` encoding, and read only from the same kind of token. `zerde.free` releases
+/// it like any other slice.
+pub const ByteString = struct {
+    bytes: []const u8,
 };
 
 pub const ValueKind = enum {
@@ -63,7 +76,7 @@ pub fn free(allocator: Allocator, value: anytype) void {
 pub fn serialize(comptime Format: type, writer: *std.Io.Writer, value: anytype, comptime serde_cfg: anytype, comptime format_cfg: anytype) !void {
     var serializer = Format.serializer(writer, format_cfg);
     defer if (@hasDecl(@TypeOf(serializer), "deinit")) serializer.deinit();
-    try serializeValue(&serializer, value, serde_cfg, comptime fieldOrderPolicy(Format, format_cfg));
+    try serializeValue(&serializer, value, serde_cfg, Format, comptime fieldOrderPolicy(Format, format_cfg));
 }
 
 /// The format's field order for this write. A format declares `fieldOrderPolicy` when its config
@@ -76,6 +89,7 @@ fn fieldOrderPolicy(comptime Format: type, comptime format_cfg: anytype) meta.Fi
 /// Indexes of `T`'s fields in the order they are written.
 fn structFieldOrder(
     comptime T: type,
+    comptime Format: type,
     comptime info: std.builtin.Type.Struct,
     comptime cfg: anytype,
     comptime policy: meta.FieldOrderPolicy,
@@ -86,16 +100,29 @@ fn structFieldOrder(
     const field_order = meta.effectiveFieldOrder(T, cfg, policy);
     if (field_order == .declaration) return order;
 
-    // Resolve wire names once: the sort compares O(n^2) pairs, and resolving a name inside the
+    // Resolve the sort keys once: the sort compares O(n^2) pairs, and resolving a key inside the
     // comparison exceeds the comptime branch quota on small structs.
-    var names: [count][]const u8 = undefined;
-    for (0..count) |index| names[index] = meta.effectiveFieldName(T, info.field_names[index], cfg);
+    var sort_keys: [count][]const u8 = undefined;
+    for (0..count) |index| {
+        const key = meta.effectiveFieldKey(T, info.field_names[index], cfg);
+        sort_keys[index] = switch (field_order) {
+            .declaration => unreachable,
+            .encoded_key => if (@hasDecl(Format, "encodeKey"))
+                Format.encodeKey(key)
+            else
+                @compileError(@typeName(Format) ++ " does not define the encoded form of a key, so it cannot use field_order .encoded_key"),
+            .length_first, .bytewise => switch (key) {
+                .text => |name| name,
+                .integer => @compileError(@typeName(T) ++ "." ++ info.field_names[index] ++ " has an integer key; use field_order .encoded_key or .declaration"),
+            },
+        };
+    }
 
     // Insertion sort: stable, and field counts are small.
     var i: usize = 1;
     while (i < count) : (i += 1) {
         var j = i;
-        while (j > 0 and nameLess(field_order, names[order[j]], names[order[j - 1]])) : (j -= 1) {
+        while (j > 0 and keyLess(field_order, sort_keys[order[j]], sort_keys[order[j - 1]])) : (j -= 1) {
             const swap = order[j - 1];
             order[j - 1] = order[j];
             order[j] = swap;
@@ -104,11 +131,11 @@ fn structFieldOrder(
     return order;
 }
 
-fn nameLess(comptime field_order: meta.FieldOrder, a: []const u8, b: []const u8) bool {
+fn keyLess(comptime field_order: meta.FieldOrder, a: []const u8, b: []const u8) bool {
     return switch (field_order) {
         .declaration => false,
         .length_first => if (a.len != b.len) a.len < b.len else std.mem.lessThan(u8, a, b),
-        .bytewise => std.mem.lessThan(u8, a, b),
+        .bytewise, .encoded_key => std.mem.lessThan(u8, a, b),
     };
 }
 
@@ -127,24 +154,33 @@ pub fn deserializeWithDiagnostics(
     return deserializeValue(T, allocator, deserializer, cfg, diagnostics, true);
 }
 
-fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, comptime order_policy: meta.FieldOrderPolicy) !void {
+fn serializeValue(
+    serializer: anytype,
+    value: anytype,
+    comptime cfg: anytype,
+    comptime Format: type,
+    comptime order_policy: meta.FieldOrderPolicy,
+) !void {
     const T = @TypeOf(value);
     const SerializerType = @TypeOf(serializer.*);
     switch (@typeInfo(T)) {
         .bool => try serializer.emitBool(value),
         .int, .comptime_int => try serializer.emitInteger(value),
         .float, .comptime_float => try serializer.emitFloat(value),
-        .optional => {
+        .optional => |info| {
+            if (@typeInfo(info.child) == .optional) {
+                @compileError("a nested optional is only supported as a struct field, where an absent field and null differ: " ++ @typeName(T));
+            }
             if (@hasDecl(SerializerType, "beginOptional")) {
                 if (value) |child| {
                     try serializer.beginOptional(true);
-                    try serializeValue(serializer, child, cfg, order_policy);
+                    try serializeValue(serializer, child, cfg, Format, order_policy);
                 } else {
                     try serializer.beginOptional(false);
                 }
             } else {
                 if (value) |child| {
-                    try serializeValue(serializer, child, cfg, order_policy);
+                    try serializeValue(serializer, child, cfg, Format, order_policy);
                 } else {
                     try serializer.emitNull();
                 }
@@ -157,13 +193,36 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, co
                 try serializer.emitString(@tagName(value));
             }
         },
+        .@"union" => |info| {
+            if (info.tag_type == null) @compileError("an untagged union cannot be serialized: " ++ @typeName(T));
+            if (!@hasDecl(SerializerType, "supports_unions")) {
+                @compileError("format " ++ @typeName(SerializerType) ++ " does not support unions: " ++ @typeName(T));
+            }
+            // Externally tagged: a variant without a payload is its name; any other is a map of one
+            // entry, the name and the payload. Both forms say which variant it is before its payload.
+            switch (value) {
+                inline else => |payload, tag| {
+                    const name = comptime meta.effectiveFieldName(T, @tagName(tag), cfg);
+                    const Payload = @TypeOf(payload);
+                    if (Payload == void) {
+                        try serializer.emitString(name);
+                    } else {
+                        if (@hasDecl(SerializerType, "beginStructSized")) {
+                            try serializer.beginStructSized(T, 1);
+                        } else {
+                            try serializer.beginStruct(T);
+                        }
+                        _ = try serializer.beginStructField(T, name, Payload);
+                        try serializeValue(serializer, payload, cfg, Format, order_policy);
+                        try serializer.endStructField(T, name, Payload);
+                        try serializer.endStruct(T);
+                    }
+                },
+            }
+        },
         .array => |info| {
             if (info.child == u8) {
-                if (@hasDecl(SerializerType, "emitBytes")) {
-                    try serializer.emitBytes(value[0..]);
-                } else {
-                    try serializer.emitString(value[0..]);
-                }
+                try emitByteString(serializer, value[0..]);
                 return;
             }
 
@@ -174,7 +233,7 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, co
             try serializer.beginArray(info.child, value.len);
             for (value, 0..) |item, index| {
                 try serializer.beginArrayItem(info.child, index);
-                try serializeValue(serializer, item, cfg, order_policy);
+                try serializeValue(serializer, item, cfg, Format, order_policy);
                 try serializer.endArrayItem(info.child, index);
             }
             try serializer.endArray(info.child, value.len);
@@ -193,15 +252,19 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, co
                 try serializer.beginArray(info.child, value.len);
                 for (value, 0..) |item, index| {
                     try serializer.beginArrayItem(info.child, index);
-                    try serializeValue(serializer, item, cfg, order_policy);
+                    try serializeValue(serializer, item, cfg, Format, order_policy);
                     try serializer.endArrayItem(info.child, index);
                 }
                 try serializer.endArray(info.child, value.len);
             },
-            .one => try serializeValue(serializer, value.*, cfg, order_policy),
+            .one => try serializeValue(serializer, value.*, cfg, Format, order_policy),
             else => @compileError("zerde cannot serialize pointer type " ++ @typeName(T)),
         },
         .@"struct" => |info| {
+            if (T == ByteString) {
+                try emitByteString(serializer, value.bytes);
+                return;
+            }
             if (info.is_tuple) @compileError("tuple structs are not supported: " ++ @typeName(T));
 
             // TOML uses two passes so scalars appear before nested tables; JSON stays at one pass.
@@ -215,9 +278,7 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, co
                         }
 
                         if (SerializerType.includeStructField(T, field_type, pass)) {
-                            const field_value = @field(value, field_name);
-                            const skip_field = meta.effectiveOmitNullFields(T, cfg) and @typeInfo(field_type) == .optional and field_value == null;
-                            if (!skip_field) field_count += 1;
+                            if (!omitField(T, field_name, field_type, cfg, @field(value, field_name))) field_count += 1;
                         }
                     }
                 }
@@ -225,7 +286,7 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, co
             } else {
                 try serializer.beginStruct(T);
             }
-            const field_order = comptime structFieldOrder(T, info, cfg, order_policy);
+            const field_order = comptime structFieldOrder(T, Format, info, cfg, order_policy);
             inline for (0..pass_count) |pass| {
                 inline for (field_order) |field_index| {
                     const field_name = info.field_names[field_index];
@@ -236,18 +297,31 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, co
 
                     if (SerializerType.includeStructField(T, field_type, pass)) {
                         const field_value = @field(value, field_name);
-                        // Null omission is decided by the typed layer so formats do not duplicate that policy.
-                        const skip_field = meta.effectiveOmitNullFields(T, cfg) and @typeInfo(field_type) == .optional and field_value == null;
-                        if (!skip_field) {
-                            const emitted_name = comptime meta.effectiveFieldName(T, field_name, cfg);
-                            const emit_value = if (@hasDecl(SerializerType, "beginStructFieldValue"))
-                                try serializer.beginStructFieldValue(T, emitted_name, field_type, field_value)
-                            else
-                                try serializer.beginStructField(T, emitted_name, field_type);
+                        // Omission is decided by the typed layer so formats do not duplicate that policy.
+                        if (!omitField(T, field_name, field_type, cfg, field_value)) {
+                            const emit_value = switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
+                                .text => |emitted_name| if (@hasDecl(SerializerType, "beginStructFieldValue"))
+                                    try serializer.beginStructFieldValue(T, emitted_name, field_type, field_value)
+                                else
+                                    try serializer.beginStructField(T, emitted_name, field_type),
+                                .integer => |emitted_key| if (@hasDecl(SerializerType, "supports_integer_keys"))
+                                    try serializer.beginStructFieldInteger(T, emitted_key, field_type)
+                                else
+                                    @compileError("format " ++ @typeName(SerializerType) ++ " does not support integer keys: " ++ @typeName(T) ++ "." ++ field_name),
+                            };
                             if (emit_value) {
-                                try serializeValue(serializer, field_value, cfg, order_policy);
+                                // A present nested optional field is written as its inner optional: null is
+                                // a value there, and the outer null was omitted above.
+                                if (comptime isNestedOptional(field_type)) {
+                                    try serializeValue(serializer, field_value.?, cfg, Format, order_policy);
+                                } else {
+                                    try serializeValue(serializer, field_value, cfg, Format, order_policy);
+                                }
                             }
-                            try serializer.endStructField(T, emitted_name, field_type);
+                            switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
+                                .text => |emitted_name| try serializer.endStructField(T, emitted_name, field_type),
+                                .integer => try serializer.endStructField(T, field_name, field_type),
+                            }
                         }
                     }
                 }
@@ -256,6 +330,34 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype, co
         },
         else => @compileError("zerde cannot serialize " ++ @typeName(T)),
     }
+}
+
+/// Bytes go to the format's byte-string token; a format with none carries them as a string.
+fn emitByteString(serializer: anytype, bytes: []const u8) !void {
+    if (@hasDecl(@TypeOf(serializer.*), "emitBytes")) {
+        try serializer.emitBytes(bytes);
+    } else {
+        try serializer.emitString(bytes);
+    }
+}
+
+fn isNestedOptional(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |info| @typeInfo(info.child) == .optional,
+        else => false,
+    };
+}
+
+/// Whether a struct field is left out of the output. The field's `optional` policy decides for a
+/// plain optional; a nested optional (`??T`) is absent when its outer optional is null.
+fn omitField(comptime T: type, comptime field_name: []const u8, comptime FieldType: type, comptime cfg: anytype, value: FieldType) bool {
+    if (@typeInfo(FieldType) != .optional) return false;
+    if (comptime isNestedOptional(FieldType)) return value == null;
+    return switch (comptime meta.effectiveOptionalPolicy(T, field_name, cfg)) {
+        .lenient => meta.effectiveOmitNullFields(T, cfg) and value == null,
+        .nullable => false,
+        .absent => value == null,
+    };
 }
 
 fn deserializeValue(
@@ -279,6 +381,9 @@ fn deserializeValue(
         else
             decodeFloatNumber(T, try deserializer.readNumber()),
         .optional => |info| blk: {
+            if (@typeInfo(info.child) == .optional) {
+                @compileError("a nested optional is only supported as a struct field, where an absent field and null differ: " ++ @typeName(T));
+            }
             if (@hasDecl(DeserializerType, "readOptionalPresent")) {
                 if (!try deserializer.readOptionalPresent()) break :blk null;
             } else {
@@ -290,29 +395,94 @@ fn deserializeValue(
             break :blk try deserializeValue(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics);
         },
         .@"enum" => try decodeEnumValue(T, allocator, deserializer),
+        .@"union" => |info| try deserializeUnion(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         .array => |info| try deserializeArray(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         .pointer => |info| try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
-        .@"struct" => |info| try deserializeStruct(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
+        .@"struct" => |info| if (T == ByteString)
+            ByteString{ .bytes = try readByteSlice(allocator, deserializer) }
+        else
+            try deserializeStruct(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         else => error.UnsupportedType,
     };
+}
+
+fn deserializeUnion(
+    comptime T: type,
+    comptime info: std.builtin.Type.Union,
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track_diagnostics: bool,
+) anyerror!T {
+    const DeserializerType = @TypeOf(deserializer.*);
+    if (info.tag_type == null) @compileError("an untagged union cannot be deserialized: " ++ @typeName(T));
+    if (!@hasDecl(DeserializerType, "supports_unions")) {
+        @compileError("format " ++ @typeName(DeserializerType) ++ " does not support unions: " ++ @typeName(T));
+    }
+    const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
+
+    switch (try deserializer.peekKind()) {
+        .string => {
+            const token = try deserializer.readString(allocator);
+            defer token.deinit(allocator);
+            inline for (info.field_names, info.field_types) |name, FieldType| {
+                if (FieldType == void and std.mem.eql(u8, token.bytes, comptime meta.effectiveFieldName(T, name, cfg))) {
+                    return @unionInit(T, name, {});
+                }
+            }
+            return error.InvalidEnumTag;
+        },
+        .object => {
+            try deserializer.beginObject();
+            const key = (try deserializer.nextObjectField(allocator)) orelse return error.LengthMismatch;
+            defer key.deinit(allocator);
+
+            const result: T = blk: {
+                inline for (info.field_names, info.field_types) |name, FieldType| {
+                    if (FieldType != void and std.mem.eql(u8, key.bytes, comptime meta.effectiveFieldName(T, name, cfg))) {
+                        const payload = try deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name);
+                        break :blk @unionInit(T, name, payload);
+                    }
+                }
+                return error.InvalidEnumTag;
+            };
+            errdefer freeTypedPartial(T, allocator, result, borrowed_strings);
+
+            // A union is one entry: a second one is not another variant.
+            if (try deserializer.nextObjectField(allocator)) |extra| {
+                extra.deinit(allocator);
+                return error.LengthMismatch;
+            }
+            return result;
+        },
+        else => return error.UnexpectedType,
+    }
 }
 
 fn decodeIntNumber(comptime T: type, number: Number) Error!T {
     return switch (number) {
         .integer => |n| std.math.cast(T, n) orelse error.IntegerOverflow,
-        .float => |n| blk: {
-            const rounded = @round(n);
-            if (rounded != n) break :blk error.UnexpectedType;
-            break :blk std.math.cast(T, @as(i128, @intFromFloat(rounded))) orelse error.IntegerOverflow;
-        },
+        // A float is not an integer even when its value is whole: `1.0` and `1` are different
+        // tokens in CBOR, and accepting one for the other turns a type error into a silent cast.
+        .float => error.UnexpectedType,
     };
 }
 
 fn decodeFloatNumber(comptime T: type, number: Number) Error!T {
     return switch (number) {
-        .integer => |n| @as(T, @floatFromInt(n)),
-        .float => |n| @as(T, @floatCast(n)),
+        .integer => |n| narrowFloat(T, @floatFromInt(n)),
+        .float => |n| narrowFloat(T, n),
     };
+}
+
+/// Narrows a parsed float to the field's type. A finite value too large for `T` is refused: rounding
+/// it to infinity would turn an out-of-range number into a different, valid-looking one. An input
+/// that is already infinite or NaN keeps that value.
+pub fn narrowFloat(comptime T: type, wide: f64) Error!T {
+    const narrowed: T = @floatCast(wide);
+    if (std.math.isInf(narrowed) and !std.math.isInf(wide)) return error.FloatOutOfRange;
+    return narrowed;
 }
 
 fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype) anyerror!T {
@@ -352,7 +522,7 @@ fn deserializeArray(
     const DeserializerType = @TypeOf(deserializer.*);
 
     if (info.child == u8) {
-        // Byte arrays may come from either a format-native bytes token or a plain string token.
+        // A byte array is read from the format's byte-string token, never from a text string.
         const token = try readByteToken(allocator, deserializer);
         defer token.deinit(allocator);
 
@@ -484,6 +654,8 @@ fn beginArrayWithKnownLen(deserializer: anytype) anyerror!?usize {
     return null;
 }
 
+/// Reads one byte-string token. A format with a `readBytes` has a distinct byte-string kind, and
+/// only that kind is a byte string: text is not bytes, whatever its content.
 fn readByteToken(allocator: Allocator, deserializer: anytype) anyerror!StringToken {
     const DeserializerType = @TypeOf(deserializer.*);
     if (@hasDecl(DeserializerType, "readByteToken")) {
@@ -492,11 +664,20 @@ fn readByteToken(allocator: Allocator, deserializer: anytype) anyerror!StringTok
     if (@hasDecl(DeserializerType, "readBytes")) {
         return switch (try deserializer.peekKind()) {
             .bytes => try deserializer.readBytes(allocator),
-            .string => try deserializer.readString(allocator),
             else => error.UnexpectedType,
         };
     }
     return try deserializer.readString(allocator);
+}
+
+/// Reads a variable-length byte string into memory the caller owns, or into the input when the
+/// parse aliases it.
+fn readByteSlice(allocator: Allocator, deserializer: anytype) anyerror![]const u8 {
+    const DeserializerType = @TypeOf(deserializer.*);
+    const token = try readByteToken(allocator, deserializer);
+    if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
+    if (token.allocated) return token.bytes;
+    return allocator.dupe(u8, token.bytes);
 }
 
 fn deserializeStruct(
@@ -532,6 +713,10 @@ fn deserializeStruct(
         return ordered_result;
     }
 
+    if (comptime structHasIntegerKeys(T, info, cfg) and !@hasDecl(DeserializerType, "supports_integer_keys")) {
+        @compileError("format " ++ @typeName(DeserializerType) ++ " does not support integer keys: " ++ @typeName(T));
+    }
+
     try deserializer.beginObject();
 
     var result: T = undefined;
@@ -550,7 +735,7 @@ fn deserializeStruct(
                     inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
                         if (field_index == i) {
                             if (seen[i]) return error.DuplicateField;
-                            @field(result, field_name) = try deserializeFieldValue(field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name);
+                            @field(result, field_name) = try deserializeStructField(T, field_name, field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics);
                             seen[i] = true;
                         }
                     }
@@ -558,18 +743,7 @@ fn deserializeStruct(
             }
         }
 
-        inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, field_type, field_attrs, i| {
-            if (!seen[i]) {
-                if (field_attrs.defaultValue(field_type)) |default_value| {
-                    @field(result, field_name) = default_value;
-                } else if (@typeInfo(field_type) == .optional) {
-                    @field(result, field_name) = null;
-                } else {
-                    return error.MissingField;
-                }
-            }
-        }
-
+        try fillMissingFields(T, info, cfg, &result, &seen);
         return result;
     }
 
@@ -580,7 +754,7 @@ fn deserializeStruct(
             inline for (info.field_names, info.field_types, 0..) |struct_field_name, field_type, i| {
                 if (field_index == i) {
                     if (seen[i]) return error.DuplicateField;
-                    @field(result, struct_field_name) = try deserializeFieldValue(field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics, struct_field_name);
+                    @field(result, struct_field_name) = try deserializeStructField(T, struct_field_name, field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics);
                     seen[i] = true;
                 }
             }
@@ -591,20 +765,66 @@ fn deserializeStruct(
         }
     }
 
-    // Missing-field defaults are resolved after the object is fully consumed.
+    try fillMissingFields(T, info, cfg, &result, &seen);
+    return result;
+}
+
+/// Reads one struct field's value under the field's optional policy.
+///
+/// A nested optional (`??T`) is the field whose absence differs from its null: a present field
+/// reads as the inner optional, so `null` is `.{ null }` and a missing field is the outer null.
+/// A plain optional with the `absent` policy refuses an explicit null.
+fn deserializeStructField(
+    comptime T: type,
+    comptime field_name: []const u8,
+    comptime FieldType: type,
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track_diagnostics: bool,
+) anyerror!FieldType {
+    if (comptime isNestedOptional(FieldType)) {
+        const Inner = @typeInfo(FieldType).optional.child;
+        const inner: Inner = try deserializeFieldValue(Inner, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name);
+        return inner;
+    }
+    if (comptime @typeInfo(FieldType) == .optional and meta.effectiveOptionalPolicy(T, field_name, cfg) == .absent) {
+        if (try deserializer.peekKind() == .null) return error.UnexpectedType;
+    }
+    return deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name);
+}
+
+/// Resolves fields the input did not name, after the object is fully consumed: a declared default,
+/// else null for an optional, else an error. An optional with the `nullable` policy must be named.
+fn fillMissingFields(
+    comptime T: type,
+    comptime info: std.builtin.Type.Struct,
+    comptime cfg: anytype,
+    result: *T,
+    seen: *const [info.field_names.len]bool,
+) Error!void {
     inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, field_type, field_attrs, i| {
         if (!seen[i]) {
             if (field_attrs.defaultValue(field_type)) |default_value| {
-                @field(result, field_name) = default_value;
+                @field(result.*, field_name) = default_value;
             } else if (@typeInfo(field_type) == .optional) {
-                @field(result, field_name) = null;
+                if (comptime !isNestedOptional(field_type) and meta.effectiveOptionalPolicy(T, field_name, cfg) == .nullable) {
+                    return error.MissingField;
+                }
+                @field(result.*, field_name) = null;
             } else {
                 return error.MissingField;
             }
         }
     }
+}
 
-    return result;
+fn structHasIntegerKeys(comptime T: type, comptime info: std.builtin.Type.Struct, comptime cfg: anytype) bool {
+    inline for (info.field_names) |field_name| {
+        if (meta.effectiveFieldKey(T, field_name, cfg) == .integer) return true;
+    }
+    return false;
 }
 
 fn deserializeIndexedValue(
@@ -637,6 +857,7 @@ fn deserializeFieldValue(
     return value;
 }
 
+/// Index of the field whose wire key is the text `actual`.
 pub fn matchStructFieldIndex(comptime T: type, comptime cfg: anytype, actual: []const u8) ?usize {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("field index matching requires a struct type");
@@ -650,45 +871,27 @@ fn matchStructFieldIndexInfo(
     actual: []const u8,
 ) ?usize {
     inline for (info.field_names, 0..) |field_name, i| {
-        const expected_name = meta.effectiveFieldName(T, field_name, cfg);
-        if (expected_name.len == actual.len and isFirstFieldWithNameLen(T, info, cfg, i)) {
-            return matchStructFieldIndexByLen(T, info, cfg, actual, expected_name.len);
+        switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
+            .text => |expected| if (expected.len == actual.len and std.mem.eql(u8, actual, expected)) return i,
+            .integer => {},
         }
     }
 
     return null;
 }
 
-fn matchStructFieldIndexByLen(
-    comptime T: type,
-    comptime info: std.builtin.Type.Struct,
-    comptime cfg: anytype,
-    actual: []const u8,
-    len: usize,
-) ?usize {
-    inline for (info.field_names, 0..) |field_name, i| {
-        const expected_name = meta.effectiveFieldName(T, field_name, cfg);
-        if (expected_name.len == len and std.mem.eql(u8, actual, expected_name)) {
-            return i;
+/// Index of the field whose wire key is the integer `actual`.
+pub fn matchStructFieldIndexInteger(comptime T: type, comptime cfg: anytype, actual: i128) ?usize {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("field index matching requires a struct type");
+    inline for (info.@"struct".field_names, 0..) |field_name, i| {
+        switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
+            .text => {},
+            .integer => |expected| if (expected == actual) return i,
         }
     }
 
     return null;
-}
-
-fn isFirstFieldWithNameLen(
-    comptime T: type,
-    comptime info: std.builtin.Type.Struct,
-    comptime cfg: anytype,
-    comptime field_index: usize,
-) bool {
-    const field_name = meta.effectiveFieldName(T, info.field_names[field_index], cfg);
-    inline for (info.field_names[0..field_index]) |prior_field_name| {
-        if (meta.effectiveFieldName(T, prior_field_name, cfg).len == field_name.len) {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn freeTyped(comptime T: type, allocator: Allocator, value: T) void {
@@ -725,6 +928,11 @@ fn freeTypedPartial(comptime T: type, allocator: Allocator, value: T, borrowed_s
                 if (!field_attrs.@"comptime") {
                     freeTypedPartial(field_type, allocator, @field(value, field_name), borrowed_strings);
                 }
+            }
+        },
+        .@"union" => {
+            switch (value) {
+                inline else => |payload| freeTypedPartial(@TypeOf(payload), allocator, payload, borrowed_strings),
             }
         },
         else => {},

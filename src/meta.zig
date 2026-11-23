@@ -21,11 +21,34 @@ pub const FieldOrder = enum {
     /// Source declaration order.
     declaration,
     /// Shorter wire name first, then bytewise. For text keys this is the order of RFC 8949 §4.2.1
-    /// (bytewise order of the encoded keys) and of the length-first ordering in §4.2.3.
+    /// (bytewise order of the encoded keys) and of the length-first ordering in §4.2.3. It is
+    /// defined for text keys only: an integer key is a compile error here.
     length_first,
     /// Bytewise order of the wire names. For ASCII names this is the order of RFC 8785 (JSON
-    /// Canonicalization Scheme), which sorts by UTF-16 code unit.
+    /// Canonicalization Scheme), which sorts by UTF-16 code unit. Text keys only.
     bytewise,
+    /// Bytewise order of each key's encoded form, which is RFC 8949 §4.2.1 for any mix of text and
+    /// integer keys. Needs a format that defines `encodeKey`; CBOR does.
+    encoded_key,
+};
+
+/// A struct field's wire key: its name, or an integer for a format whose maps allow integer keys.
+pub const FieldKey = union(enum) {
+    text: []const u8,
+    integer: i128,
+};
+
+/// How an optional struct field treats an absent field and an explicit null.
+pub const OptionalPolicy = enum {
+    /// Absent and null both read as null; null is written, or the field is omitted when the call
+    /// asks to omit null fields.
+    lenient,
+    /// The field must be present, and may be null: a null is always written and an absent field is
+    /// `error.MissingField`.
+    nullable,
+    /// The field may be absent but not null: a null is never written and an explicit null is
+    /// `error.UnexpectedType`.
+    absent,
 };
 
 /// A format's field order: the order it uses when neither the call site nor the type names one,
@@ -68,18 +91,16 @@ fn serdeHasField(comptime T: type, comptime name: []const u8) bool {
     return @hasDecl(T, "serde") and hasField(@TypeOf(T.serde), name);
 }
 
-fn fieldOverrideHasRenameFrom(comptime container: anytype, comptime field_name: []const u8) bool {
+fn fieldOverrideHas(comptime container: anytype, comptime field_name: []const u8, comptime option: []const u8) bool {
     if (!comptime cfgHasField(container, "fields")) return false;
     const fields = @field(container, "fields");
     if (!comptime hasField(@TypeOf(fields), field_name)) return false;
     const field_cfg = @field(fields, field_name);
-    return comptime hasField(@TypeOf(field_cfg), "rename");
+    return comptime hasField(@TypeOf(field_cfg), option);
 }
 
-fn fieldOverrideRenameFrom(comptime container: anytype, comptime field_name: []const u8) []const u8 {
-    const fields = @field(container, "fields");
-    const field_cfg = @field(fields, field_name);
-    return @field(field_cfg, "rename");
+fn fieldOverride(comptime container: anytype, comptime field_name: []const u8, comptime option: []const u8) @TypeOf(@field(@field(@field(container, "fields"), field_name), option)) {
+    return @field(@field(@field(container, "fields"), field_name), option);
 }
 
 /// Per-type `rename_all` wins over call-site defaults.
@@ -119,15 +140,37 @@ pub fn effectiveFieldOrder(comptime T: type, comptime cfg: anytype, comptime pol
 
 /// Field name precedence is: call-site field override, type field override, then rename_all.
 pub fn effectiveFieldName(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) []const u8 {
-    if (comptime fieldOverrideHasRenameFrom(cfg, field_name)) {
-        return fieldOverrideRenameFrom(cfg, field_name);
+    if (comptime fieldOverrideHas(cfg, field_name, "rename")) {
+        return fieldOverride(cfg, field_name, "rename");
     }
 
-    if (comptime @hasDecl(T, "serde") and fieldOverrideHasRenameFrom(T.serde, field_name)) {
-        return fieldOverrideRenameFrom(T.serde, field_name);
+    if (comptime @hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, "rename")) {
+        return fieldOverride(T.serde, field_name, "rename");
     }
 
     return applyCase(field_name, effectiveRenameAll(T, cfg));
+}
+
+/// A field's wire key. A field override `.key = <integer>` makes it an integer key; otherwise the
+/// key is the name `effectiveFieldName` gives. The call site wins over the type at each step.
+pub fn effectiveFieldKey(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) FieldKey {
+    @setEvalBranchQuota(20_000);
+    if (comptime fieldOverrideHas(cfg, field_name, "key")) return .{ .integer = fieldOverride(cfg, field_name, "key") };
+    if (comptime fieldOverrideHas(cfg, field_name, "rename")) return .{ .text = fieldOverride(cfg, field_name, "rename") };
+    if (comptime @hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, "key")) {
+        return .{ .integer = fieldOverride(T.serde, field_name, "key") };
+    }
+    return .{ .text = effectiveFieldName(T, field_name, cfg) };
+}
+
+/// A field's `optional` policy, from a field override: the call site, then the type. Lenient by default.
+pub fn effectiveOptionalPolicy(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) OptionalPolicy {
+    @setEvalBranchQuota(20_000);
+    if (comptime fieldOverrideHas(cfg, field_name, "optional")) return fieldOverride(cfg, field_name, "optional");
+    if (comptime @hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, "optional")) {
+        return fieldOverride(T.serde, field_name, "optional");
+    }
+    return .lenient;
 }
 
 /// Converts a source field name to the requested wire-format case at comptime.
@@ -187,7 +230,10 @@ pub fn applyCase(comptime name: []const u8, comptime style: FieldCase) []const u
             in_word = true;
         }
 
-        break :blk std.fmt.comptimePrint("{s}", .{buffer[0..out_len]});
+        var exact: [out_len]u8 = undefined;
+        @memcpy(&exact, buffer[0..out_len]);
+        const final = exact;
+        break :blk &final;
     };
 }
 

@@ -20,6 +20,8 @@ const meta = @import("meta.zig");
 const typed = @import("typed.zig");
 
 pub const FieldCase = meta.FieldCase;
+/// A variable-length byte string field; see `typed.ByteString`.
+pub const ByteString = typed.ByteString;
 pub const SerdeConfig = meta.SerdeConfig;
 pub const Diagnostic = diagnostic_impl.Diagnostic;
 pub const DiagnosticLocation = diagnostic_impl.Location;
