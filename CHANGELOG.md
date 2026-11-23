@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added `cbor.pullReader` and `json.pullReader`: an event reader (`zerde.Event`) over one item, with `skip`, the mode and limits of a typed read, and the duplicate-key check
 - added `serde.extras` (CBOR and JSON): a `zerde.Raw` or `?zerde.Raw` field collects the unknown text-keyed members as one map, merged back in key order on write; an entry that repeats a declared member is `error.DuplicateField`
 - `json.sliceDeserializer` now allocates while collecting extras, so a caller that uses it directly must call `deinit` on the result (as for `cbor.sliceDeserializer`); `parseSlice*` already does
 - added field bounds (`min_len`, `max_len`, `min`, `max` in `serde.fields`; `error.LengthOutOfBounds`, `error.ValueOutOfRange`), checked before allocation where the length is known, and a struct-level `check` run after a read

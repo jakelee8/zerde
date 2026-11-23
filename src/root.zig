@@ -24,6 +24,8 @@ pub const FieldCase = meta.FieldCase;
 pub const ByteString = typed.ByteString;
 /// A validated item kept as its bytes; see `typed.Raw`.
 pub const Raw = typed.Raw;
+/// One step of a pull read; see `typed.Event`.
+pub const Event = typed.Event;
 pub const SerdeConfig = meta.SerdeConfig;
 pub const Diagnostic = diagnostic_impl.Diagnostic;
 pub const DiagnosticLocation = diagnostic_impl.Location;

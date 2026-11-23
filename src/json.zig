@@ -650,6 +650,126 @@ pub fn JsonDeserializer(comptime Config: type) type {
     };
 }
 
+/// A pull reader over a JSON text: `next` returns the events of one value in order, for a shape
+/// that is only known while reading; see `cbor.PullReader`. Object keys arrive as text events. A
+/// text event is valid until the next call. The input must outlive the reader.
+pub fn pullReader(allocator: Allocator, input: []const u8, comptime cfg: anytype) !PullReader(@TypeOf(cfg)) {
+    return PullReader(@TypeOf(cfg)).init(allocator, input, cfg);
+}
+
+pub fn PullReader(comptime Config: type) type {
+    return struct {
+        d: JsonDeserializer(Config),
+        allocator: Allocator,
+        scratch: ?[]u8 = null,
+        done: bool = false,
+        /// Whether an object frame, by depth, has read a key and expects its value.
+        want_value: [128]bool = @splat(false),
+
+        const Self = @This();
+
+        fn init(allocator: Allocator, input: []const u8, cfg: Config) !Self {
+            return .{ .d = JsonDeserializer(Config).initBorrowed(input, cfg), .allocator = allocator };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.release();
+            self.d.deinit(self.allocator);
+        }
+
+        /// The next event, or null after the value is complete.
+        pub fn next(self: *Self) !?typed.Event {
+            self.release();
+            const d = &self.d;
+            if (d.stack_len == 0) {
+                if (self.done) return null;
+                const event = try self.valueEvent();
+                if (d.stack_len == 0) self.done = true;
+                return event;
+            }
+            const frame = d.current();
+            const depth = d.stack_len - 1;
+            switch (frame.kind) {
+                .array => {
+                    if (!try d.nextArrayItem()) {
+                        self.done = d.stack_len == 0;
+                        return .array_end;
+                    }
+                    return try self.valueEvent();
+                },
+                .object => {
+                    if (self.want_value[depth]) {
+                        self.want_value[depth] = false;
+                        return try self.valueEvent();
+                    }
+                    const key = (try d.nextObjectField(self.allocator)) orelse {
+                        self.done = d.stack_len == 0;
+                        return .map_end;
+                    };
+                    self.want_value[depth] = true;
+                    return .{ .text = self.keep(key) };
+                },
+            }
+        }
+
+        /// Consumes the next value whole; see `cbor.PullReader.skip`.
+        pub fn skip(self: *Self) !void {
+            var depth: usize = 0;
+            while (try self.next()) |event| {
+                switch (event) {
+                    .array_begin, .map_begin => depth += 1,
+                    .array_end, .map_end => depth -= 1,
+                    else => {},
+                }
+                if (depth == 0) return;
+            }
+        }
+
+        /// After the last event: nothing but whitespace follows.
+        pub fn finish(self: *Self) !void {
+            if (!self.done) return error.UnexpectedEndOfInput;
+            try self.d.finish();
+        }
+
+        fn release(self: *Self) void {
+            if (self.scratch) |bytes| self.allocator.free(bytes);
+            self.scratch = null;
+        }
+
+        fn keep(self: *Self, token: StringToken) []const u8 {
+            if (token.allocated) self.scratch = @constCast(token.bytes);
+            return token.bytes;
+        }
+
+        fn valueEvent(self: *Self) !typed.Event {
+            const d = &self.d;
+            switch (try d.peekKind()) {
+                .null => {
+                    try d.readNull();
+                    return .null;
+                },
+                .bool => return .{ .bool = try d.readBool() },
+                .number => return switch (try d.readNumber()) {
+                    .integer => |value| .{ .integer = value },
+                    .float => |value| .{ .float = value },
+                },
+                .string => return .{ .text = self.keep(try d.readString(self.allocator)) },
+                .array => {
+                    try d.beginArray();
+                    self.want_value[d.stack_len - 1] = false;
+                    return .{ .array_begin = null };
+                },
+                .object => {
+                    try d.beginObject();
+                    self.want_value[d.stack_len - 1] = false;
+                    return .{ .map_begin = null };
+                },
+                .bytes => unreachable,
+            }
+        }
+    };
+}
+
 pub fn serialize(writer: *std.Io.Writer, value: anytype) !void {
     try serializeWith(writer, value, .{}, .{});
 }

@@ -47,6 +47,24 @@ pub const Raw = struct {
     bytes: []const u8,
 };
 
+/// One step of a pull read: a scalar, or the start or end of an array or map. A map's events are
+/// its keys and values alternately, so a key is the event before its value. A text or byte string
+/// is valid until the next call.
+pub const Event = union(enum) {
+    null,
+    bool: bool,
+    integer: i128,
+    float: f64,
+    text: []const u8,
+    bytes: []const u8,
+    /// The element count when the format states it (a definite CBOR array), else null.
+    array_begin: ?usize,
+    array_end,
+    /// The entry count when the format states it (a definite CBOR map), else null.
+    map_begin: ?usize,
+    map_end,
+};
+
 pub const ValueKind = enum {
     null,
     bool,

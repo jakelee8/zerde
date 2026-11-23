@@ -1607,3 +1607,209 @@ test "extras that sort after a declared member are written after it" {
         0x03,
     }, decoded, .{}, .{ .deterministic = true });
 }
+
+// ---- pull reader ----------------------------------------------------------------------------------------------
+
+/// The events of one item as text: `[` `]` `{` `}` for containers, `i5` integers, `f1.5` floats,
+/// `"x"` text, `b:0102` bytes, and `[3` or `{2` when the format states a count.
+fn describeEvents(reader: anytype) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    while (try reader.next()) |event| {
+        switch (event) {
+            .null => try out.appendSlice(allocator, "null "),
+            .bool => |b| try out.appendSlice(allocator, if (b) "true " else "false "),
+            .integer => |n| try out.print(allocator, "i{d} ", .{n}),
+            .float => |f| try out.print(allocator, "f{d} ", .{f}),
+            .text => |t| try out.print(allocator, "\"{s}\" ", .{t}),
+            .bytes => |b| try out.print(allocator, "b:{x} ", .{b}),
+            .array_begin => |n| if (n) |count| try out.print(allocator, "[{d} ", .{count}) else try out.appendSlice(allocator, "[ "),
+            .array_end => try out.appendSlice(allocator, "] "),
+            .map_begin => |n| if (n) |count| try out.print(allocator, "{{{d} ", .{count}) else try out.appendSlice(allocator, "{ "),
+            .map_end => try out.appendSlice(allocator, "} "),
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn expectCborEvents(expected: []const u8, input: []const u8, comptime cfg: anytype) !void {
+    var reader = try zerde.cbor.pullReader(allocator, input, cfg);
+    defer reader.deinit();
+    const text = try describeEvents(&reader);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings(expected, text);
+    try reader.finish();
+}
+
+fn expectJsonEvents(expected: []const u8, input: []const u8, comptime cfg: anytype) !void {
+    var reader = try zerde.json.pullReader(allocator, input, cfg);
+    defer reader.deinit();
+    const text = try describeEvents(&reader);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings(expected, text);
+    try reader.finish();
+}
+
+test "a CBOR pull reader returns every kind of item in order" {
+    // {1: "a", "k": [true, null, 1.5, h'01'], -3: {}} with counts stated.
+    try expectCborEvents("{3 i1 \"a\" \"k\" [4 true null f1.5 b:01 ] i-3 {0 } } ", &.{ 0xa3, 0x01, 0x61, 'a', 0x61, 'k', 0x84, 0xf5, 0xf6, 0xf9, 0x3e, 0x00, 0x41, 0x01, 0x22, 0xa0 }, .{});
+    // Indefinite containers and chunked strings: no counts, the chunks joined.
+    try expectCborEvents("{ \"ab\" [ i1 i2 ] } ", &.{ 0xbf, 0x7f, 0x61, 'a', 0x61, 'b', 0xff, 0x9f, 0x01, 0x02, 0xff, 0xff }, .{});
+    // Scalars at the top, a tag 55799 prefix, and an empty array.
+    try expectCborEvents("i7 ", &.{0x07}, .{});
+    try expectCborEvents("[0 ] ", &.{ 0xd9, 0xd9, 0xf7, 0x80 }, .{});
+    try expectCborEvents("f-0 ", &.{ 0xf9, 0x80, 0x00 }, .{});
+    try expectCborEvents("i18446744073709551615 ", &.{ 0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, .{});
+    try expectCborEvents("i-18446744073709551616 ", &.{ 0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, .{});
+}
+
+test "a CBOR pull reader checks what a typed read does" {
+    // A repeated key is found when its map ends, a strict read refuses unsorted keys at once.
+    var dup = try zerde.cbor.pullReader(allocator, &.{ 0xa2, 0x01, 0x00, 0x01, 0x01 }, .{});
+    defer dup.deinit();
+    var count: usize = 0;
+    const result = while (dup.next()) |event| : (count += 1) {
+        if (event == null) break error.Ended;
+    } else |err| err;
+    try std.testing.expectEqual(@as(anyerror, error.DuplicateField), result);
+    try std.testing.expectEqual(@as(usize, 5), count);
+
+    var unsorted = try zerde.cbor.pullReader(allocator, &.{ 0xa2, 0x02, 0x00, 0x01, 0x00 }, strict);
+    defer unsorted.deinit();
+    _ = try unsorted.next(); // {
+    _ = try unsorted.next(); // 2
+    _ = try unsorted.next(); // 0
+    try std.testing.expectError(error.NonDeterministicEncoding, unsorted.next());
+
+    // Invalid UTF-8, indefinite lengths under strict, tags, limits.
+    var bad = try zerde.cbor.pullReader(allocator, &.{ 0x62, 0xc3, 0x28 }, .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.InvalidUtf8, bad.next());
+    var indef = try zerde.cbor.pullReader(allocator, &.{ 0x9f, 0xff }, strict);
+    defer indef.deinit();
+    try std.testing.expectError(error.NonDeterministicEncoding, indef.next());
+    var tagged = try zerde.cbor.pullReader(allocator, &.{ 0xc1, 0x00 }, .{});
+    defer tagged.deinit();
+    try std.testing.expectError(error.UnexpectedTag, tagged.next());
+    var deep = try zerde.cbor.pullReader(allocator, &.{ 0x81, 0x81, 0x00 }, .{ .max_depth = 1 });
+    defer deep.deinit();
+    _ = try deep.next();
+    try std.testing.expectError(error.CborNestingTooDeep, deep.next());
+    var many = try zerde.cbor.pullReader(allocator, &.{ 0x82, 0x01, 0x02 }, .{ .max_items = 2 });
+    defer many.deinit();
+    _ = try many.next();
+    _ = try many.next();
+    try std.testing.expectError(error.TooManyItems, many.next());
+    // A map key that is an array cannot be an event.
+    var composite = try zerde.cbor.pullReader(allocator, &.{ 0xa1, 0x81, 0x01, 0x00 }, .{});
+    defer composite.deinit();
+    _ = try composite.next();
+    try std.testing.expectError(error.UnexpectedType, composite.next());
+    // Trailing bytes, and an unfinished item.
+    var trailing = try zerde.cbor.pullReader(allocator, &.{ 0x01, 0x02 }, .{});
+    defer trailing.deinit();
+    _ = try trailing.next();
+    try std.testing.expectEqual(@as(?zerde.Event, null), try trailing.next());
+    try std.testing.expectError(error.TrailingCharacters, trailing.finish());
+    var partial = try zerde.cbor.pullReader(allocator, &.{ 0x82, 0x01, 0x02 }, .{});
+    defer partial.deinit();
+    _ = try partial.next();
+    try std.testing.expectError(error.UnexpectedEndOfInput, partial.finish());
+}
+
+test "skip consumes the next value whole, at any depth" {
+    // {"a": [1, [2, 3]], "b": 4, "c": {"d": 5}}: skip "a"'s value, then read "b".
+    const input = [_]u8{ 0xa3, 0x61, 'a', 0x82, 0x01, 0x82, 0x02, 0x03, 0x61, 'b', 0x04, 0x61, 'c', 0xa1, 0x61, 'd', 0x05 };
+    var reader = try zerde.cbor.pullReader(allocator, &input, .{});
+    defer reader.deinit();
+    _ = try reader.next(); // {
+    try std.testing.expectEqualStrings("a", (try reader.next()).?.text);
+    try reader.skip();
+    try std.testing.expectEqualStrings("b", (try reader.next()).?.text);
+    try std.testing.expectEqual(@as(i128, 4), (try reader.next()).?.integer);
+    try std.testing.expectEqualStrings("c", (try reader.next()).?.text);
+    try reader.skip();
+    try std.testing.expectEqual(zerde.Event.map_end, (try reader.next()).?);
+    try std.testing.expectEqual(@as(?zerde.Event, null), try reader.next());
+    try reader.finish();
+
+    // Skipping at the top level takes the whole item, and skip checks it too.
+    var whole = try zerde.cbor.pullReader(allocator, &.{ 0x82, 0x01, 0x62, 0xc3, 0x28 }, .{});
+    defer whole.deinit();
+    try std.testing.expectError(error.InvalidUtf8, whole.skip());
+}
+
+test "a JSON pull reader returns every kind of value in order" {
+    try expectJsonEvents("{ \"a\" [ i1 f2.5 \"x\" ] \"b\" { \"c\" null } \"d\" true } ", "{\"a\":[1, 2.5,\"x\"] ,\"b\":{\"c\":null},\"d\":true}", .{});
+    try expectJsonEvents("{ \"k\u{e9}\" i-7 } ", " { \"k\\u00e9\" : -7 } ", .{});
+    try expectJsonEvents("[ ] ", "[]", .{});
+    try expectJsonEvents("\"a\nb\" ", "\"a\\nb\"", .{});
+    try expectJsonEvents("f100 ", "1e2", .{});
+    try expectJsonEvents("{ } ", "{}", .{});
+}
+
+test "a JSON pull reader checks syntax, UTF-8, limits and trailing text" {
+    var syntax = try zerde.json.pullReader(allocator, "{\"a\":}", .{});
+    defer syntax.deinit();
+    _ = try syntax.next();
+    _ = try syntax.next();
+    try std.testing.expectError(error.UnexpectedToken, syntax.next());
+    var bad = try zerde.json.pullReader(allocator, "\"\xff\"", .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.InvalidUtf8, bad.next());
+    var deep = try zerde.json.pullReader(allocator, "[[1]]", .{ .max_depth = 1 });
+    defer deep.deinit();
+    _ = try deep.next();
+    try std.testing.expectError(error.JsonNestingTooDeep, deep.next());
+    var trailing = try zerde.json.pullReader(allocator, "1 2", .{});
+    defer trailing.deinit();
+    _ = try trailing.next();
+    try std.testing.expectError(error.TrailingCharacters, trailing.finish());
+    var partial = try zerde.json.pullReader(allocator, "[1", .{});
+    defer partial.deinit();
+    _ = try partial.next();
+    _ = try partial.next();
+    try std.testing.expectError(error.UnexpectedEndOfInput, partial.next());
+
+    var reader = try zerde.json.pullReader(allocator, "{\"a\":[1,{\"b\":2}],\"c\":3}", .{});
+    defer reader.deinit();
+    _ = try reader.next();
+    _ = try reader.next();
+    try reader.skip();
+    try std.testing.expectEqualStrings("c", (try reader.next()).?.text);
+    try std.testing.expectEqual(@as(i128, 3), (try reader.next()).?.integer);
+    try std.testing.expectEqual(zerde.Event.map_end, (try reader.next()).?);
+    try reader.finish();
+}
+
+test "a pull reader counts each item once against max_items" {
+    // A map, a key and its value are three items; an array key is refused, so keys are scalars.
+    var reader = try zerde.cbor.pullReader(allocator, &.{ 0xa1, 0x01, 0x00 }, .{ .max_items = 3 });
+    defer reader.deinit();
+    while (try reader.next()) |_| {}
+    var tight = try zerde.cbor.pullReader(allocator, &.{ 0xa1, 0x01, 0x00 }, .{ .max_items = 2 });
+    defer tight.deinit();
+    _ = try tight.next();
+    _ = try tight.next();
+    try std.testing.expectError(error.TooManyItems, tight.next());
+    var json = try zerde.json.pullReader(allocator, "{\"a\":[1]}", .{ .max_items = 4 });
+    defer json.deinit();
+    while (try json.next()) |_| {}
+    var json_tight = try zerde.json.pullReader(allocator, "{\"a\":[1]}", .{ .max_items = 3 });
+    defer json_tight.deinit();
+    _ = try json_tight.next();
+    _ = try json_tight.next();
+    _ = try json_tight.next();
+    try std.testing.expectError(error.TooManyItems, json_tight.next());
+}
+
+test "a pull reader releases each joined string before the next, and finish needs a complete item" {
+    // Two chunked strings, one after the other: both are freed (the testing allocator checks).
+    try expectCborEvents("[ \"ab\" \"cd\" ] ", &.{ 0x9f, 0x7f, 0x61, 'a', 0x61, 'b', 0xff, 0x7f, 0x61, 'c', 0x61, 'd', 0xff, 0xff }, .{});
+    try expectJsonEvents("[ \"a\nb\" \"c\nd\" ] ", "[\"a\\nb\",\"c\\nd\"]", .{});
+    var json = try zerde.json.pullReader(allocator, "[1", .{});
+    defer json.deinit();
+    _ = try json.next();
+    _ = try json.next();
+    try std.testing.expectError(error.UnexpectedEndOfInput, json.finish());
+}

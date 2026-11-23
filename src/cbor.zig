@@ -1223,6 +1223,155 @@ fn skipTrusted(input: []const u8, index: *usize, depth: usize) !void {
     }
 }
 
+/// A pull reader over a CBOR input: `next` returns the events of one item in order, for a shape
+/// that is only known while reading. It checks what a typed read does, as the mode and limits say,
+/// including ascending keys in a strict read and no repeated key in a map. A map's keys must be
+/// scalars (`error.UnexpectedType` for an array or map key). Text and byte strings borrow the input
+/// unless they were in chunks, and are valid until the next call. The input must outlive the reader.
+pub fn pullReader(allocator: Allocator, input: []const u8, comptime cfg: anytype) !PullReader(@TypeOf(cfg)) {
+    return PullReader(@TypeOf(cfg)).init(allocator, input, cfg);
+}
+
+pub fn PullReader(comptime Config: type) type {
+    return struct {
+        d: CborDeserializer(Config),
+        allocator: Allocator,
+        scratch: ?[]u8 = null,
+        done: bool = false,
+        /// Whether a map frame, by depth, has read a key and expects its value.
+        want_value: [max_nesting]bool = @splat(false),
+
+        const Self = @This();
+
+        fn init(allocator: Allocator, input: []const u8, cfg: Config) !Self {
+            return .{ .d = CborDeserializer(Config).initBorrowed(allocator, input, cfg), .allocator = allocator };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.release();
+            self.d.deinit(self.allocator);
+        }
+
+        /// The next event, or null after the item is complete.
+        pub fn next(self: *Self) !?typed.Event {
+            self.release();
+            const d = &self.d;
+            if (d.stack_len == 0) {
+                if (self.done) return null;
+                const event = try self.valueEvent();
+                if (d.stack_len == 0) self.done = true;
+                return event;
+            }
+            const frame = d.current();
+            const depth = d.stack_len - 1;
+            switch (frame.kind) {
+                .array => {
+                    if (!try d.nextArrayItem()) {
+                        self.done = d.stack_len == 0;
+                        return .array_end;
+                    }
+                    return try self.valueEvent();
+                },
+                .object => {
+                    if (self.want_value[depth]) {
+                        self.want_value[depth] = false;
+                        return try self.valueEvent();
+                    }
+                    if (try d.beginObjectEntry()) {
+                        self.done = d.stack_len == 0;
+                        return .map_end;
+                    }
+                    self.want_value[depth] = true;
+                    return try self.keyEvent();
+                },
+            }
+        }
+
+        /// Consumes the next item whole: a scalar, or a container with everything in it. Call it
+        /// where a value is expected, as `next` would return one.
+        pub fn skip(self: *Self) !void {
+            var depth: usize = 0;
+            while (try self.next()) |event| {
+                switch (event) {
+                    .array_begin, .map_begin => depth += 1,
+                    .array_end, .map_end => depth -= 1,
+                    else => {},
+                }
+                if (depth == 0) return;
+            }
+        }
+
+        /// After the last event: no trailing bytes.
+        pub fn finish(self: *Self) !void {
+            if (!self.done) return error.UnexpectedEndOfInput;
+            try self.d.finish();
+        }
+
+        fn release(self: *Self) void {
+            if (self.scratch) |bytes| self.allocator.free(bytes);
+            self.scratch = null;
+        }
+
+        fn keep(self: *Self, token: StringToken) []const u8 {
+            if (token.allocated) self.scratch = @constCast(token.bytes);
+            return token.bytes;
+        }
+
+        fn valueEvent(self: *Self) !typed.Event {
+            const d = &self.d;
+            switch (try d.peekKind()) {
+                .array => {
+                    const len = try d.beginArrayLen();
+                    self.want_value[d.stack_len - 1] = false;
+                    return .{ .array_begin = len };
+                },
+                .object => {
+                    try d.beginObject();
+                    self.want_value[d.stack_len - 1] = false;
+                    const frame = d.current();
+                    return .{ .map_begin = if (frame.indefinite) null else frame.remaining };
+                },
+                else => |kind| return try self.scalarEvent(kind),
+            }
+        }
+
+        fn scalarEvent(self: *Self, kind: ValueKind) !typed.Event {
+            const d = &self.d;
+            switch (kind) {
+                .null => {
+                    try d.readNull();
+                    return .null;
+                },
+                .bool => return .{ .bool = try d.readBool() },
+                .number => return switch (try d.readNumber()) {
+                    .integer => |value| .{ .integer = value },
+                    .float => |value| .{ .float = value },
+                },
+                .string => return .{ .text = self.keep(try d.readString(self.allocator)) },
+                .bytes => return .{ .bytes = self.keep(try d.readBytes(self.allocator)) },
+                .array, .object => unreachable,
+            }
+        }
+
+        /// A map key: a scalar, checked and recorded like any key of a typed read.
+        fn keyEvent(self: *Self) !typed.Event {
+            const d = &self.d;
+            const kind = try d.peekKind();
+            if (kind == .array or kind == .object) return error.UnexpectedType;
+            const start = d.index;
+            try d.recordKeyItem(d.stack_len);
+            const end = d.index;
+            // Read it again as an event; the first read counted it already.
+            d.index = start;
+            d.items -= 1;
+            const event = try self.scalarEvent(kind);
+            std.debug.assert(d.index == end);
+            try d.orderFrameKey(start);
+            return event;
+        }
+    };
+}
+
 pub fn serialize(writer: *std.Io.Writer, value: anytype) !void {
     try serializeWith(writer, value, .{}, .{});
 }

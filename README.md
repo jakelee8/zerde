@@ -332,6 +332,18 @@ members follow the declared ones. An extras entry that repeats a declared member
 `error.DuplicateField` on write, so no output has a member twice. A `Raw` built by hand must be in the
 form a read leaves: a definite CBOR map in key order, or a JSON object.
 
+### Pull reader
+
+For a shape that is only known while reading, `cbor.pullReader(allocator, input, cfg)` and
+`json.pullReader(...)` return a reader whose `next()` gives the events of one item in order
+(`zerde.Event`: `null`, `bool`, `integer`, `float`, `text`, `bytes`, and the start and end of arrays
+and maps, with their counts when the format states them) and null after the last. A map's events are its
+keys and values alternately. `skip()` consumes the next value whole, `finish()` checks that the item is
+complete and nothing follows, and `deinit()` releases it. A reader checks what a typed read does and
+takes the same configuration: the mode, the limits, no repeated key in a CBOR map, UTF-8. A CBOR map
+key must be a scalar. Text and byte strings borrow the input (which must outlive the reader) unless they
+were in chunks or escaped, and are valid until the next call.
+
 ### Raw items
 
 A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked
