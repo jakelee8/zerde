@@ -1069,10 +1069,13 @@ test "limits: depth, items and string length" {
     try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(Probe, allocator, &three, .{}, .{ .max_depth = 2 }));
     // Typed containers count the same way.
     try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith([]const []const u16, allocator, &.{ 0x81, 0x80 }, .{}, .{ .max_depth = 1 }));
-    // A limit above the fixed stack is the stack's.
-    const deep = try nestedCbor(200, 0x81);
-    defer allocator.free(deep);
-    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(Probe, allocator, deep, .{}, .{ .max_depth = 100_000 }));
+    // The most the fixed stack holds is allowed: 127 arrays in a map is 128 containers, 128 is not.
+    const fits = try nestedCbor(127, 0x81);
+    defer allocator.free(fits);
+    _ = try zerde.cbor.parseSliceWith(Probe, allocator, fits, .{}, .{ .max_depth = 128 });
+    const over = try nestedCbor(128, 0x81);
+    defer allocator.free(over);
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(Probe, allocator, over, .{}, .{ .max_depth = 128 }));
 
     // Items: the map, its key and its value are three.
     const two_pairs = [_]u8{ 0xa2, 0x61, 'x', 0x00, 0x61, 'y', 0x00 };
@@ -2530,4 +2533,71 @@ test "a JSON encode hook refuses NaN and nests no deeper than 128" {
     try std.testing.expectError(error.NonFiniteFloat, zerde.serializeWith(zerde.json, &out.writer, Nan{}, .{}, .{}));
     try zerde.serializeWith(zerde.json, &out.writer, Deep{ .depth = 128 }, .{}, .{});
     try std.testing.expectError(error.JsonNestingTooDeep, zerde.serializeWith(zerde.json, &out.writer, Deep{ .depth = 129 }, .{}, .{}));
+}
+
+// ---- review fixes: leaks on failure, chunk bounds -----------------------------------------------------------------
+
+fn parseListOfText(gpa: std.mem.Allocator, input: []const u8) !void {
+    const parsed = try zerde.json.parseSlice(struct { b: []const []const u8, n: u8 }, gpa, input);
+    zerde.free(gpa, parsed);
+}
+
+fn parseCborListOfText(gpa: std.mem.Allocator, input: []const u8) !void {
+    const parsed = try zerde.cbor.parseSlice(struct { b: []const []const u8, n: u8 }, gpa, input);
+    zerde.free(gpa, parsed);
+}
+
+test "a slice of strings leaks nothing when an allocation fails in the middle" {
+    try std.testing.checkAllAllocationFailures(allocator, parseListOfText, .{"{\"b\":[\"p\",\"q\",\"r\"],\"n\":1}"});
+    try std.testing.checkAllAllocationFailures(allocator, parseCborListOfText, .{&[_]u8{ 0xa2, 0x61, 'b', 0x9f, 0x61, 'p', 0x61, 'q', 0xff, 0x61, 'n', 0x01 }});
+}
+
+test "a decode hook that stops short frees what it built" {
+    const Early = struct {
+        text: []const u8,
+
+        pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!@This() {
+            _ = (try reader.next()) orelse return error.UnexpectedEndOfInput; // [
+            const first = (try reader.next()) orelse return error.UnexpectedEndOfInput;
+            return .{ .text = try gpa.dupe(u8, first.text) };
+        }
+
+        pub fn zerdeFree(self: @This(), gpa: std.mem.Allocator) void {
+            gpa.free(self.text);
+        }
+    };
+    try expectJsonError(struct { e: Early }, error.HookIncomplete, "{\"e\":[\"ab\",\"c\"]}");
+}
+
+test "a chunked string is refused at its bound before it is joined" {
+    const Capped = struct {
+        s: []const u8,
+        pub const serde = .{ .fields = .{ .s = .{ .max_len = 2 } } };
+    };
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x61, 's', 0x7f });
+    for (0..64) |_| try input.appendSlice(allocator, &.{ 0x64, 'a', 'b', 'c', 'd' });
+    try input.append(allocator, 0xff);
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Capped, failing.allocator(), input.items));
+    try std.testing.expect(failing.allocated_bytes <= 16);
+    // Bytes too.
+    const CappedBytes = struct {
+        b: zerde.ByteString,
+        pub const serde = .{ .fields = .{ .b = .{ .max_len = 2 } } };
+    };
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, &.{ 0xa1, 0x61, 'b', 0x5f });
+    for (0..64) |_| try bytes.appendSlice(allocator, &.{ 0x44, 1, 2, 3, 4 });
+    try bytes.append(allocator, 0xff);
+    var failing_bytes = std.testing.FailingAllocator.init(allocator, .{});
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(CappedBytes, failing_bytes.allocator(), bytes.items));
+    try std.testing.expect(failing_bytes.allocated_bytes <= 16);
+    // Within the bound a chunked string is read, and max_string_len still applies.
+    const ok = try zerde.cbor.parseSlice(Capped, allocator, &.{ 0xa1, 0x61, 's', 0x7f, 0x61, 'a', 0x61, 'b', 0xff });
+    defer zerde.free(allocator, ok);
+    try std.testing.expectEqualStrings("ab", ok.s);
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith(Capped, allocator, &.{ 0xa1, 0x61, 's', 0x7f, 0x62, 'a', 'b', 0xff }, .{}, .{ .max_string_len = 1 }));
 }

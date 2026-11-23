@@ -193,11 +193,13 @@ pub fn serializer(writer: *std.Io.Writer, comptime cfg: anytype) CborSerializer(
 }
 
 pub fn readerDeserializer(allocator: Allocator, reader: *std.Io.Reader, comptime cfg: anytype) !CborDeserializer(@TypeOf(cfg)) {
+    comptime checkLimits(cfg);
     const input = try reader.allocRemaining(allocator, .limited(effectiveMaxInputBytes(cfg)));
     return CborDeserializer(@TypeOf(cfg)).initOwned(allocator, input, cfg);
 }
 
 pub fn sliceDeserializer(allocator: Allocator, input: []const u8, comptime cfg: anytype) !CborDeserializer(@TypeOf(cfg)) {
+    comptime checkLimits(cfg);
     return CborDeserializer(@TypeOf(cfg)).initBorrowed(allocator, input, cfg);
 }
 
@@ -528,6 +530,23 @@ pub fn CborDeserializer(comptime Config: type) type {
 
         pub fn readByteToken(self: *Self, allocator: Allocator) !StringToken {
             return self.readBytes(allocator);
+        }
+
+        /// `readString` for a field with a `max_len`: a string longer than `max` is refused as it
+        /// is read, so chunks are not joined into memory the bound exists to deny.
+        pub fn readStringMax(self: *Self, allocator: Allocator, max: usize) !StringToken {
+            const saved = self.max_string_len;
+            defer self.max_string_len = saved;
+            if (max < saved) self.max_string_len = max;
+            return self.readString(allocator) catch |err| if (err == error.StringTooLong and max < saved) error.LengthOutOfBounds else err;
+        }
+
+        /// `readByteToken` for a field with a `max_len`; see `readStringMax`.
+        pub fn readByteTokenMax(self: *Self, allocator: Allocator, max: usize) !StringToken {
+            const saved = self.max_string_len;
+            defer self.max_string_len = saved;
+            if (max < saved) self.max_string_len = max;
+            return self.readBytes(allocator) catch |err| if (err == error.StringTooLong and max < saved) error.LengthOutOfBounds else err;
         }
 
         /// The next item as the bytes it was read from, checked as the mode and limits say. A
@@ -1240,6 +1259,7 @@ fn skipTrusted(input: []const u8, index: *usize, depth: usize) !void {
 /// scalars (`error.UnexpectedType` for an array or map key). Text and byte strings borrow the input
 /// unless they were in chunks, and are valid until the next call. The input must outlive the reader.
 pub fn pullReader(allocator: Allocator, input: []const u8, comptime cfg: anytype) !PullReader(@TypeOf(cfg)) {
+    comptime checkLimits(cfg);
     return PullReader(@TypeOf(cfg)).init(allocator, input, cfg);
 }
 
@@ -1924,9 +1944,14 @@ fn readOption(cfg: anytype, comptime name: []const u8, default: anytype) @TypeOf
 }
 
 fn limit(cfg: anytype, comptime name: []const u8, default: usize) usize {
-    const value = readOption(cfg, name, default);
-    if (comptime std.mem.eql(u8, name, "max_depth")) return @min(value, max_nesting);
-    return value;
+    return readOption(cfg, name, default);
+}
+
+/// The container stack is fixed at `max_nesting`, so a larger `max_depth` cannot be honoured.
+fn checkLimits(comptime cfg: anytype) void {
+    if (comptime meta.hasField(@TypeOf(cfg), "max_depth") and cfg.max_depth > max_nesting) {
+        @compileError("max_depth is at most 128, the depth of the container stack");
+    }
 }
 
 /// Whether a head with a length argument is written in the fewest bytes (RFC 8949 §4.2.1).

@@ -64,14 +64,23 @@ pub fn serializer(writer: *std.Io.Writer, comptime cfg: anytype) JsonSerializer(
     return JsonSerializer(@TypeOf(cfg)).init(writer, cfg);
 }
 
+/// The container stack is fixed at 128, so a larger `max_depth` cannot be honoured.
+fn checkLimits(comptime cfg: anytype) void {
+    if (comptime meta.hasField(@TypeOf(cfg), "max_depth") and cfg.max_depth > 128) {
+        @compileError("max_depth is at most 128, the depth of the container stack");
+    }
+}
+
 /// Reader-backed deserializer. The reader payload is copied and owned by the backend.
 pub fn readerDeserializer(allocator: Allocator, reader: *std.Io.Reader, comptime cfg: anytype) !JsonDeserializer(@TypeOf(cfg)) {
+    comptime checkLimits(cfg);
     const input = try reader.allocRemaining(allocator, .limited(effectiveMaxInputBytes(cfg)));
     return JsonDeserializer(@TypeOf(cfg)).initOwned(input, cfg);
 }
 
 /// Slice-backed deserializer. The raw bytes are borrowed from the caller.
 pub fn sliceDeserializer(allocator: Allocator, input: []const u8, comptime cfg: anytype) !JsonDeserializer(@TypeOf(cfg)) {
+    comptime checkLimits(cfg);
     _ = allocator;
     return JsonDeserializer(@TypeOf(cfg)).initBorrowed(input, cfg);
 }
@@ -316,7 +325,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
                 .input = input,
                 .cfg = cfg,
                 .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)) },
-                .max_depth = @min(readLimit(cfg, "max_depth", 128), 128),
+                .max_depth = readLimit(cfg, "max_depth", 128),
                 .max_items = readLimit(cfg, "max_items", std.math.maxInt(usize)),
                 .owns_input = false,
                 .can_borrow_strings = effectiveBorrowStrings(cfg),
@@ -651,6 +660,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
 /// that is only known while reading; see `cbor.PullReader`. Object keys arrive as text events. A
 /// text event is valid until the next call. The input must outlive the reader.
 pub fn pullReader(allocator: Allocator, input: []const u8, comptime cfg: anytype) !PullReader(@TypeOf(cfg)) {
+    comptime checkLimits(cfg);
     return PullReader(@TypeOf(cfg)).init(allocator, input, cfg);
 }
 

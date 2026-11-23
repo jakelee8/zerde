@@ -483,8 +483,11 @@ fn deserializeValue(
         var reader = deserializer.pullView(allocator);
         defer reader.deinit();
         const decoded = try T.zerdeDecode(allocator, &reader);
-        // The hook reads one whole item, no less.
-        if (!reader.done) return error.HookIncomplete;
+        // The hook reads one whole item, no less; what it built is released before the error.
+        if (!reader.done) {
+            freeTypedPartial(T, allocator, decoded, @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings());
+            return error.HookIncomplete;
+        }
         return decoded;
     }
     return switch (@typeInfo(T)) {
@@ -753,7 +756,10 @@ fn deserializePointer(
     switch (info.size) {
         .slice => {
             if (info.child == u8) {
-                const token = try deserializer.readString(allocator);
+                const token = if (comptime hasMax(bounds) and @hasDecl(DeserializerType, "readStringMax"))
+                    try deserializer.readStringMax(allocator, bounds.max_len)
+                else
+                    try deserializer.readString(allocator);
                 errdefer token.deinit(allocator);
                 try checkLength(bounds, token.bytes.len);
                 // Aliased slice parses can hand byte and string fields straight back to the caller without copying.
@@ -807,6 +813,7 @@ fn deserializePointer(
             while (try deserializer.nextArrayItem()) {
                 if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;
                 const item = try deserializeIndexedValue(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len);
+                errdefer freeTypedPartial(info.child, allocator, item, borrowed_strings);
                 try items.append(allocator, item);
             }
             try checkLength(bounds, items.items.len);
@@ -853,7 +860,10 @@ fn readByteToken(allocator: Allocator, deserializer: anytype) anyerror!StringTok
 /// parse aliases it.
 fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
     const DeserializerType = @TypeOf(deserializer.*);
-    const token = try readByteToken(allocator, deserializer);
+    const token = if (comptime hasMax(bounds) and @hasDecl(DeserializerType, "readByteTokenMax"))
+        try deserializer.readByteTokenMax(allocator, bounds.max_len)
+    else
+        try readByteToken(allocator, deserializer);
     errdefer token.deinit(allocator);
     try checkLength(bounds, token.bytes.len);
     if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
@@ -1096,6 +1106,11 @@ fn deserializeIndexedValue(
     const value = deserializeValue(T, allocator, deserializer, cfg, diagnostics, track_diagnostics) catch |err| return err;
     if (track_diagnostics) diagnostics.?.pop();
     return value;
+}
+
+/// Whether the field has a `max_len`.
+fn hasMax(comptime bounds: meta.Bounds) bool {
+    return bounds.max_len != std.math.maxInt(usize);
 }
 
 pub fn checkLength(comptime bounds: meta.Bounds, len: usize) error{LengthOutOfBounds}!void {

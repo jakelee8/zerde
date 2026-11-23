@@ -286,8 +286,8 @@ What they refuse, and why:
 - a JSON object member repeated in a field the type reads (`error.DuplicateField`); RFC 8259 §4 allows
   repeated names, so this is a policy, and one that has not been settled. A repeated member in a field
   the type does not read is skipped
-- in a dynamic `Value`: a JSON number that is not a finite double or an integer within 128 bits
-  (`error.InvalidNumber`, `error.FloatOutOfRange`); a CBOR map key that is not text
+- in a dynamic `Value`: a JSON integer beyond 128 bits or a float literal too large for a double
+  (`error.InvalidNumber` for an integer beyond 128 bits, `error.FloatOutOfRange` for a float literal that overflows); a CBOR map key that is not text
   (`error.UnexpectedType`), a tag (`error.UnexpectedTag`), and a simple value other than false, true and
   null (`error.UnexpectedToken`). A struct reads text and integer keys and skips a key of another type
   with its value
@@ -426,7 +426,7 @@ Anything else is `error.NonDeterministicEncoding`, or `error.DuplicateField` for
 it has no mode.
 
 Both readers take limits, so a hostile input costs a bounded amount: `max_depth` (open containers; at most
-128), `max_items` (data items in the whole input, keys and values each counted, `error.TooManyItems`) and
+128, a larger value is a compile error), `max_items` (data items in the whole input, keys and values each counted, `error.TooManyItems`) and
 `max_string_len` (bytes of one string after decoding, `error.StringTooLong`). The input size is
 `max_input_bytes` for a reader; a slice is already in memory and is not measured.
 

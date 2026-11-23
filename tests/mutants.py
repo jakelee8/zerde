@@ -254,6 +254,12 @@ MUTANTS = [
     ("bulk.zig", "hex[c >> 4], hex[c & 0xf] }", "hex[c & 0xf], hex[c >> 4] }"),
     ("bulk.zig", "        start = at + 1;\n    }\n}", "        start = at;\n    }\n}"),
     ("json.zig", "    fn push(self: *Encoder, kind: ContainerKind) !void {\n        if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;", "    fn push(self: *Encoder, kind: ContainerKind) !void {"),
+    ("typed.zig", "            freeTypedPartial(T, allocator, decoded, @hasDecl(DeserializerType, \"borrowStrings\") and deserializer.borrowStrings());\n", "            _ = 0;\n"),
+    ("typed.zig", "                errdefer freeTypedPartial(info.child, allocator, item, borrowed_strings);\n                try items.append(allocator, item);", "                try items.append(allocator, item);"),
+    ("typed.zig", "if (comptime hasMax(bounds) and @hasDecl(DeserializerType, \"readStringMax\"))", "if (comptime false and @hasDecl(DeserializerType, \"readStringMax\"))"),
+    ("typed.zig", "if (comptime hasMax(bounds) and @hasDecl(DeserializerType, \"readByteTokenMax\"))", "if (comptime false and @hasDecl(DeserializerType, \"readByteTokenMax\"))"),
+    ("cbor.zig", "if (max < saved) self.max_string_len = max;\n            return self.readString(allocator)", "return self.readString(allocator)"),
+    ("cbor.zig", "if (err == error.StringTooLong and max < saved) error.LengthOutOfBounds else err;\n        }\n\n        /// `readByteToken`", "err;\n        }\n\n        /// `readByteToken`"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
