@@ -94,6 +94,15 @@ MUTANTS = [
     ("cbor.zig", "                7 => try self.checkFloat(header),", "                7 => {},"),
     ("cbor.zig", "            const header = try parseHeader(self.input, &self.index);\n            try self.checkFloat(header);\n            const record", "            const header = try parseHeader(self.input, &self.index);\n            const record"),
     ("cbor.zig", "            const header = try self.readHeader();\n            try self.checkFloat(header);", "            const header = try self.readHeader();"),
+    # Integer variant keys and integer enums
+    ("typed.zig", ".integer => |number| try serializer.emitInteger(number),", ".integer => try serializer.emitString(\"x\"),"),
+    ("typed.zig", ".integer => |number| _ = try serializer.beginStructFieldInteger(T, number, Payload),", ".integer => |number| _ = try serializer.beginStructFieldInteger(T, number + 1, Payload),"),
+    ("typed.zig", ".integer => |key| key == number,", ".integer => |key| key == number or true,"),
+    ("typed.zig", "if (!integer_keys) return error.UnexpectedType;", "_ = 0;"),
+    ("typed.zig", "if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) return error.UnexpectedType;", "if (comptime meta.effectiveEnumRepr(T, cfg) == .integer and false) return error.UnexpectedType;"),
+    ("typed.zig", "if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) {\n                try serializer.emitInteger", "if (false) {\n                try serializer.emitInteger"),
+    ("meta.zig", "if (comptime cfgHasField(cfg, \"enum_repr\")) return @field(cfg, \"enum_repr\");", "if (comptime cfgHasField(cfg, \"enum_repr\") and false) return @field(cfg, \"enum_repr\");"),
+    ("cbor.zig", "                else => return error.UnexpectedType,\n            }\n        }\n\n        /// The next key of a struct's map", "                else => return null,\n            }\n        }\n\n        /// The next key of a struct's map"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

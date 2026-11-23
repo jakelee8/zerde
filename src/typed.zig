@@ -187,7 +187,9 @@ fn serializeValue(
             }
         },
         .@"enum" => {
-            if (@hasDecl(SerializerType, "emitEnum")) {
+            if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) {
+                try serializer.emitInteger(@backingInt(value));
+            } else if (@hasDecl(SerializerType, "emitEnum")) {
                 try serializer.emitEnum(T, value);
             } else {
                 try serializer.emitString(@tagName(value));
@@ -198,23 +200,33 @@ fn serializeValue(
             if (!@hasDecl(SerializerType, "supports_unions")) {
                 @compileError("format " ++ @typeName(SerializerType) ++ " does not support unions: " ++ @typeName(T));
             }
-            // Externally tagged: a variant without a payload is its name; any other is a map of one
-            // entry, the name and the payload. Both forms say which variant it is before its payload.
+            // Externally tagged: a variant without a payload is its key; any other is a map of one
+            // entry, the key and the payload. A key is the variant's name, or an integer when the
+            // variant has a `key` override. Both forms say which variant it is before its payload.
             switch (value) {
                 inline else => |payload, tag| {
-                    const name = comptime meta.effectiveFieldName(T, @tagName(tag), cfg);
+                    const key = comptime meta.effectiveFieldKey(T, @tagName(tag), cfg);
                     const Payload = @TypeOf(payload);
+                    if (comptime key == .integer and !@hasDecl(SerializerType, "supports_integer_keys")) {
+                        @compileError("format " ++ @typeName(SerializerType) ++ " does not support integer keys: " ++ @typeName(T));
+                    }
                     if (Payload == void) {
-                        try serializer.emitString(name);
+                        switch (comptime key) {
+                            .text => |name| try serializer.emitString(name),
+                            .integer => |number| try serializer.emitInteger(number),
+                        }
                     } else {
                         if (@hasDecl(SerializerType, "beginStructSized")) {
                             try serializer.beginStructSized(T, 1);
                         } else {
                             try serializer.beginStruct(T);
                         }
-                        _ = try serializer.beginStructField(T, name, Payload);
+                        switch (comptime key) {
+                            .text => |name| _ = try serializer.beginStructField(T, name, Payload),
+                            .integer => |number| _ = try serializer.beginStructFieldInteger(T, number, Payload),
+                        }
                         try serializeValue(serializer, payload, cfg, Format, order_policy);
-                        try serializer.endStructField(T, name, Payload);
+                        try serializer.endStructField(T, @tagName(tag), Payload);
                         try serializer.endStruct(T);
                     }
                 },
@@ -394,7 +406,7 @@ fn deserializeValue(
             }
             break :blk try deserializeValue(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics);
         },
-        .@"enum" => try decodeEnumValue(T, allocator, deserializer),
+        .@"enum" => try decodeEnumValue(T, allocator, deserializer, cfg),
         .@"union" => |info| try deserializeUnion(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         .array => |info| try deserializeArray(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         .pointer => |info| try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
@@ -421,26 +433,43 @@ fn deserializeUnion(
         @compileError("format " ++ @typeName(DeserializerType) ++ " does not support unions: " ++ @typeName(T));
     }
     const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
+    const integer_keys = comptime unionHasIntegerKeys(T, info, cfg);
+    if (integer_keys and !@hasDecl(DeserializerType, "supports_integer_keys")) {
+        @compileError("format " ++ @typeName(DeserializerType) ++ " does not support integer keys: " ++ @typeName(T));
+    }
 
     switch (try deserializer.peekKind()) {
         .string => {
             const token = try deserializer.readString(allocator);
             defer token.deinit(allocator);
             inline for (info.field_names, info.field_types) |name, FieldType| {
-                if (FieldType == void and std.mem.eql(u8, token.bytes, comptime meta.effectiveFieldName(T, name, cfg))) {
-                    return @unionInit(T, name, {});
-                }
+                if (FieldType == void and variantHasText(T, name, cfg, token.bytes)) return @unionInit(T, name, {});
+            }
+            return error.InvalidEnumTag;
+        },
+        .number => {
+            if (!integer_keys) return error.UnexpectedType;
+            const number = switch (try deserializer.readNumber()) {
+                .integer => |n| n,
+                .float => return error.UnexpectedType,
+            };
+            inline for (info.field_names, info.field_types) |name, FieldType| {
+                if (FieldType == void and variantHasInteger(T, name, cfg, number)) return @unionInit(T, name, {});
             }
             return error.InvalidEnumTag;
         },
         .object => {
             try deserializer.beginObject();
-            const key = (try deserializer.nextObjectField(allocator)) orelse return error.LengthMismatch;
-            defer key.deinit(allocator);
+            const key = (try nextUnionKey(deserializer, allocator, integer_keys)) orelse return error.LengthMismatch;
+            defer if (key == .text) key.text.deinit(allocator);
 
             const result: T = blk: {
                 inline for (info.field_names, info.field_types) |name, FieldType| {
-                    if (FieldType != void and std.mem.eql(u8, key.bytes, comptime meta.effectiveFieldName(T, name, cfg))) {
+                    const matches = switch (key) {
+                        .text => |token| variantHasText(T, name, cfg, token.bytes),
+                        .integer => |number| variantHasInteger(T, name, cfg, number),
+                    };
+                    if (FieldType != void and matches) {
                         const payload = try deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name);
                         break :blk @unionInit(T, name, payload);
                     }
@@ -450,14 +479,47 @@ fn deserializeUnion(
             errdefer freeTypedPartial(T, allocator, result, borrowed_strings);
 
             // A union is one entry: a second one is not another variant.
-            if (try deserializer.nextObjectField(allocator)) |extra| {
-                extra.deinit(allocator);
+            if (try nextUnionKey(deserializer, allocator, integer_keys)) |extra| {
+                if (extra == .text) extra.text.deinit(allocator);
                 return error.LengthMismatch;
             }
             return result;
         },
         else => return error.UnexpectedType,
     }
+}
+
+/// A map key that is text or an integer, for formats that allow both (`supports_integer_keys`).
+pub const ObjectKey = union(enum) {
+    text: StringToken,
+    integer: i128,
+};
+
+fn nextUnionKey(deserializer: anytype, allocator: Allocator, comptime integer_keys: bool) anyerror!?ObjectKey {
+    if (integer_keys) return try deserializer.nextObjectKey(allocator);
+    const token = (try deserializer.nextObjectField(allocator)) orelse return null;
+    return .{ .text = token };
+}
+
+fn unionHasIntegerKeys(comptime T: type, comptime info: std.builtin.Type.Union, comptime cfg: anytype) bool {
+    inline for (info.field_names) |name| {
+        if (meta.effectiveFieldKey(T, name, cfg) == .integer) return true;
+    }
+    return false;
+}
+
+fn variantHasText(comptime T: type, comptime name: []const u8, comptime cfg: anytype, bytes: []const u8) bool {
+    return switch (comptime meta.effectiveFieldKey(T, name, cfg)) {
+        .text => |text| std.mem.eql(u8, bytes, text),
+        .integer => false,
+    };
+}
+
+fn variantHasInteger(comptime T: type, comptime name: []const u8, comptime cfg: anytype, number: i128) bool {
+    return switch (comptime meta.effectiveFieldKey(T, name, cfg)) {
+        .text => false,
+        .integer => |key| key == number,
+    };
 }
 
 fn decodeIntNumber(comptime T: type, number: Number) Error!T {
@@ -485,7 +547,7 @@ pub fn narrowFloat(comptime T: type, wide: f64) Error!T {
     return narrowed;
 }
 
-fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype) anyerror!T {
+fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype, comptime cfg: anytype) anyerror!T {
     const DeserializerType = @TypeOf(deserializer.*);
     if (@hasDecl(DeserializerType, "readEnumTag")) {
         return try deserializer.readEnumTag(T);
@@ -493,6 +555,8 @@ fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype
 
     return switch (try deserializer.peekKind()) {
         .string => blk: {
+            // An enum written as its number reads only a number.
+            if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) return error.UnexpectedType;
             const token = try deserializer.readString(allocator);
             defer token.deinit(allocator);
             break :blk std.meta.stringToEnum(T, token.bytes) orelse error.InvalidEnumTag;

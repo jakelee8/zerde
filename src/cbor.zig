@@ -502,6 +502,27 @@ pub fn CborDeserializer(comptime Config: type) type {
             return token;
         }
 
+        /// The next key of a map whose keys are text or integers, which is what a union with integer
+        /// variant keys holds. A key of another type is `error.UnexpectedType`.
+        pub fn nextObjectKey(self: *Self, allocator: Allocator) !?typed.ObjectKey {
+            if (try self.beginObjectEntry()) return null;
+
+            const header = try self.readHeader();
+            switch (header.major) {
+                3 => {
+                    const token = try self.finishString(allocator, header);
+                    errdefer token.deinit(allocator);
+                    try self.recordText(token);
+                    return .{ .text = token };
+                },
+                0, 1 => {
+                    try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
+                    return .{ .integer = if (header.major == 0) header.value else -@as(i128, header.value) - 1 };
+                },
+                else => return error.UnexpectedType,
+            }
+        }
+
         /// The next key of a struct's map, matched to one of `T`'s fields by its text or integer
         /// key. Any other key, of any type, is `.unknown` and is checked for repeats.
         ///

@@ -893,3 +893,74 @@ test "refuse_non_finite turns NaN and infinity into an error, wherever they are"
     _ = try zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xfa, 0x7f, 0x7f, 0xff, 0xff }, .{}, refuse);
     _ = try zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xfb, 0x7f, 0xef, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, .{}, refuse);
 }
+
+// ---- integer variant keys, integer enums ----------------------------------------------------------
+
+const Op = union(enum) {
+    ping,
+    get: u32,
+    put: struct { a: u8 },
+
+    pub const serde = .{ .fields = .{
+        .ping = .{ .key = 1 },
+        .get = .{ .key = 2 },
+        .put = .{ .key = 24 },
+    } };
+};
+
+test "a union variant can have an integer key" {
+    try expectCborBytes(&.{0x01}, Op{ .ping = {} }, .{}, .{ .deterministic = true });
+    try expectCborBytes(&.{ 0xa1, 0x02, 0x07 }, Op{ .get = 7 }, .{}, .{ .deterministic = true });
+    try expectCborBytes(&.{ 0xa1, 0x18, 0x18, 0xa1, 0x61, 'a', 0x03 }, Op{ .put = .{ .a = 3 } }, .{}, .{ .deterministic = true });
+    for ([_]Op{ .ping, .{ .get = 9 }, .{ .put = .{ .a = 1 } } }) |op| try cborRoundTrip(Op, op, .{});
+    // Another spelling of the key (a longer head) reads the same.
+    const decoded = try zerde.cbor.parseSlice(Op, allocator, &.{ 0xa1, 0x18, 0x02, 0x07 });
+    try std.testing.expectEqual(Op{ .get = 7 }, decoded);
+}
+
+test "an integer-keyed union refuses a text key, an unknown number and a second entry" {
+    try expectCborError(Op, error.InvalidEnumTag, &.{ 0xa1, 0x63, 'g', 'e', 't', 0x07 });
+    try expectCborError(Op, error.InvalidEnumTag, &.{ 0xa1, 0x05, 0x07 });
+    try expectCborError(Op, error.InvalidEnumTag, &.{0x05});
+    try expectCborError(Op, error.LengthMismatch, &.{ 0xa2, 0x02, 0x07, 0x02, 0x08 });
+    try expectCborError(Op, error.UnexpectedType, &.{ 0xa1, 0x41, 'x', 0x07 });
+    try expectCborError(Op, error.UnexpectedType, &.{ 0xf9, 0x3c, 0x00 });
+    // The payload keeps its own checks.
+    try expectCborError(Op, error.UnexpectedType, &.{ 0xa1, 0x02, 0x61, 'x' });
+}
+
+test "text and integer variant keys can mix in one union" {
+    const MixedKeys = union(enum) {
+        a: u8,
+        b: u8,
+        pub const serde = .{ .fields = .{ .b = .{ .key = 5 } } };
+    };
+    try cborRoundTrip(MixedKeys, .{ .a = 1 }, .{});
+    try cborRoundTrip(MixedKeys, .{ .b = 1 }, .{});
+    // JSON has no integer keys; asking for one is a compile error, so only text unions reach it.
+    try jsonRoundTrip(Shape, .{ .circle = 3 }, .{}, .{});
+}
+
+const Level = enum(u8) {
+    low = 1,
+    high = 9,
+    pub const serde = .{ .enum_repr = .integer };
+};
+
+test "an enum can be written as its number" {
+    const Holder = struct { level: Level };
+    try expectCborBytes(&.{ 0xa1, 0x65, 'l', 'e', 'v', 'e', 'l', 0x09 }, Holder{ .level = .high }, .{}, .{ .deterministic = true });
+    try expectJsonText("{\"level\":1}", Holder{ .level = .low }, .{}, .{});
+    try cborRoundTrip(Holder, .{ .level = .high }, .{});
+    try jsonRoundTrip(Holder, .{ .level = .low }, .{}, .{});
+    // It reads only the number; an unknown number is not a level.
+    try expectJsonError(Holder, error.UnexpectedType, "{\"level\":\"low\"}");
+    try expectJsonError(Holder, error.InvalidEnumTag, "{\"level\":2}");
+    // The call site can ask for it too, for an enum whose type says nothing.
+    const Plain = enum(u8) { a = 3, b = 4 };
+    try expectJsonText("4", Plain.b, .{ .enum_repr = .integer }, .{});
+    try expectJsonText("\"b\"", Plain.b, .{}, .{});
+    // The name form still reads either.
+    const by_number = try zerde.json.parseSlice(Plain, allocator, "3");
+    try std.testing.expectEqual(Plain.a, by_number);
+}

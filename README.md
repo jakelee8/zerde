@@ -241,6 +241,14 @@ and per-field `rename` like a struct field. Reading takes only those two forms: 
 name, and a bare name only for a variant without a payload. Other formats do not support unions and
 say so at compile time.
 
+A variant can have an integer key like a struct field (`.fields = .{ .get = .{ .key = 2 } }`): a variant
+without a payload is then the bare integer, any other is `{2: payload}`. Integer variant keys need a format
+with integer keys (CBOR). Text and integer keys can mix in one union.
+
+An enum is written as its name by default. `pub const serde = .{ .enum_repr = .integer }` on the enum, or
+`.enum_repr = .integer` at the call site, writes its number instead; such an enum reads only a number, while
+a name-form enum reads a name or a number.
+
 ### Optional fields
 
 A plain `?T` field reads an absent field and `null` alike, and is written as `null` or, with

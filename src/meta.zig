@@ -51,6 +51,10 @@ pub const OptionalPolicy = enum {
     absent,
 };
 
+/// How an enum is written. Reading takes the name or the number for `.name`, and only the number for
+/// `.integer`.
+pub const EnumRepr = enum { name, integer };
+
 /// A format's field order: the order it uses when neither the call site nor the type names one,
 /// and whether it requires that order. A deterministic encoding requires its order, so asking such
 /// a format for another order is a compile error instead of output that only looks deterministic.
@@ -122,6 +126,13 @@ pub fn effectiveDenyUnknownFields(comptime T: type, comptime cfg: anytype) bool 
     if (comptime cfgHasField(cfg, "deny_unknown_fields")) return @field(cfg, "deny_unknown_fields");
     if (comptime serdeHasField(T, "deny_unknown_fields")) return @field(T.serde, "deny_unknown_fields");
     return false;
+}
+
+/// Call-site `enum_repr` wins over the type's, as the other write policies do.
+pub fn effectiveEnumRepr(comptime T: type, comptime cfg: anytype) EnumRepr {
+    if (comptime cfgHasField(cfg, "enum_repr")) return @field(cfg, "enum_repr");
+    if (comptime serdeHasField(T, "enum_repr")) return @field(T.serde, "enum_repr");
+    return .name;
 }
 
 /// Field order precedence is: call site, then the type's `serde`, then the format's default.
