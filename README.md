@@ -293,6 +293,22 @@ What they refuse, and why:
   with its value
 - a JSON text that starts with a byte order mark
 
+### Reader modes and limits
+
+CBOR `ReadConfig.mode` is `.lenient` (the default, everything above) or `.strict`. A strict read
+accepts only the deterministic encoding of RFC 8949 §4.2.1 with the preferred floats of §4.2.2, which is
+what `WriteConfig.deterministic` writes, so it is the check a boundary that requires canonical input
+uses: shortest heads, definite lengths only, map keys in strictly ascending order of their encoded bytes,
+floats in the shortest exact width, NaN only as `0xf97e00`, and no tags (self-described CBOR included).
+Anything else is `error.NonDeterministicEncoding`, or `error.DuplicateField` for a repeated key and
+`error.UnexpectedTag` for a tag. Strict checks apply to skipped values and keys too. JSON has one form, so
+it has no mode.
+
+Both readers take limits, so a hostile input costs a bounded amount: `max_depth` (open containers; at most
+128), `max_items` (data items in the whole input, keys and values each counted, `error.TooManyItems`) and
+`max_string_len` (bytes of one string after decoding, `error.StringTooLong`). The input size is
+`max_input_bytes` for a reader; a slice is already in memory and is not measured.
+
 NaN and the infinities are values in CBOR (RFC 8949 §3.3) and are read into float fields and written;
 JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteFloat`). A profile that
 forbids them in CBOR sets `ReadConfig.refuse_non_finite`: any NaN or infinity, in a field, a skipped

@@ -43,6 +43,27 @@ pub const ReadConfig = struct {
     /// (`error.NonFiniteFloat`). RFC 8949 §3.3 makes them values, so the default reads them; a
     /// profile that forbids them turns this on.
     refuse_non_finite: bool = false,
+    /// Which encodings are accepted; see `Mode`.
+    mode: Mode = .lenient,
+    /// Most containers open at once, at most `max_nesting`.
+    max_depth: usize = max_nesting,
+    /// Most data items in the whole input, map keys and values each counted (`error.TooManyItems`).
+    max_items: usize = std.math.maxInt(usize),
+    /// Longest text or byte string in bytes, after its chunks are joined (`error.StringTooLong`).
+    max_string_len: usize = std.math.maxInt(usize),
+};
+
+/// Which encodings a read accepts.
+pub const Mode = enum {
+    /// Any well-formed CBOR (RFC 8949 §5.3), as the module documentation lists.
+    lenient,
+    /// Only the deterministic encoding of RFC 8949 §4.2.1 with the preferred floats of §4.2.2, which
+    /// is the form `WriteConfig.deterministic` writes: shortest heads, definite lengths, map keys in
+    /// strictly ascending order of their encoded bytes, floats in the shortest exact width and NaN
+    /// only as `0xf97e00`, and no tags (self-described CBOR included). Anything else is
+    /// `error.NonDeterministicEncoding`, or `error.DuplicateField` for a repeated key and
+    /// `error.UnexpectedTag` for a tag. This is the check a boundary that requires canonical input uses.
+    strict,
 };
 pub const WriteConfig = struct {
     /// Write the core deterministic encoding of RFC 8949 §4.2.1, so equal values produce equal
@@ -135,6 +156,10 @@ const Container = struct {
     /// keys only and the records are released when it ends.
     keys_base: usize = 0,
     key_bytes_base: usize = 0,
+    /// The encoded bytes of the previous key in the input (an empty span for none), which a strict
+    /// read compares the next key to.
+    prev_key_start: usize = 0,
+    prev_key_end: usize = 0,
 };
 
 const Header = struct {
@@ -307,6 +332,11 @@ pub fn CborDeserializer(comptime Config: type) type {
         index: usize = 0,
         owns_input: bool,
         can_borrow_strings: bool,
+        strict: bool = false,
+        max_depth: usize = max_nesting,
+        max_items: usize = std.math.maxInt(usize),
+        max_string_len: usize = std.math.maxInt(usize),
+        items: usize = 0,
         stack: [max_nesting]Container = undefined,
         stack_len: usize = 0,
         /// Keys of the maps being read, innermost last, for the duplicate check.
@@ -326,6 +356,10 @@ pub fn CborDeserializer(comptime Config: type) type {
                 .allocator = allocator,
                 .owns_input = false,
                 .can_borrow_strings = effectiveBorrowStrings(cfg),
+                .strict = readOption(cfg, "mode", Mode.lenient) == .strict,
+                .max_depth = limit(cfg, "max_depth", max_nesting),
+                .max_items = limit(cfg, "max_items", std.math.maxInt(usize)),
+                .max_string_len = limit(cfg, "max_string_len", std.math.maxInt(usize)),
             };
         }
 
@@ -336,6 +370,10 @@ pub fn CborDeserializer(comptime Config: type) type {
                 .allocator = allocator,
                 .owns_input = true,
                 .can_borrow_strings = false,
+                .strict = readOption(cfg, "mode", Mode.lenient) == .strict,
+                .max_depth = limit(cfg, "max_depth", max_nesting),
+                .max_items = limit(cfg, "max_items", std.math.maxInt(usize)),
+                .max_string_len = limit(cfg, "max_string_len", std.math.maxInt(usize)),
             };
         }
 
@@ -494,10 +532,12 @@ pub fn CborDeserializer(comptime Config: type) type {
         pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {
             if (try self.beginObjectEntry()) return null;
 
+            const start = self.index;
             const header = try self.readHeader();
             if (header.major != 3) return error.UnexpectedType;
             const token = try self.finishString(allocator, header);
             errdefer token.deinit(allocator);
+            try self.orderFrameKey(start);
             try self.recordText(token);
             return token;
         }
@@ -507,15 +547,18 @@ pub fn CborDeserializer(comptime Config: type) type {
         pub fn nextObjectKey(self: *Self, allocator: Allocator) !?typed.ObjectKey {
             if (try self.beginObjectEntry()) return null;
 
+            const start = self.index;
             const header = try self.readHeader();
             switch (header.major) {
                 3 => {
                     const token = try self.finishString(allocator, header);
                     errdefer token.deinit(allocator);
+                    try self.orderFrameKey(start);
                     try self.recordText(token);
                     return .{ .text = token };
                 },
                 0, 1 => {
+                    try self.orderFrameKey(start);
                     try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
                     return .{ .integer = if (header.major == 0) header.value else -@as(i128, header.value) - 1 };
                 },
@@ -531,13 +574,24 @@ pub fn CborDeserializer(comptime Config: type) type {
         pub fn nextObjectFieldIndex(self: *Self, comptime T: type, comptime cfg: anytype) !ObjectFieldLookup {
             if (try self.beginObjectEntry()) return .end;
 
+            const frame = self.current();
             const start = self.index;
-            const header = try parseHeader(self.input, &self.index);
+            const result = try self.lookupKey(T, cfg, start);
+            var previous: [2]usize = .{ frame.prev_key_start, frame.prev_key_end };
+            try self.checkKeyOrder(&previous, start);
+            frame.prev_key_start = previous[0];
+            frame.prev_key_end = previous[1];
+            return result;
+        }
+
+        fn lookupKey(self: *Self, comptime T: type, comptime cfg: anytype, start: usize) !ObjectFieldLookup {
+            const header = try self.nextHead();
             switch (header.major) {
                 3 => {
                     if (!header.indefinite) {
                         // A field name the type declares is UTF-8 already, so a key that matches one needs no
                         // validation; any other key is checked before it is recorded.
+                        if (header.value > self.max_string_len) return error.StringTooLong;
                         const raw = try self.takeBytes(header.value);
                         if (typed.matchStructFieldIndex(T, cfg, raw)) |index| return .{ .field_index = index };
                         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
@@ -558,6 +612,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 },
                 else => {
                     self.index = start;
+                    self.items -= 1;
                     try self.recordKeyItem(self.stack_len);
                     return .unknown;
                 },
@@ -590,23 +645,38 @@ pub fn CborDeserializer(comptime Config: type) type {
             return true;
         }
 
+        /// Reads one head, counts it against `max_items`, and in a strict read refuses what the
+        /// deterministic encoding does not allow.
+        fn nextHead(self: *Self) !Header {
+            const header = try parseHeader(self.input, &self.index);
+            self.items += 1;
+            if (self.items > self.max_items) return error.TooManyItems;
+            if (self.strict) {
+                if (header.major == 6) return error.UnexpectedTag;
+                if (header.indefinite or !isShortestHead(header)) return error.NonDeterministicEncoding;
+                if (header.major == 7 and !isPreferredFloat(header)) return error.NonDeterministicEncoding;
+            }
+            return header;
+        }
+
         /// A header with any self-described tag read through. Another tag is not a value the typed
-        /// layer can read: it would be dropped without anyone having agreed what it meant.
-        fn readHeaderAt(self: *Self, cursor: *usize) !Header {
+        /// layer can read: it would be dropped without anyone having agreed what it meant. A strict
+        /// read refuses every tag when it reads the head.
+        fn peekHeader(self: *Self) !Header {
+            var cursor = self.index;
             while (true) {
-                const header = try parseHeader(self.input, cursor);
+                const header = try parseHeader(self.input, &cursor);
                 if (header.major != 6) return header;
                 if (header.value != self_described_tag) return error.UnexpectedTag;
             }
         }
 
-        fn peekHeader(self: *Self) !Header {
-            var cursor = self.index;
-            return self.readHeaderAt(&cursor);
-        }
-
         fn readHeader(self: *Self) !Header {
-            return self.readHeaderAt(&self.index);
+            while (true) {
+                const header = try self.nextHead();
+                if (header.major != 6) return header;
+                if (header.value != self_described_tag) return error.UnexpectedTag;
+            }
         }
 
         /// A length that claims more items than the input has bytes left, at `per_item` bytes
@@ -632,6 +702,7 @@ pub fn CborDeserializer(comptime Config: type) type {
         fn finishString(self: *Self, allocator: Allocator, header: Header) !StringToken {
             const is_text = header.major == 3;
             if (!header.indefinite) {
+                if (header.value > self.max_string_len) return error.StringTooLong;
                 const raw = try self.takeBytes(header.value);
                 if (is_text and !std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
                 return .{ .bytes = raw, .allocated = false };
@@ -647,6 +718,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 }
                 const chunk = try parseHeader(self.input, &self.index);
                 if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;
+                if (chunk.value > self.max_string_len - assembled.items.len) return error.StringTooLong;
                 const raw = try self.takeBytes(chunk.value);
                 if (is_text and !std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
                 try assembled.appendSlice(allocator, raw);
@@ -657,9 +729,9 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// Skips one data item, checking that it is well-formed and that every map in it has
         /// distinct keys. `depth` is how many containers are open around it.
         fn skipItem(self: *Self, depth: usize) anyerror!void {
-            var header = try parseHeader(self.input, &self.index);
+            var header = try self.nextHead();
             // A tag adds no nesting of its own, so a run of tags is a loop, not recursion.
-            while (header.major == 6) header = try parseHeader(self.input, &self.index);
+            while (header.major == 6) header = try self.nextHead();
 
             switch (header.major) {
                 0, 1 => {},
@@ -669,7 +741,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                     token.deinit(self.allocator);
                 },
                 4 => {
-                    if (depth >= max_nesting) return error.CborNestingTooDeep;
+                    if (depth >= self.max_depth) return error.CborNestingTooDeep;
                     if (header.indefinite) {
                         while (try self.moreItems()) try self.skipItem(depth + 1);
                     } else {
@@ -677,17 +749,21 @@ pub fn CborDeserializer(comptime Config: type) type {
                     }
                 },
                 5 => {
-                    if (depth >= max_nesting) return error.CborNestingTooDeep;
+                    if (depth >= self.max_depth) return error.CborNestingTooDeep;
                     const keys_base = self.keys.items.len;
                     const key_bytes_base = self.key_bytes.items.len;
+                    var previous: [2]usize = .{ 0, 0 };
                     if (header.indefinite) {
+                        // A strict read has refused an indefinite map already, so no order to check.
                         while (try self.moreItems()) {
                             try self.recordKeyItem(depth + 1);
                             try self.skipItem(depth + 1);
                         }
                     } else {
                         for (0..try self.boundedCount(header.value, 2)) |_| {
+                            const key_start = self.index;
                             try self.recordKeyItem(depth + 1);
+                            try self.checkKeyOrder(&previous, key_start);
                             try self.skipItem(depth + 1);
                         }
                     }
@@ -710,6 +786,27 @@ pub fn CborDeserializer(comptime Config: type) type {
             if (exponent_all_ones) return error.NonFiniteFloat;
         }
 
+        /// A strict read needs each key of a map to sort after the one before it by its encoded bytes
+        /// (RFC 8949 §4.2.1), which also rules out a repeated key. `previous` is the span of the last key.
+        fn checkKeyOrder(self: *Self, previous: *[2]usize, start: usize) !void {
+            if (!self.strict) return;
+            const key = self.input[start..self.index];
+            if (previous[1] != 0) {
+                const before = self.input[previous[0]..previous[1]];
+                if (std.mem.eql(u8, before, key)) return error.DuplicateField;
+                if (!std.mem.lessThan(u8, before, key)) return error.NonDeterministicEncoding;
+            }
+            previous.* = .{ start, self.index };
+        }
+
+        fn orderFrameKey(self: *Self, start: usize) !void {
+            const frame = self.current();
+            var previous: [2]usize = .{ frame.prev_key_start, frame.prev_key_end };
+            try self.checkKeyOrder(&previous, start);
+            frame.prev_key_start = previous[0];
+            frame.prev_key_end = previous[1];
+        }
+
         /// Whether an indefinite-length container has another item, consuming its break if not.
         fn moreItems(self: *Self) !bool {
             if (self.index >= self.input.len) return error.UnexpectedEndOfInput;
@@ -723,7 +820,7 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// spellings of one key are the same key.
         fn recordKeyItem(self: *Self, depth: usize) anyerror!void {
             const start = self.index;
-            const header = try parseHeader(self.input, &self.index);
+            const header = try self.nextHead();
             try self.checkFloat(header);
             const record: KeyRecord = switch (header.major) {
                 0 => .{ .kind = .uint, .a = header.value },
@@ -738,7 +835,9 @@ pub fn CborDeserializer(comptime Config: type) type {
                     else => .{ .kind = .simple, .a = if (header.ai == 24) header.value else header.ai },
                 },
                 else => blk: {
+                    // skipItem reads the head again and counts it again.
                     self.index = start;
+                    self.items -= 1;
                     try self.skipItem(depth);
                     const end = self.index;
                     self.index = start;
@@ -884,7 +983,7 @@ pub fn CborDeserializer(comptime Config: type) type {
         }
 
         fn push(self: *Self, container: Container) !void {
-            if (self.stack_len == self.stack.len) return error.CborNestingTooDeep;
+            if (self.stack_len >= self.max_depth) return error.CborNestingTooDeep;
             self.stack[self.stack_len] = container;
             self.stack_len += 1;
         }
@@ -1177,6 +1276,53 @@ fn writeBigEndian(writer: *std.Io.Writer, value: anytype) !void {
 fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
     if (comptime meta.hasField(@TypeOf(cfg), "max_input_bytes")) return @field(cfg, "max_input_bytes");
     return (ReadConfig{}).max_input_bytes;
+}
+
+fn readOption(cfg: anytype, comptime name: []const u8, default: anytype) @TypeOf(default) {
+    if (comptime meta.hasField(@TypeOf(cfg), name)) return @field(cfg, name);
+    return default;
+}
+
+fn limit(cfg: anytype, comptime name: []const u8, default: usize) usize {
+    const value = readOption(cfg, name, default);
+    if (comptime std.mem.eql(u8, name, "max_depth")) return @min(value, max_nesting);
+    return value;
+}
+
+/// Whether a head with a length argument is written in the fewest bytes (RFC 8949 §4.2.1).
+fn isShortestHead(header: Header) bool {
+    if (header.major == 7 or header.indefinite) return true;
+    return switch (header.ai) {
+        24 => header.value >= 24,
+        25 => header.value > 0xff,
+        26 => header.value > 0xffff,
+        27 => header.value > 0xffff_ffff,
+        else => true,
+    };
+}
+
+/// Whether a float head is the preferred serialization of RFC 8949 §4.2.2: the shortest of half,
+/// single and double that keeps the value, and NaN only as `0xf97e00`.
+fn isPreferredFloat(header: Header) bool {
+    switch (header.ai) {
+        25 => {
+            const half: f16 = @bitCast(@as(u16, @intCast(header.value)));
+            return !std.math.isNan(half) or header.value == 0x7e00;
+        },
+        26 => {
+            const single: f32 = @bitCast(@as(u32, @intCast(header.value)));
+            if (!std.math.isFinite(single)) return false;
+            const half: f16 = @floatCast(single);
+            return @as(f32, half) != single;
+        },
+        27 => {
+            const double: f64 = @bitCast(header.value);
+            if (!std.math.isFinite(double)) return false;
+            const single: f32 = @floatCast(double);
+            return @as(f64, single) != double;
+        },
+        else => return true,
+    }
 }
 
 fn effectiveBorrowStrings(cfg: anytype) bool {

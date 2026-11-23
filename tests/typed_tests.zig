@@ -964,3 +964,195 @@ test "an enum can be written as its number" {
     const by_number = try zerde.json.parseSlice(Plain, allocator, "3");
     try std.testing.expectEqual(Plain.a, by_number);
 }
+
+// ---- strict mode and limits --------------------------------------------------------------------------
+
+const strict = .{ .mode = .strict };
+
+fn expectStrict(comptime T: type, expected: anyerror, input: []const u8) !void {
+    try std.testing.expectError(expected, zerde.cbor.parseSliceWith(T, allocator, input, .{}, strict));
+}
+
+test "strict reads accept exactly what the deterministic writer writes" {
+    inline for (.{
+        Blob{ .id = 1, .data = .{ .bytes = "\xff\x00" } },
+        Keyed{ .f = 6, .e = 5, .d = 4, .c = 3, .b = 2, .a = 1 },
+        Real{ .v = 1.5 },
+        Real{ .v = 1.1 },
+        Real{ .v = 100000.0 },
+        Real{ .v = -0.0 },
+        Real{ .v = std.math.inf(f64) },
+        Real{ .v = std.math.nan(f64) },
+        Mixed{ .big = 200, .text = "hello", .ratio = 0.5, .list = &.{ 1, 300, 65535 } },
+    }) |value| {
+        const T = @TypeOf(value);
+        var out = try writeCbor(value, .{}, .{ .deterministic = true });
+        defer out.deinit();
+        const decoded = try zerde.cbor.parseSliceWith(T, allocator, out.written(), .{}, strict);
+        defer zerde.free(allocator, decoded);
+        // And it is a fixed point: strict reading then writing gives the same bytes.
+        try expectCborBytes(out.written(), decoded, .{}, .{ .deterministic = true });
+    }
+    // A union, a nested array and negative integers.
+    var out = try writeCbor(Op{ .put = .{ .a = 3 } }, .{}, .{ .deterministic = true });
+    defer out.deinit();
+    _ = try zerde.cbor.parseSliceWith(Op, allocator, out.written(), .{}, strict);
+    const nested = try zerde.cbor.parseSliceWith([]const []const i64, allocator, &.{ 0x82, 0x82, 0x20, 0x38, 0x64, 0x80 }, .{}, strict);
+    defer zerde.free(allocator, nested);
+}
+
+test "strict refuses a head that is longer than it needs to be" {
+    try expectStrict(u8, error.NonDeterministicEncoding, &.{ 0x18, 0x05 });
+    try expectStrict(u32, error.NonDeterministicEncoding, &.{ 0x19, 0x00, 0xff });
+    try expectStrict(u32, error.NonDeterministicEncoding, &.{ 0x1a, 0x00, 0x00, 0xff, 0xff });
+    try expectStrict(u64, error.NonDeterministicEncoding, &.{ 0x1b, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff });
+    try expectStrict(i8, error.NonDeterministicEncoding, &.{ 0x38, 0x05 });
+    try expectStrict([]const u8, error.NonDeterministicEncoding, &.{ 0x78, 0x01, 'a' });
+    try expectStrict([]const u16, error.NonDeterministicEncoding, &.{ 0x98, 0x01, 0x01 });
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xb8, 0x00 });
+    // The shortest form of each width is fine.
+    _ = try zerde.cbor.parseSliceWith(u8, allocator, &.{ 0x18, 0x18 }, .{}, strict);
+    _ = try zerde.cbor.parseSliceWith(u16, allocator, &.{ 0x19, 0x01, 0x00 }, .{}, strict);
+    _ = try zerde.cbor.parseSliceWith(u32, allocator, &.{ 0x1a, 0x00, 0x01, 0x00, 0x00 }, .{}, strict);
+    _ = try zerde.cbor.parseSliceWith(u64, allocator, &.{ 0x1b, 0, 0, 0, 1, 0, 0, 0, 0 }, .{}, strict);
+}
+
+test "strict refuses indefinite lengths and tags" {
+    try expectStrict([]const u16, error.NonDeterministicEncoding, &.{ 0x9f, 0x01, 0xff });
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xbf, 0xff });
+    try expectStrict([]const u8, error.NonDeterministicEncoding, &.{ 0x7f, 0x61, 'a', 0xff });
+    try expectStrict(zerde.ByteString, error.NonDeterministicEncoding, &.{ 0x5f, 0x41, 0x01, 0xff });
+    try expectStrict(u8, error.UnexpectedTag, &.{ 0xc1, 0x05 });
+    try expectStrict(u8, error.UnexpectedTag, &.{ 0xd9, 0xd9, 0xf7, 0x05 });
+    try expectStrict(Probe, error.UnexpectedTag, &.{ 0xa1, 0x61, 'x', 0xc1, 0x05 }); // a skipped value
+    // Lenient takes all of them.
+    _ = try zerde.cbor.parseSlice(u8, allocator, &.{ 0xd9, 0xd9, 0xf7, 0x05 });
+}
+
+test "strict refuses a float that is not in its shortest width" {
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xfa, 0x3f, 0xc0, 0x00, 0x00 }); // 1.5 as single
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0 }); // 1.5 as double
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0 }); // 1.0 as double
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xfa, 0x7f, 0x80, 0x00, 0x00 }); // infinity as single
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xfa, 0x7f, 0xc0, 0x00, 0x00 }); // NaN as single
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xf9, 0x7e, 0x01 }); // a NaN with a payload
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xf9, 0xfe, 0x00 }); // a NaN with a sign
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xa1, 0x61, 'x', 0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0 }); // skipped
+    // A value that needs the width it has is fine.
+    _ = try zerde.cbor.parseSliceWith(f64, allocator, &.{ 0xfa, 0x47, 0xc3, 0x50, 0x00 }, .{}, strict);
+    _ = try zerde.cbor.parseSliceWith(f64, allocator, &.{ 0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a }, .{}, strict);
+    _ = try zerde.cbor.parseSliceWith(f64, allocator, &.{ 0xf9, 0x80, 0x00 }, .{}, strict);
+    // Lenient takes the long spellings.
+    _ = try zerde.cbor.parseSlice(f64, allocator, &.{ 0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0 });
+}
+
+test "strict needs map keys in ascending order of their encoded bytes, with none repeated" {
+    // "b" before "a"; and a longer key before a shorter one.
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xa2, 0x61, 'b', 0x00, 0x61, 'a', 0x00 });
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xa2, 0x62, 'a', 'a', 0x00, 0x61, 'z', 0x00 });
+    try expectStrict(Probe, error.DuplicateField, &.{ 0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02 });
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xa2, 0x02, 0x00, 0x01, 0x00 }); // integer keys
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xa2, 0x20, 0x00, 0x01, 0x00 }); // -1 sorts after 1
+    // In a skipped value.
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xa1, 0x61, 'x', 0xa2, 0x61, 'b', 0x00, 0x61, 'a', 0x00 });
+    try expectStrict(Probe, error.NonDeterministicEncoding, &.{ 0xa2, 0x61, 'x', 0x00, 0x61, 'a', 0x01 });
+    // Ascending is fine, mixing types as the major types sort.
+    _ = try zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa3, 0x01, 0x00, 0x20, 0x00, 0x61, 'x', 0x00 }, .{}, strict);
+    // Lenient takes any order.
+    _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0x61, 'b', 0x00, 0x61, 'a', 0x00 });
+}
+
+test "limits: depth, items and string length" {
+    // Depth: a map holding an array holding an array is three levels.
+    const three = [_]u8{ 0xa1, 0x61, 'x', 0x81, 0x81, 0x00 };
+    _ = try zerde.cbor.parseSliceWith(Probe, allocator, &three, .{}, .{ .max_depth = 3 });
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(Probe, allocator, &three, .{}, .{ .max_depth = 2 }));
+    // Typed containers count the same way.
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith([]const []const u16, allocator, &.{ 0x81, 0x80 }, .{}, .{ .max_depth = 1 }));
+    // A limit above the fixed stack is the stack's.
+    const deep = try nestedCbor(200, 0x81);
+    defer allocator.free(deep);
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(Probe, allocator, deep, .{}, .{ .max_depth = 100_000 }));
+
+    // Items: the map, its key and its value are three.
+    const two_pairs = [_]u8{ 0xa2, 0x61, 'x', 0x00, 0x61, 'y', 0x00 };
+    _ = try zerde.cbor.parseSliceWith(Probe, allocator, &two_pairs, .{}, .{ .max_items = 5 });
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceWith(Probe, allocator, &two_pairs, .{}, .{ .max_items = 4 }));
+    // A skipped array's elements count, and a typed array's.
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x61, 'x', 0x83, 0x01, 0x02, 0x03 }, .{}, .{ .max_items = 5 }));
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceWith([]const u16, allocator, &.{ 0x83, 0x01, 0x02, 0x03 }, .{}, .{ .max_items = 3 }));
+    const sixteen = try zerde.cbor.parseSliceWith([]const u16, allocator, &.{ 0x83, 0x01, 0x02, 0x03 }, .{}, .{ .max_items = 4 });
+    allocator.free(sixteen);
+
+    // String length: text and bytes, definite and in chunks, and a skipped string.
+    const Text = struct { s: []const u8 };
+    const hi = [_]u8{ 0xa1, 0x61, 's', 0x62, 'h', 'i' };
+    const text = try zerde.cbor.parseSliceWith(Text, allocator, &hi, .{}, .{ .max_string_len = 2 });
+    allocator.free(text.s);
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith(Text, allocator, &hi, .{}, .{ .max_string_len = 1 }));
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith(zerde.ByteString, allocator, &.{ 0x43, 1, 2, 3 }, .{}, .{ .max_string_len = 2 }));
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith([]const u8, allocator, &.{ 0x7f, 0x62, 'h', 'i', 0x62, 'h', 'i', 0xff }, .{}, .{ .max_string_len = 3 }));
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x61, 'x', 0x43, 1, 2, 3 }, .{}, .{ .max_string_len = 2 }));
+    // A key is a string too.
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x63, 'a', 'b', 'c', 0x00 }, .{}, .{ .max_string_len = 2 }));
+}
+
+test "JSON limits: depth, items and string length" {
+    const Text = struct { s: []const u8 };
+    // Depth: the object and two arrays.
+    const three = "{\"x\":[[0]]}";
+    _ = try zerde.json.parseSliceWith(Probe, allocator, three, .{}, .{ .max_depth = 3 });
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(Probe, allocator, three, .{}, .{ .max_depth = 2 }));
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith([]const []const u16, allocator, "[[]]", .{}, .{ .max_depth = 1 }));
+
+    // Items: the object, two keys and two values are five.
+    const pairs = "{\"x\":0,\"y\":0}";
+    _ = try zerde.json.parseSliceWith(Probe, allocator, pairs, .{}, .{ .max_items = 5 });
+    try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith(Probe, allocator, pairs, .{}, .{ .max_items = 4 }));
+    // A skipped number, string and literal each count.
+    try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith(Probe, allocator, "{\"x\":[1,\"a\",null,true,false]}", .{}, .{ .max_items = 6 }));
+    try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith([]const u16, allocator, "[1,2,3]", .{}, .{ .max_items = 3 }));
+    const three_items = try zerde.json.parseSliceWith([]const u16, allocator, "[1,2,3]", .{}, .{ .max_items = 4 });
+    allocator.free(three_items);
+
+    // String length counts decoded bytes: "\u00e9" is two bytes, and an escape is one.
+    const fits = try zerde.json.parseSliceWith(Text, allocator, "{\"s\":\"h\\u00e9\"}", .{}, .{ .max_string_len = 3 });
+    allocator.free(fits.s);
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceWith(Text, allocator, "{\"s\":\"h\\u00e9\"}", .{}, .{ .max_string_len = 2 }));
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceWith(Text, allocator, "{\"s\":\"abc\"}", .{}, .{ .max_string_len = 2 }));
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceWith(Probe, allocator, "{\"x\":\"abc\"}", .{}, .{ .max_string_len = 2 }));
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceWith(Probe, allocator, "{\"abc\":1}", .{}, .{ .max_string_len = 2 }));
+}
+
+test "strict checks the order of the keys of a union, and the items limit counts keys exactly" {
+    try expectStrict(Op, error.NonDeterministicEncoding, &.{ 0xa2, 0x02, 0x07, 0x01, 0x00 });
+    try expectStrict(Shape, error.NonDeterministicEncoding, &.{ 0xa2, 0x66, 'c', 'i', 'r', 'c', 'l', 'e', 0x01, 0x65, 'l', 'a', 'b', 'e', 'l', 0x61, 'x' });
+    // Not strict, the second entry is a length mismatch whatever its order.
+    try expectCborError(Op, error.LengthMismatch, &.{ 0xa2, 0x02, 0x07, 0x01, 0x00 });
+    // A double that is infinity or NaN is not preferred; a half is.
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xfb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0 });
+    try expectStrict(f64, error.NonDeterministicEncoding, &.{ 0xfb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0 });
+    // An array key is one item and its elements: a map, [1], 0 is four items, however it is reached.
+    _ = try zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x81, 0x01, 0x00 }, .{}, .{ .max_items = 4 });
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x81, 0x01, 0x00 }, .{}, .{ .max_items = 3 }));
+    _ = try zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x61, 'x', 0xa1, 0x81, 0x01, 0x00 }, .{}, .{ .max_items = 6 });
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x61, 'x', 0xa1, 0x81, 0x01, 0x00 }, .{}, .{ .max_items = 5 }));
+    // Every JSON value kind counts once: an object, a key, an array and one element is four.
+    inline for (.{ "1", "\"a\"", "null", "true", "false", "[]", "{}" }) |element| {
+        const text = "{\"x\":[" ++ element ++ "]}";
+        _ = try zerde.json.parseSliceWith(Probe, allocator, text, .{}, .{ .max_items = 4 });
+        try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith(Probe, allocator, text, .{}, .{ .max_items = 3 }));
+    }
+}
+
+test "strict checks the order of text keys in a union that also has integer keys" {
+    const Wide = union(enum) {
+        a: u8,
+        c: u8,
+        n: u8,
+        pub const serde = .{ .fields = .{ .n = .{ .key = 5 } } };
+    };
+    try expectStrict(Wide, error.NonDeterministicEncoding, &.{ 0xa2, 0x61, 'c', 0x01, 0x61, 'a', 0x01 });
+    try expectStrict(Wide, error.NonDeterministicEncoding, &.{ 0xa2, 0x61, 'a', 0x01, 0x05, 0x01 });
+    _ = try zerde.cbor.parseSliceWith(Wide, allocator, &.{ 0xa1, 0x61, 'c', 0x01 }, .{}, strict);
+}

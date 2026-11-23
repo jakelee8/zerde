@@ -30,6 +30,12 @@ pub const ReadConfig = struct {
     borrow_strings: bool = false,
     /// Must match the writer's `bytes`; a base64 field that does not decode is `error.InvalidBytes`.
     bytes: BytesEncoding = .string,
+    /// Most containers open at once, at most 128 (`error.JsonNestingTooDeep`).
+    max_depth: usize = 128,
+    /// Most values in the whole input, object keys and values each counted (`error.TooManyItems`).
+    max_items: usize = std.math.maxInt(usize),
+    /// Longest string in bytes after its escapes are decoded (`error.StringTooLong`).
+    max_string_len: usize = std.math.maxInt(usize),
 };
 pub const WriteConfig = struct {
     bytes: BytesEncoding = .string,
@@ -240,6 +246,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
         can_borrow_strings: bool,
         stack: [128]Container = undefined,
         stack_len: usize = 0,
+        max_depth: usize = 128,
+        max_items: usize = std.math.maxInt(usize),
+        items: usize = 0,
 
         const Self = @This();
 
@@ -250,7 +259,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return .{
                 .input = input,
                 .cfg = cfg,
-                .parser = .{ .input = input },
+                .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)) },
+                .max_depth = @min(readLimit(cfg, "max_depth", 128), 128),
+                .max_items = readLimit(cfg, "max_items", std.math.maxInt(usize)),
                 .owns_input = false,
                 .can_borrow_strings = effectiveBorrowStrings(cfg),
             };
@@ -260,7 +271,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return .{
                 .input = input,
                 .cfg = cfg,
-                .parser = .{ .input = input },
+                .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)) },
+                .max_depth = @min(readLimit(cfg, "max_depth", 128), 128),
+                .max_items = readLimit(cfg, "max_items", std.math.maxInt(usize)),
                 .owns_input = true,
                 .can_borrow_strings = false,
             };
@@ -316,11 +329,13 @@ pub fn JsonDeserializer(comptime Config: type) type {
         }
 
         pub fn readNull(self: *Self) !void {
+            try self.count();
             self.parser.skipWhitespace();
             try self.parser.consumeLiteral("null");
         }
 
         pub fn readBool(self: *Self) !bool {
+            try self.count();
             self.parser.skipWhitespace();
             return switch (self.parser.peek() orelse return error.UnexpectedEndOfInput) {
                 't' => blk: {
@@ -336,6 +351,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
         }
 
         pub fn readNumber(self: *Self) !Number {
+            try self.count();
             self.parser.skipWhitespace();
             return self.parser.parseNumberToken();
         }
@@ -343,6 +359,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
         /// An integer field takes an integer literal only: `1.0` and `1e2` are floats, so they are a
         /// type error even when their value is whole.
         pub fn readInt(self: *Self, comptime T: type) !T {
+            try self.count();
             self.parser.skipWhitespace();
             const parsed = try self.parser.parseNumberSlice();
             if (parsed.is_float) return error.UnexpectedType;
@@ -365,6 +382,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
         /// A float field takes any number literal. One too large for `T` is `error.FloatOutOfRange`:
         /// `1e999` must not become infinity, which JSON cannot write and a field cannot mean.
         pub fn readFloat(self: *Self, comptime T: type) !T {
+            try self.count();
             self.parser.skipWhitespace();
             const parsed = try self.parser.parseNumberSlice();
 
@@ -376,11 +394,13 @@ pub fn JsonDeserializer(comptime Config: type) type {
         }
 
         pub fn readString(self: *Self, allocator: Allocator) !StringToken {
+            try self.count();
             self.parser.skipWhitespace();
             return self.parser.parseStringToken(allocator);
         }
 
         pub fn beginArray(self: *Self) !void {
+            try self.count();
             self.parser.skipWhitespace();
             if (self.parser.consume() != '[') return error.UnexpectedToken;
             try self.push(.{ .kind = .array, .first = true });
@@ -421,6 +441,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
         }
 
         pub fn beginObject(self: *Self) !void {
+            try self.count();
             self.parser.skipWhitespace();
             if (self.parser.consume() != '{') return error.UnexpectedToken;
             try self.push(.{ .kind = .object, .first = true });
@@ -451,6 +472,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
             }
 
             if (self.parser.peek() != '"') return error.UnexpectedToken;
+            try self.count();
             const key = try self.parser.parseStringToken(allocator);
             errdefer key.deinit(allocator);
 
@@ -464,7 +486,10 @@ pub fn JsonDeserializer(comptime Config: type) type {
                 .null => try self.readNull(),
                 .bool => _ = try self.readBool(),
                 // Skipping checks the grammar and nothing more: a number too large for any type is still JSON.
-                .number => _ = try self.parser.parseNumberSlice(),
+                .number => {
+                    try self.count();
+                    _ = try self.parser.parseNumberSlice();
+                },
                 .bytes => {
                     const token = try self.readString(allocator);
                     token.deinit(allocator);
@@ -489,8 +514,14 @@ pub fn JsonDeserializer(comptime Config: type) type {
             }
         }
 
+        /// Counts one value against `max_items`.
+        fn count(self: *Self) !void {
+            self.items += 1;
+            if (self.items > self.max_items) return error.TooManyItems;
+        }
+
         fn push(self: *Self, container: Container) !void {
-            if (self.stack_len == self.stack.len) return error.JsonNestingTooDeep;
+            if (self.stack_len >= self.max_depth) return error.JsonNestingTooDeep;
             self.stack[self.stack_len] = container;
             self.stack_len += 1;
         }
@@ -597,6 +628,11 @@ fn parseFiniteFloat(comptime T: type, slice: []const u8) error{ InvalidNumber, F
     return value;
 }
 
+fn readLimit(cfg: anytype, comptime name: []const u8, default: usize) usize {
+    if (comptime meta.hasField(@TypeOf(cfg), name)) return @field(cfg, name);
+    return default;
+}
+
 fn effectiveBorrowStrings(cfg: anytype) bool {
     if (comptime meta.hasField(@TypeOf(cfg), "borrow_strings")) return cfg.borrow_strings;
     return false;
@@ -605,6 +641,7 @@ fn effectiveBorrowStrings(cfg: anytype) bool {
 const Parser = struct {
     input: []const u8,
     index: usize = 0,
+    max_string_len: usize = std.math.maxInt(usize),
 
     const NumberSlice = struct {
         slice: []const u8,
@@ -622,6 +659,7 @@ const Parser = struct {
         InvalidStringCharacter,
         InvalidUtf8,
         FloatOutOfRange,
+        StringTooLong,
     };
 
     // Shared token parser for both direct typed reads and recursive skipping.
@@ -695,6 +733,15 @@ const Parser = struct {
 
     // Plain strings borrow from the input; escaped strings allocate rewritten bytes.
     fn parseStringToken(self: *Parser, allocator: Allocator) Error!StringToken {
+        const token = try self.parseStringTokenUnbounded(allocator);
+        if (token.bytes.len > self.max_string_len) {
+            token.deinit(allocator);
+            return error.StringTooLong;
+        }
+        return token;
+    }
+
+    fn parseStringTokenUnbounded(self: *Parser, allocator: Allocator) Error!StringToken {
         if (self.consume() != '"') return error.UnexpectedToken;
 
         const start = self.index;

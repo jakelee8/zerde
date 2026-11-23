@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added CBOR `ReadConfig.mode` (`.lenient`, `.strict`): strict accepts only RFC 8949 §4.2.1/§4.2.2 deterministic encoding (`error.NonDeterministicEncoding`, tags refused); added `max_depth`, `max_items` and `max_string_len` limits to the CBOR and JSON readers (`error.TooManyItems`, `error.StringTooLong`)
 - added integer union variant keys (`.fields = .{ .v = .{ .key = N } }` on a union; CBOR) and `enum_repr = .integer`, which writes an enum as its number and reads only a number
 - added CBOR `ReadConfig.refuse_non_finite`: NaN and infinity anywhere in the input are `error.NonFiniteFloat`
 - added `field_order` to the typed-layer config (`.declaration`, `.length_first`, `.bytewise`, `.encoded_key`), settable per call or per type; `.length_first` and `.bytewise` are for text keys, `.encoded_key` is the bytewise order of the encoded keys
