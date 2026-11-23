@@ -2642,3 +2642,70 @@ test "a writer refuses text that is not UTF-8 in either format, so its output re
     try zerde.serializeWith(zerde.cbor, &out.writer, Text{ .s = "h\xc3\xa9 \xe2\x82\xac" }, .{}, .{});
     try zerde.serializeWith(zerde.json, &out.writer, Text{ .s = "h\xc3\xa9 \xe2\x82\xac" }, .{}, .{});
 }
+
+// ---- every entry point applies the whole read configuration ------------------------------------------------------
+
+const OneA = struct { a: u8 };
+
+test "every CBOR entry point applies mode, limits and refuse_non_finite" {
+    // An indefinite map: lenient reads it, strict_mode refuses it.
+    const loose = [_]u8{ 0xbf, 0x61, 'a', 0x01, 0xff };
+    const strict_mode = .{ .mode = .strict };
+    const E = error.NonDeterministicEncoding;
+    try std.testing.expectError(E, zerde.cbor.parseSliceWith(OneA, allocator, &loose, .{}, strict_mode));
+    try std.testing.expectError(E, zerde.cbor.parseSliceAliasedWith(OneA, allocator, &loose, .{}, strict_mode));
+    var reader: std.Io.Reader = .fixed(&loose);
+    try std.testing.expectError(E, zerde.cbor.deserializeWith(OneA, allocator, &reader, .{}, strict_mode));
+    try std.testing.expectError(E, zerde.parseSliceWith(zerde.cbor, OneA, allocator, &loose, .{}, strict_mode));
+    try std.testing.expectError(E, zerde.parseSliceAliasedWith(zerde.cbor, OneA, allocator, &loose, .{}, strict_mode));
+    try std.testing.expectError(E, zerde.parseSliceOwnedWith(zerde.cbor, OneA, allocator, &loose, .{}, strict_mode));
+    var again: std.Io.Reader = .fixed(&loose);
+    try std.testing.expectError(E, zerde.deserializeWith(zerde.cbor, OneA, allocator, &again, .{}, strict_mode));
+    var third: std.Io.Reader = .fixed(&loose);
+    try std.testing.expectError(E, zerde.deserializeOwnedWith(zerde.cbor, OneA, allocator, &third, .{}, strict_mode));
+    var diagnostic: zerde.Diagnostic = .{};
+    try std.testing.expectError(E, zerde.parseSliceWithDiagnostics(zerde.cbor, OneA, allocator, &loose, &diagnostic, .{}, strict_mode));
+    try std.testing.expectError(E, zerde.value.parseSliceWith(zerde.cbor, allocator, &loose, strict_mode));
+    var fourth: std.Io.Reader = .fixed(&loose);
+    try std.testing.expectError(E, zerde.value.deserializeWith(zerde.cbor, allocator, &fourth, strict_mode));
+    var pull = try zerde.cbor.pullReader(allocator, &loose, strict_mode);
+    defer pull.deinit();
+    try std.testing.expectError(E, pull.next());
+    // Lenient still reads it, aliased or not.
+    try std.testing.expectEqual(@as(u8, 1), (try zerde.cbor.parseSliceAliasedWith(OneA, allocator, &loose, .{}, .{})).a);
+
+    // A limit and a refused NaN apply to the aliased read as to the owned one.
+    const nan = [_]u8{ 0xa1, 0x61, 'a', 0xf9, 0x7e, 0x00 };
+    try std.testing.expectError(error.NonFiniteFloat, zerde.cbor.parseSliceAliasedWith(struct { a: f64 }, allocator, &nan, .{}, .{ .refuse_non_finite = true }));
+    const text = [_]u8{ 0xa1, 0x61, 'a', 0x63, 'x', 'y', 'z' };
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceAliasedWith(struct { a: []const u8 }, allocator, &text, .{}, .{ .max_string_len = 2 }));
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceAliasedWith(OneA, allocator, &.{ 0xa1, 0x61, 'a', 0x01 }, .{}, .{ .max_items = 1 }));
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceAliasedWith(struct { a: zerde.cbor.Raw }, allocator, &.{ 0xa1, 0x61, 'a', 0x81, 0x01 }, .{}, .{ .max_depth = 1 }));
+}
+
+test "every JSON entry point applies the limits" {
+    const input = "{\"a\":1}";
+    const limits = .{ .max_items = 1 };
+    const E = error.TooManyItems;
+    try std.testing.expectError(E, zerde.json.parseSliceWith(OneA, allocator, input, .{}, limits));
+    try std.testing.expectError(E, zerde.json.parseSliceAliasedWith(OneA, allocator, input, .{}, limits));
+    var reader: std.Io.Reader = .fixed(input);
+    try std.testing.expectError(E, zerde.json.deserializeWith(OneA, allocator, &reader, .{}, limits));
+    try std.testing.expectError(E, zerde.parseSliceWith(zerde.json, OneA, allocator, input, .{}, limits));
+    try std.testing.expectError(E, zerde.parseSliceAliasedWith(zerde.json, OneA, allocator, input, .{}, limits));
+    try std.testing.expectError(E, zerde.parseSliceOwnedWith(zerde.json, OneA, allocator, input, .{}, limits));
+    try std.testing.expectError(E, zerde.value.parseSliceWith(zerde.json, allocator, input, limits));
+    var pull = try zerde.json.pullReader(allocator, input, limits);
+    defer pull.deinit();
+    var failed = false;
+    while (pull.next() catch |err| blk: {
+        try std.testing.expectEqual(E, err);
+        failed = true;
+        break :blk null;
+    }) |_| {}
+    try std.testing.expect(failed);
+    // Depth and string length reach the aliased read too.
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceAliasedWith(struct { a: zerde.json.Raw }, allocator, "{\"a\":[1]}", .{}, .{ .max_depth = 1 }));
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceAliasedWith(struct { a: []const u8 }, allocator, "{\"a\":\"xyz\"}", .{}, .{ .max_string_len = 2 }));
+    try std.testing.expectEqual(@as(u8, 1), (try zerde.json.parseSliceAliasedWith(OneA, allocator, input, .{}, .{})).a);
+}

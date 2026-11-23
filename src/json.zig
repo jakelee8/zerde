@@ -342,7 +342,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
                 .input = input,
                 .cfg = cfg,
                 .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)) },
-                .max_depth = @min(readLimit(cfg, "max_depth", 128), 128),
+                .max_depth = readLimit(cfg, "max_depth", 128),
                 .max_items = readLimit(cfg, "max_items", std.math.maxInt(usize)),
                 .owns_input = true,
                 .can_borrow_strings = false,
@@ -1208,11 +1208,10 @@ pub fn parseSliceAliasedWith(
     comptime serde_cfg: anytype,
     comptime read_cfg: anytype,
 ) ParseError!T {
-    var deserializer = try sliceDeserializer(allocator, input, .{
-        .max_input_bytes = effectiveMaxInputBytes(read_cfg),
-        .borrow_strings = true,
-    });
+    var deserializer = try sliceDeserializer(allocator, input, read_cfg);
     defer deserializer.deinit(allocator);
+    // The caller's whole configuration applies; only the aliasing is added.
+    deserializer.can_borrow_strings = true;
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;

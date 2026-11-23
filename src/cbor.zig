@@ -1753,11 +1753,10 @@ pub fn parseSliceAliasedWith(
     comptime serde_cfg: anytype,
     comptime read_cfg: anytype,
 ) ParseError!T {
-    var deserializer = try sliceDeserializer(allocator, input, .{
-        .max_input_bytes = effectiveMaxInputBytes(read_cfg),
-        .borrow_strings = true,
-    });
+    var deserializer = try sliceDeserializer(allocator, input, read_cfg);
     defer deserializer.deinit(allocator);
+    // The caller's whole configuration applies; only the aliasing is added.
+    deserializer.can_borrow_strings = true;
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
