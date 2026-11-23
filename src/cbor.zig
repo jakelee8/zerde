@@ -1372,6 +1372,218 @@ pub fn PullReader(comptime Config: type) type {
     };
 }
 
+/// A writer for a value whose shape is only known while writing: the caller says what comes next,
+/// and containers are closed with `endArray` and `endMap`. Arrays and maps are buffered until they
+/// close, so their lengths are definite. With `deterministic` a map is sorted by the encoded bytes of
+/// its keys (RFC 8949 §4.2.1; a repeated key is `error.DuplicateField`) and a float is written in its
+/// shortest exact width; without it entries keep the order they were written in and a float is a
+/// double. A map's items are keys and values alternately, and a key can be any item.
+pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
+    return ValueWriter.init(allocator, writer, effectiveDeterministic(cfg));
+}
+
+// The writer's methods share these names, so the file-level writers get others.
+const encodeInt = writeInt;
+const encodeFloat = writeFloat;
+
+pub const ValueWriter = struct {
+    allocator: Allocator,
+    out: *std.Io.Writer,
+    deterministic: bool,
+    frames: [max_nesting]Frame = undefined,
+    depth: usize = 0,
+
+    const Frame = struct {
+        kind: ContainerKind,
+        buf: std.Io.Writer.Allocating,
+        /// Items in an array, entries in a map.
+        count: usize = 0,
+        entries: std.ArrayList(Entry) = .empty,
+        key_start: usize = 0,
+        key_end: usize = 0,
+        expect_key: bool = true,
+    };
+
+    /// One map entry in its frame's buffer: the key, then its value.
+    const Entry = struct { key_start: usize, key_end: usize, end: usize };
+
+    fn init(allocator: Allocator, writer: *std.Io.Writer, deterministic: bool) ValueWriter {
+        return .{ .allocator = allocator, .out = writer, .deterministic = deterministic };
+    }
+
+    /// Releases the buffers of containers still open.
+    pub fn deinit(self: *ValueWriter) void {
+        for (self.frames[0..self.depth]) |*frame| {
+            frame.buf.deinit();
+            frame.entries.deinit(self.allocator);
+        }
+        self.depth = 0;
+    }
+
+    /// After the last item: every container is closed.
+    pub fn finish(self: *ValueWriter) !void {
+        if (self.depth != 0) return error.UnbalancedContainers;
+    }
+
+    pub fn writeNull(self: *ValueWriter) !void {
+        try self.beforeItem();
+        try self.sink().writeByte(0xf6);
+        try self.afterItem();
+    }
+
+    pub fn writeBool(self: *ValueWriter, value: bool) !void {
+        try self.beforeItem();
+        try self.sink().writeByte(if (value) 0xf5 else 0xf4);
+        try self.afterItem();
+    }
+
+    pub fn writeInt(self: *ValueWriter, value: i128) !void {
+        try self.beforeItem();
+        try encodeInt(self.sink(), value);
+        try self.afterItem();
+    }
+
+    pub fn writeFloat(self: *ValueWriter, value: f64) !void {
+        try self.beforeItem();
+        if (self.deterministic) try writePreferredFloat(self.sink(), value) else try encodeFloat(self.sink(), value);
+        try self.afterItem();
+    }
+
+    pub fn writeText(self: *ValueWriter, value: []const u8) !void {
+        try self.beforeItem();
+        try writeTextString(self.sink(), value);
+        try self.afterItem();
+    }
+
+    pub fn writeBytes(self: *ValueWriter, value: []const u8) !void {
+        try self.beforeItem();
+        const out = self.sink();
+        try writeMajorValue(out, 2, value.len);
+        try out.writeAll(value);
+        try self.afterItem();
+    }
+
+    /// Writes an item that is already CBOR, unchanged: a `zerde.Raw` that was read, say.
+    pub fn writeRaw(self: *ValueWriter, bytes: []const u8) !void {
+        try self.beforeItem();
+        try self.sink().writeAll(bytes);
+        try self.afterItem();
+    }
+
+    pub fn beginArray(self: *ValueWriter) !void {
+        try self.begin(.array);
+    }
+
+    pub fn endArray(self: *ValueWriter) !void {
+        const frame = try self.closing(.array);
+        const out = self.parentSink();
+        try writeMajorValue(out, 4, frame.count);
+        try out.writeAll(frame.buf.written());
+        self.release(frame);
+        try self.afterItem();
+    }
+
+    pub fn beginMap(self: *ValueWriter) !void {
+        try self.begin(.object);
+    }
+
+    pub fn endMap(self: *ValueWriter) !void {
+        const frame = try self.closing(.object);
+        if (!frame.expect_key) return error.UnbalancedContainers;
+        const out = self.parentSink();
+        const body = frame.buf.written();
+        try writeMajorValue(out, 5, frame.count);
+        if (!self.deterministic) {
+            try out.writeAll(body);
+        } else {
+            const Order = struct {
+                body: []const u8,
+                fn less(ctx: @This(), a: Entry, b: Entry) bool {
+                    return std.mem.lessThan(u8, ctx.body[a.key_start..a.key_end], ctx.body[b.key_start..b.key_end]);
+                }
+            };
+            const entries = frame.entries.items;
+            std.sort.pdq(Entry, entries, Order{ .body = body }, Order.less);
+            for (entries[@min(1, entries.len)..], 0..) |entry, previous| {
+                if (std.mem.eql(u8, body[entries[previous].key_start..entries[previous].key_end], body[entry.key_start..entry.key_end])) return error.DuplicateField;
+            }
+            for (entries) |entry| try out.writeAll(body[entry.key_start..entry.end]);
+        }
+        self.release(frame);
+        try self.afterItem();
+    }
+
+    /// Writes one event of a pull read, so a reader can be copied into a writer.
+    pub fn writeEvent(self: *ValueWriter, event: typed.Event) !void {
+        switch (event) {
+            .null => try self.writeNull(),
+            .bool => |value| try self.writeBool(value),
+            .integer => |value| try self.writeInt(value),
+            .float => |value| try self.writeFloat(value),
+            .text => |value| try self.writeText(value),
+            .bytes => |value| try self.writeBytes(value),
+            .array_begin => try self.beginArray(),
+            .array_end => try self.endArray(),
+            .map_begin => try self.beginMap(),
+            .map_end => try self.endMap(),
+        }
+    }
+
+    fn sink(self: *ValueWriter) *std.Io.Writer {
+        if (self.depth == 0) return self.out;
+        return &self.frames[self.depth - 1].buf.writer;
+    }
+
+    fn parentSink(self: *ValueWriter) *std.Io.Writer {
+        if (self.depth <= 1) return self.out;
+        return &self.frames[self.depth - 2].buf.writer;
+    }
+
+    /// Notes where a map key starts, before any item is written.
+    fn beforeItem(self: *ValueWriter) !void {
+        if (self.depth == 0) return;
+        const frame = &self.frames[self.depth - 1];
+        if (frame.kind == .object and frame.expect_key) frame.key_start = frame.buf.written().len;
+    }
+
+    /// Counts a finished item in the container around it, and closes a map entry.
+    fn afterItem(self: *ValueWriter) !void {
+        if (self.depth == 0) return;
+        const frame = &self.frames[self.depth - 1];
+        const at = frame.buf.written().len;
+        switch (frame.kind) {
+            .array => frame.count += 1,
+            .object => if (frame.expect_key) {
+                frame.key_end = at;
+                frame.expect_key = false;
+            } else {
+                try frame.entries.append(self.allocator, .{ .key_start = frame.key_start, .key_end = frame.key_end, .end = at });
+                frame.count += 1;
+                frame.expect_key = true;
+            },
+        }
+    }
+
+    fn begin(self: *ValueWriter, kind: ContainerKind) !void {
+        try self.beforeItem();
+        if (self.depth >= max_nesting) return error.CborNestingTooDeep;
+        self.frames[self.depth] = .{ .kind = kind, .buf = .init(self.allocator) };
+        self.depth += 1;
+    }
+
+    /// The innermost container, which must be of `kind`; the caller releases it after use.
+    fn closing(self: *ValueWriter, kind: ContainerKind) !*Frame {
+        if (self.depth == 0 or self.frames[self.depth - 1].kind != kind) return error.UnbalancedContainers;
+        return &self.frames[self.depth - 1];
+    }
+
+    fn release(self: *ValueWriter, frame: *Frame) void {
+        frame.buf.deinit();
+        frame.entries.deinit(self.allocator);
+        self.depth -= 1;
+    }
+};
+
 pub fn serialize(writer: *std.Io.Writer, value: anytype) !void {
     try serializeWith(writer, value, .{}, .{});
 }

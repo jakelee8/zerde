@@ -344,6 +344,20 @@ takes the same configuration: the mode, the limits, no repeated key in a CBOR ma
 key must be a scalar. Text and byte strings borrow the input (which must outlive the reader) unless they
 were in chunks or escaped, and are valid until the next call.
 
+### Value writer
+
+`cbor.valueWriter(allocator, writer, cfg)` and `json.valueWriter(...)` write a value whose shape is only
+known while writing: call `writeNull`, `writeBool`, `writeInt`, `writeFloat`, `writeText`, `writeBytes`
+or `writeRaw` for an item, `beginArray`/`endArray` and `beginMap`/`endMap` around a container, and
+`finish()` at the end; `writeEvent` takes a `zerde.Event`, so a pull reader can be copied into a writer.
+A map's items are keys and values alternately. Maps are sorted when they close: CBOR with
+`.deterministic = true` orders keys by their encoded bytes (RFC 8949 §4.2.1, any item can be a key) and
+writes each float in its shortest exact width, and JSON orders text keys shorter first and then bytewise
+(the same order; `.sort_keys = false` keeps insertion order). A repeated key is `error.DuplicateField`;
+an unbalanced container is `error.UnbalancedContainers`. CBOR arrays and maps are buffered so their
+lengths are definite; JSON arrays are written as they come. JSON bytes follow the config's `bytes`
+encoding, and a NaN or infinity is refused.
+
 ### Raw items
 
 A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked

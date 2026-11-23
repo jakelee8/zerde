@@ -39,6 +39,8 @@ pub const ReadConfig = struct {
 };
 pub const WriteConfig = struct {
     bytes: BytesEncoding = .string,
+    /// For `valueWriter`: sort each map's keys as deterministic CBOR does (shorter first, then bytewise).
+    sort_keys: bool = true,
 };
 
 fn bytesEncoding(comptime Config: type, cfg: Config) BytesEncoding {
@@ -183,23 +185,7 @@ pub fn JsonSerializer(comptime Config: type) type {
         }
 
         pub fn emitBytes(self: *Self, value: []const u8) !void {
-            switch (bytesEncoding(Config, self.cfg)) {
-                .string => {
-                    // The raw-string encoding is exact only for UTF-8; any other bytes would write invalid JSON.
-                    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
-                    try writeEscapedString(self.writer, value);
-                },
-                .base64 => {
-                    try self.writer.writeByte('"');
-                    try std.base64.standard.Encoder.encodeWriter(self.writer, value);
-                    try self.writer.writeByte('"');
-                },
-                .base64url => {
-                    try self.writer.writeByte('"');
-                    try std.base64.url_safe_no_pad.Encoder.encodeWriter(self.writer, value);
-                    try self.writer.writeByte('"');
-                },
-            }
+            try writeBytesText(self.writer, bytesEncoding(Config, self.cfg), value);
         }
 
         pub fn beginStruct(self: *Self, comptime T: type) !void {
@@ -770,6 +756,233 @@ pub fn PullReader(comptime Config: type) type {
     };
 }
 
+/// A writer for a value whose shape is only known while writing; see `cbor.ValueWriter`. A map's
+/// keys are text, and the map is buffered until it closes so its members can be sorted: with
+/// `sort_keys` (the default) shorter keys come first and equal lengths bytewise, which is the order of
+/// deterministic CBOR keys, and a repeated key is `error.DuplicateField`. Arrays are written as they
+/// come. Bytes are written in the config's `bytes` encoding, and a NaN or infinity is refused.
+pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
+    return ValueWriter.init(allocator, writer, readLimitFlag(cfg, "sort_keys", true), bytesEncoding(@TypeOf(cfg), cfg));
+}
+
+pub const ValueWriter = struct {
+    allocator: Allocator,
+    out: *std.Io.Writer,
+    sort_keys: bool,
+    encoding: BytesEncoding,
+    frames: [128]Frame = undefined,
+    depth: usize = 0,
+
+    const Frame = struct {
+        kind: ContainerKind,
+        /// Only a map owns a buffer; an array writes to the map around it, or to the output.
+        buf: std.Io.Writer.Allocating,
+        first: bool = true,
+        entries: std.ArrayList(Entry) = .empty,
+        /// The key text of every entry, back to back.
+        keys: std.ArrayList(u8) = .empty,
+        expect_key: bool = true,
+        entry_start: usize = 0,
+        key_start: usize = 0,
+        key_len: usize = 0,
+    };
+
+    /// A map entry: its key text in `keys`, and its `"key":value` text in the buffer.
+    const Entry = struct { key_start: usize, key_len: usize, start: usize, end: usize };
+
+    fn init(allocator: Allocator, writer: *std.Io.Writer, sort_keys: bool, encoding: BytesEncoding) ValueWriter {
+        return .{ .allocator = allocator, .out = writer, .sort_keys = sort_keys, .encoding = encoding };
+    }
+
+    /// Releases the buffers of containers still open.
+    pub fn deinit(self: *ValueWriter) void {
+        for (self.frames[0..self.depth]) |*frame| self.release(frame);
+        self.depth = 0;
+    }
+
+    /// After the last value: every container is closed.
+    pub fn finish(self: *ValueWriter) !void {
+        if (self.depth != 0) return error.UnbalancedContainers;
+    }
+
+    pub fn writeNull(self: *ValueWriter) !void {
+        try self.beforeValue();
+        try self.sink().writeAll("null");
+        try self.afterValue();
+    }
+
+    pub fn writeBool(self: *ValueWriter, value: bool) !void {
+        try self.beforeValue();
+        try self.sink().writeAll(if (value) "true" else "false");
+        try self.afterValue();
+    }
+
+    pub fn writeInt(self: *ValueWriter, value: i128) !void {
+        try self.beforeValue();
+        try self.sink().print("{}", .{value});
+        try self.afterValue();
+    }
+
+    pub fn writeFloat(self: *ValueWriter, value: f64) !void {
+        if (!std.math.isFinite(value)) return error.NonFiniteFloat;
+        try self.beforeValue();
+        try self.sink().print("{}", .{value});
+        try self.afterValue();
+    }
+
+    /// In a map's key position, this is the key.
+    pub fn writeText(self: *ValueWriter, value: []const u8) !void {
+        if (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.kind == .object and frame.expect_key) {
+                const out = &frame.buf.writer;
+                frame.entry_start = frame.buf.written().len;
+                try writeEscapedString(out, value);
+                try out.writeByte(':');
+                frame.key_start = frame.keys.items.len;
+                frame.key_len = value.len;
+                try frame.keys.appendSlice(self.allocator, value);
+                frame.expect_key = false;
+                return;
+            }
+        }
+        try self.beforeValue();
+        try writeEscapedString(self.sink(), value);
+        try self.afterValue();
+    }
+
+    pub fn writeBytes(self: *ValueWriter, value: []const u8) !void {
+        try self.beforeValue();
+        try writeBytesText(self.sink(), self.encoding, value);
+        try self.afterValue();
+    }
+
+    /// Writes JSON text that is already valid, unchanged: a `zerde.Raw` that was read, say.
+    pub fn writeRaw(self: *ValueWriter, text: []const u8) !void {
+        try self.beforeValue();
+        try self.sink().writeAll(text);
+        try self.afterValue();
+    }
+
+    pub fn beginArray(self: *ValueWriter) !void {
+        try self.beforeValue();
+        try self.push(.array);
+        try self.sink().writeByte('[');
+    }
+
+    pub fn endArray(self: *ValueWriter) !void {
+        if (self.depth == 0 or self.frames[self.depth - 1].kind != .array) return error.UnbalancedContainers;
+        try self.sink().writeByte(']');
+        self.depth -= 1;
+        try self.afterValue();
+    }
+
+    pub fn beginMap(self: *ValueWriter) !void {
+        try self.beforeValue();
+        try self.push(.object);
+    }
+
+    pub fn endMap(self: *ValueWriter) !void {
+        if (self.depth == 0 or self.frames[self.depth - 1].kind != .object) return error.UnbalancedContainers;
+        const frame = &self.frames[self.depth - 1];
+        if (!frame.expect_key) return error.UnbalancedContainers;
+        const body = frame.buf.written();
+        const keys = frame.keys.items;
+        const entries = frame.entries.items;
+        if (self.sort_keys) {
+            const Order = struct {
+                keys: []const u8,
+                fn less(ctx: @This(), a: Entry, b: Entry) bool {
+                    const x = ctx.keys[a.key_start..][0..a.key_len];
+                    const y = ctx.keys[b.key_start..][0..b.key_len];
+                    if (x.len != y.len) return x.len < y.len;
+                    return std.mem.lessThan(u8, x, y);
+                }
+            };
+            std.sort.pdq(Entry, entries, Order{ .keys = keys }, Order.less);
+            for (entries[@min(1, entries.len)..], 0..) |entry, previous| {
+                const before = entries[previous];
+                if (std.mem.eql(u8, keys[before.key_start..][0..before.key_len], keys[entry.key_start..][0..entry.key_len])) return error.DuplicateField;
+            }
+        }
+        const out = self.sinkAt(self.depth - 1);
+        try out.writeByte('{');
+        for (entries, 0..) |entry, index| {
+            if (index != 0) try out.writeByte(',');
+            try out.writeAll(body[entry.start..entry.end]);
+        }
+        try out.writeByte('}');
+        self.release(frame);
+        self.depth -= 1;
+        try self.afterValue();
+    }
+
+    /// Writes one event of a pull read, so a reader can be copied into a writer.
+    pub fn writeEvent(self: *ValueWriter, event: typed.Event) !void {
+        switch (event) {
+            .null => try self.writeNull(),
+            .bool => |value| try self.writeBool(value),
+            .integer => |value| try self.writeInt(value),
+            .float => |value| try self.writeFloat(value),
+            .text => |value| try self.writeText(value),
+            .bytes => |value| try self.writeBytes(value),
+            .array_begin => try self.beginArray(),
+            .array_end => try self.endArray(),
+            .map_begin => try self.beginMap(),
+            .map_end => try self.endMap(),
+        }
+    }
+
+    /// Where the text of the innermost open container goes: its own buffer if it is a map, else
+    /// the buffer of the nearest map around it, else the output.
+    fn sink(self: *ValueWriter) *std.Io.Writer {
+        return self.sinkAt(self.depth);
+    }
+
+    fn sinkAt(self: *ValueWriter, depth: usize) *std.Io.Writer {
+        var level = depth;
+        while (level > 0) : (level -= 1) {
+            if (self.frames[level - 1].kind == .object) return &self.frames[level - 1].buf.writer;
+        }
+        return self.out;
+    }
+
+    /// Separates an array element from the one before it, and refuses a value where a key is due.
+    fn beforeValue(self: *ValueWriter) !void {
+        if (self.depth == 0) return;
+        const frame = &self.frames[self.depth - 1];
+        switch (frame.kind) {
+            .array => {
+                if (!frame.first) try self.sink().writeByte(',');
+                frame.first = false;
+            },
+            .object => if (frame.expect_key) return error.UnexpectedType,
+        }
+    }
+
+    /// Closes the entry of a map whose value was just written.
+    fn afterValue(self: *ValueWriter) !void {
+        if (self.depth == 0) return;
+        const frame = &self.frames[self.depth - 1];
+        if (frame.kind != .object) return;
+        try frame.entries.append(self.allocator, .{ .key_start = frame.key_start, .key_len = frame.key_len, .start = frame.entry_start, .end = frame.buf.written().len });
+        frame.expect_key = true;
+    }
+
+    fn push(self: *ValueWriter, kind: ContainerKind) !void {
+        if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;
+        self.frames[self.depth] = .{ .kind = kind, .buf = if (kind == .object) .init(self.allocator) else undefined };
+        self.depth += 1;
+    }
+
+    fn release(self: *ValueWriter, frame: *Frame) void {
+        if (frame.kind != .object) return;
+        frame.buf.deinit();
+        frame.entries.deinit(self.allocator);
+        frame.keys.deinit(self.allocator);
+    }
+};
+
 pub fn serialize(writer: *std.Io.Writer, value: anytype) !void {
     try serializeWith(writer, value, .{}, .{});
 }
@@ -843,6 +1056,32 @@ pub fn parseSliceAliasedWith(
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
+}
+
+/// Writes bytes as a JSON string in `encoding`. The raw-string encoding is exact only for UTF-8, so
+/// any other bytes would write invalid JSON and are refused.
+fn writeBytesText(writer: *std.Io.Writer, encoding: BytesEncoding, value: []const u8) !void {
+    switch (encoding) {
+        .string => {
+            if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+            try writeEscapedString(writer, value);
+        },
+        .base64 => {
+            try writer.writeByte('"');
+            try std.base64.standard.Encoder.encodeWriter(writer, value);
+            try writer.writeByte('"');
+        },
+        .base64url => {
+            try writer.writeByte('"');
+            try std.base64.url_safe_no_pad.Encoder.encodeWriter(writer, value);
+            try writer.writeByte('"');
+        },
+    }
+}
+
+fn readLimitFlag(cfg: anytype, comptime name: []const u8, default: bool) bool {
+    if (comptime meta.hasField(@TypeOf(cfg), name)) return @field(cfg, name);
+    return default;
 }
 
 pub fn writeEscapedString(writer: *std.Io.Writer, bytes: []const u8) !void {

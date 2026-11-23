@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added `cbor.valueWriter` and `json.valueWriter`: a writer for runtime-defined values with `writeEvent`, definite CBOR lengths, maps sorted on close (CBOR with `deterministic`: encoded-key order and shortest floats; JSON: length-first `sort_keys`) and `error.DuplicateField` for a repeated key
 - added `cbor.pullReader` and `json.pullReader`: an event reader (`zerde.Event`) over one item, with `skip`, the mode and limits of a typed read, and the duplicate-key check
 - added `serde.extras` (CBOR and JSON): a `zerde.Raw` or `?zerde.Raw` field collects the unknown text-keyed members as one map, merged back in key order on write; an entry that repeats a declared member is `error.DuplicateField`
 - `json.sliceDeserializer` now allocates while collecting extras, so a caller that uses it directly must call `deinit` on the result (as for `cbor.sliceDeserializer`); `parseSlice*` already does

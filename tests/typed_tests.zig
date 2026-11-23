@@ -1813,3 +1813,299 @@ test "a pull reader releases each joined string before the next, and finish need
     _ = try json.next();
     try std.testing.expectError(error.UnexpectedEndOfInput, json.finish());
 }
+
+// ---- value writer -----------------------------------------------------------------------------------------------
+
+fn valueBytes(comptime Format: type, comptime cfg: anytype, build: *const fn (w: *Format.ValueWriter) anyerror!void) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var w = Format.valueWriter(allocator, &out.writer, cfg);
+    defer w.deinit();
+    try build(&w);
+    try w.finish();
+    return out.toOwnedSlice();
+}
+
+fn buildMixed(comptime Format: type) *const fn (w: *Format.ValueWriter) anyerror!void {
+    return struct {
+        fn run(w: *Format.ValueWriter) anyerror!void {
+            try w.beginMap();
+            try w.writeText("b");
+            try w.beginArray();
+            try w.writeInt(1);
+            try w.writeFloat(2.5);
+            try w.writeText("x");
+            try w.endArray();
+            try w.writeText("a");
+            try w.writeNull();
+            try w.writeText("cc");
+            try w.beginMap();
+            try w.writeText("z");
+            try w.writeBool(true);
+            try w.writeText("y");
+            try w.writeBool(false);
+            try w.endMap();
+            try w.endMap();
+        }
+    }.run;
+}
+
+test "a CBOR value writer sorts maps on close and writes shortest floats" {
+    const bytes = try valueBytes(zerde.cbor, .{ .deterministic = true }, buildMixed(zerde.cbor));
+    defer allocator.free(bytes);
+    // {"a": null, "b": [1, 2.5, "x"], "cc": {"y": false, "z": true}}: keys by encoded bytes, 2.5 as a half.
+    try std.testing.expectEqualSlices(u8, &.{
+        0xa3,
+        0x61,
+        'a',
+        0xf6,
+        0x61,
+        'b',
+        0x83,
+        0x01,
+        0xf9,
+        0x41,
+        0x00,
+        0x61,
+        'x',
+        0x62,
+        'c',
+        'c',
+        0xa2,
+        0x61,
+        'y',
+        0xf4,
+        0x61,
+        'z',
+        0xf5,
+    }, bytes);
+    // Without `deterministic` the entries keep their order, lengths are still definite, floats are doubles.
+    const plain = try valueBytes(zerde.cbor, .{}, buildMixed(zerde.cbor));
+    defer allocator.free(plain);
+    try std.testing.expectEqualSlices(u8, &.{
+        0xa3,
+        0x61,
+        'b',
+        0x83,
+        0x01,
+        0xfb,
+        0x40,
+        0x04,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0x61,
+        'x',
+        0x61,
+        'a',
+        0xf6,
+        0x62,
+        'c',
+        'c',
+        0xa2,
+        0x61,
+        'z',
+        0xf5,
+        0x61,
+        'y',
+        0xf4,
+    }, plain);
+}
+
+test "a CBOR value writer's keys can be any item, ordered as RFC 8949 4.2.1 says" {
+    const Build = struct {
+        fn run(w: *zerde.cbor.ValueWriter) anyerror!void {
+            try w.beginMap();
+            try w.writeText("a");
+            try w.writeInt(1);
+            try w.writeInt(-1);
+            try w.writeInt(2);
+            try w.writeInt(256);
+            try w.writeInt(3);
+            try w.writeBytes("x");
+            try w.writeInt(4);
+            try w.writeInt(24);
+            try w.writeInt(5);
+            try w.endMap();
+        }
+    };
+    const bytes = try valueBytes(zerde.cbor, .{ .deterministic = true }, Build.run);
+    defer allocator.free(bytes);
+    // 24 (0x1818), 256 (0x190100), -1 (0x20), h'78' (0x4178), "a" (0x6161): by their encoded bytes.
+    try std.testing.expectEqualSlices(u8, &.{ 0xa5, 0x18, 0x18, 0x05, 0x19, 0x01, 0x00, 0x03, 0x20, 0x02, 0x41, 'x', 0x04, 0x61, 'a', 0x01 }, bytes);
+}
+
+test "a value writer refuses a repeated key, an unbalanced container and a missing value" {
+    const Dup = struct {
+        fn run(w: *zerde.cbor.ValueWriter) anyerror!void {
+            try w.beginMap();
+            try w.writeInt(1);
+            try w.writeNull();
+            try w.writeInt(1);
+            try w.writeNull();
+            try w.endMap();
+        }
+    };
+    try std.testing.expectError(error.DuplicateField, valueBytes(zerde.cbor, .{ .deterministic = true }, Dup.run));
+    const Unclosed = struct {
+        fn run(w: *zerde.cbor.ValueWriter) anyerror!void {
+            try w.beginArray();
+        }
+    };
+    try std.testing.expectError(error.UnbalancedContainers, valueBytes(zerde.cbor, .{}, Unclosed.run));
+    const Mismatch = struct {
+        fn run(w: *zerde.cbor.ValueWriter) anyerror!void {
+            try w.beginArray();
+            try w.endMap();
+        }
+    };
+    try std.testing.expectError(error.UnbalancedContainers, valueBytes(zerde.cbor, .{}, Mismatch.run));
+    const Dangling = struct {
+        fn run(w: *zerde.cbor.ValueWriter) anyerror!void {
+            try w.beginMap();
+            try w.writeText("k");
+            try w.endMap();
+        }
+    };
+    try std.testing.expectError(error.UnbalancedContainers, valueBytes(zerde.cbor, .{}, Dangling.run));
+    const Stray = struct {
+        fn run(w: *zerde.cbor.ValueWriter) anyerror!void {
+            try w.endArray();
+        }
+    };
+    try std.testing.expectError(error.UnbalancedContainers, valueBytes(zerde.cbor, .{}, Stray.run));
+}
+
+test "a JSON value writer sorts keys like deterministic CBOR, and writes arrays as they come" {
+    const sorted = try valueBytes(zerde.json, .{}, buildMixed(zerde.json));
+    defer allocator.free(sorted);
+    try std.testing.expectEqualStrings("{\"a\":null,\"b\":[1,2.5,\"x\"],\"cc\":{\"y\":false,\"z\":true}}", sorted);
+    const kept = try valueBytes(zerde.json, .{ .sort_keys = false }, buildMixed(zerde.json));
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("{\"b\":[1,2.5,\"x\"],\"a\":null,\"cc\":{\"z\":true,\"y\":false}}", kept);
+    // Keys escape, an array of maps nests, bytes follow the config.
+    const Build = struct {
+        fn run(w: *zerde.json.ValueWriter) anyerror!void {
+            try w.beginArray();
+            try w.beginMap();
+            try w.writeText("k\"q");
+            try w.writeBytes("\xff\x00");
+            try w.endMap();
+            try w.beginMap();
+            try w.endMap();
+            try w.writeRaw("{ \"raw\" : 1 }");
+            try w.endArray();
+        }
+    };
+    const nested = try valueBytes(zerde.json, .{ .bytes = .base64 }, Build.run);
+    defer allocator.free(nested);
+    try std.testing.expectEqualStrings("[{\"k\\\"q\":\"/wA=\"},{},{ \"raw\" : 1 }]", nested);
+}
+
+test "a JSON value writer refuses what JSON cannot say" {
+    const Dup = struct {
+        fn run(w: *zerde.json.ValueWriter) anyerror!void {
+            try w.beginMap();
+            try w.writeText("a");
+            try w.writeNull();
+            try w.writeText("a");
+            try w.writeNull();
+            try w.endMap();
+        }
+    };
+    try std.testing.expectError(error.DuplicateField, valueBytes(zerde.json, .{}, Dup.run));
+    const NumberKey = struct {
+        fn run(w: *zerde.json.ValueWriter) anyerror!void {
+            try w.beginMap();
+            try w.writeInt(1);
+        }
+    };
+    try std.testing.expectError(error.UnexpectedType, valueBytes(zerde.json, .{}, NumberKey.run));
+    const Nan = struct {
+        fn run(w: *zerde.json.ValueWriter) anyerror!void {
+            try w.writeFloat(std.math.nan(f64));
+        }
+    };
+    try std.testing.expectError(error.NonFiniteFloat, valueBytes(zerde.json, .{}, Nan.run));
+    const Bad = struct {
+        fn run(w: *zerde.json.ValueWriter) anyerror!void {
+            try w.writeBytes("\xff");
+        }
+    };
+    try std.testing.expectError(error.InvalidUtf8, valueBytes(zerde.json, .{}, Bad.run));
+    const Unclosed = struct {
+        fn run(w: *zerde.json.ValueWriter) anyerror!void {
+            try w.beginMap();
+        }
+    };
+    try std.testing.expectError(error.UnbalancedContainers, valueBytes(zerde.json, .{}, Unclosed.run));
+}
+
+test "a reader copied into a writer canonicalizes, and moves between formats" {
+    // A lenient CBOR input in a scrambled spelling becomes the deterministic bytes a strict read accepts.
+    const loose = [_]u8{ 0xbf, 0x61, 'b', 0x9f, 0x18, 0x01, 0xfb, 0x40, 0x04, 0, 0, 0, 0, 0, 0, 0xff, 0x61, 'a', 0x7f, 0x61, 'x', 0xff, 0xff };
+    var reader = try zerde.cbor.pullReader(allocator, &loose, .{});
+    defer reader.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = zerde.cbor.valueWriter(allocator, &out.writer, .{ .deterministic = true });
+    defer writer.deinit();
+    while (try reader.next()) |event| try writer.writeEvent(event);
+    try writer.finish();
+    try std.testing.expectEqualSlices(u8, &.{ 0xa2, 0x61, 'a', 0x61, 'x', 0x61, 'b', 0x82, 0x01, 0xf9, 0x41, 0x00 }, out.written());
+    var strict_reader = try zerde.cbor.pullReader(allocator, out.written(), strict);
+    defer strict_reader.deinit();
+    while (try strict_reader.next()) |_| {}
+    try strict_reader.finish();
+
+    // The same item as JSON, and back: map order is the key order of the deterministic form.
+    var again = try zerde.cbor.pullReader(allocator, out.written(), .{});
+    defer again.deinit();
+    var json_out: std.Io.Writer.Allocating = .init(allocator);
+    defer json_out.deinit();
+    var json_writer = zerde.json.valueWriter(allocator, &json_out.writer, .{});
+    defer json_writer.deinit();
+    while (try again.next()) |event| try json_writer.writeEvent(event);
+    try json_writer.finish();
+    try std.testing.expectEqualStrings("{\"a\":\"x\",\"b\":[1,2.5]}", json_out.written());
+    var back = try zerde.json.pullReader(allocator, json_out.written(), .{});
+    defer back.deinit();
+    var cbor_out: std.Io.Writer.Allocating = .init(allocator);
+    defer cbor_out.deinit();
+    var cbor_writer = zerde.cbor.valueWriter(allocator, &cbor_out.writer, .{ .deterministic = true });
+    defer cbor_writer.deinit();
+    while (try back.next()) |event| try cbor_writer.writeEvent(event);
+    try std.testing.expectEqualSlices(u8, out.written(), cbor_out.written());
+}
+
+test "a value writer's nesting is bounded" {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var cbor = zerde.cbor.valueWriter(allocator, &out.writer, .{});
+    defer cbor.deinit();
+    for (0..128) |_| try cbor.beginArray();
+    try std.testing.expectError(error.CborNestingTooDeep, cbor.beginArray());
+    var json = zerde.json.valueWriter(allocator, &out.writer, .{});
+    defer json.deinit();
+    for (0..128) |_| try json.beginArray();
+    try std.testing.expectError(error.JsonNestingTooDeep, json.beginArray());
+}
+
+test "a JSON value writer puts shorter keys first, as deterministic CBOR does" {
+    const Build = struct {
+        fn run(w: *zerde.json.ValueWriter) anyerror!void {
+            try w.beginMap();
+            try w.writeText("aa");
+            try w.writeInt(1);
+            try w.writeText("b");
+            try w.writeInt(2);
+            try w.endMap();
+        }
+    };
+    const bytes = try valueBytes(zerde.json, .{}, Build.run);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("{\"b\":2,\"aa\":1}", bytes);
+}
