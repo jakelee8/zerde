@@ -293,6 +293,29 @@ What they refuse, and why:
   with its value
 - a JSON text that starts with a byte order mark
 
+### Bounds and `check`
+
+A field can carry bounds in `serde.fields` (type or call site): `.min_len` and `.max_len` for the length of
+text, a `ByteString`, a `Raw` item or an array slice, and `.min` and `.max` for an integer; they also apply
+to the value inside an optional. A length is checked before the memory for it is allocated wherever the
+format states it first (a CBOR definite array or string; an indefinite or JSON array is counted as it is read
+and stops at `max_len`). A violation is `error.LengthOutOfBounds` or `error.ValueOutOfRange`. For a rule across
+fields, a struct declares `pub fn check(self: T) !void`; it runs once the struct is read and its error is
+returned as it is. Both are read-side checks: the writer does not repeat them, since a sender does not
+re-validate its own output. Bounds apply to the field's own value, not to the elements of an array.
+
+```zig
+const Revision = struct {
+    key: zerde.ByteString,
+    level: u8,
+
+    pub const serde = .{ .fields = .{ .key = .{ .max_len = 1024 }, .level = .{ .min = 1, .max = 9 } } };
+    pub fn check(self: Revision) error{Invalid}!void {
+        if (self.level == 9 and self.key.bytes.len == 0) return error.Invalid;
+    }
+};
+```
+
 ### Raw items
 
 A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked

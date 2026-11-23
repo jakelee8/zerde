@@ -21,6 +21,10 @@ pub const Error = Allocator.Error || error{
     FloatOutOfRange,
     InvalidEnumTag,
     LengthMismatch,
+    /// A field's length (`min_len`, `max_len`) is outside its bounds.
+    LengthOutOfBounds,
+    /// A field's integer value (`min`, `max`) is outside its bounds.
+    ValueOutOfRange,
 };
 
 /// A variable-length byte string.
@@ -425,11 +429,11 @@ fn deserializeValue(
         .@"enum" => try decodeEnumValue(T, allocator, deserializer, cfg),
         .@"union" => |info| try deserializeUnion(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         .array => |info| try deserializeArray(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
-        .pointer => |info| try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
+        .pointer => |info| try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}),
         .@"struct" => |info| if (T == ByteString)
-            ByteString{ .bytes = try readByteSlice(allocator, deserializer) }
+            ByteString{ .bytes = try readByteSlice(allocator, deserializer, .{}) }
         else if (T == Raw)
-            Raw{ .bytes = try readRawSlice(allocator, deserializer) }
+            Raw{ .bytes = try readRawSlice(allocator, deserializer, .{}) }
         else
             try deserializeStruct(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         else => error.UnsupportedType,
@@ -488,7 +492,7 @@ fn deserializeUnion(
                         .integer => |number| variantHasInteger(T, name, cfg, number),
                     };
                     if (FieldType != void and matches) {
-                        const payload = try deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name);
+                        const payload = try deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name, .{});
                         break :blk @unionInit(T, name, payload);
                     }
                 }
@@ -655,6 +659,7 @@ fn deserializePointer(
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
+    comptime bounds: meta.Bounds,
 ) anyerror!T {
     const DeserializerType = @TypeOf(deserializer.*);
     const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
@@ -663,6 +668,8 @@ fn deserializePointer(
         .slice => {
             if (info.child == u8) {
                 const token = try deserializer.readString(allocator);
+                errdefer token.deinit(allocator);
+                try checkLength(bounds, token.bytes.len);
                 // Aliased slice parses can hand byte and string fields straight back to the caller without copying.
                 if (borrowed_strings) {
                     return token.bytes;
@@ -676,6 +683,8 @@ fn deserializePointer(
 
             const known_len = try beginArrayWithKnownLen(deserializer);
             if (known_len) |len| {
+                // Bounds are checked before the allocation they exist to limit.
+                try checkLength(bounds, len);
                 const items = try allocator.alloc(info.child, len);
                 errdefer allocator.free(items);
 
@@ -710,9 +719,11 @@ fn deserializePointer(
             }
 
             while (try deserializer.nextArrayItem()) {
+                if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;
                 const item = try deserializeIndexedValue(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len);
                 try items.append(allocator, item);
             }
+            try checkLength(bounds, items.items.len);
 
             return items.toOwnedSlice(allocator);
         },
@@ -754,21 +765,24 @@ fn readByteToken(allocator: Allocator, deserializer: anytype) anyerror!StringTok
 
 /// Reads a variable-length byte string into memory the caller owns, or into the input when the
 /// parse aliases it.
-fn readByteSlice(allocator: Allocator, deserializer: anytype) anyerror![]const u8 {
+fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
     const DeserializerType = @TypeOf(deserializer.*);
     const token = try readByteToken(allocator, deserializer);
+    errdefer token.deinit(allocator);
+    try checkLength(bounds, token.bytes.len);
     if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
     if (token.allocated) return token.bytes;
     return allocator.dupe(u8, token.bytes);
 }
 
 /// Reads the next item as raw bytes into memory the caller owns, or into the input when the parse aliases it.
-fn readRawSlice(allocator: Allocator, deserializer: anytype) anyerror![]const u8 {
+fn readRawSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
     const DeserializerType = @TypeOf(deserializer.*);
     if (!@hasDecl(DeserializerType, "readRaw")) {
         @compileError("format " ++ @typeName(DeserializerType) ++ " cannot read a Raw item");
     }
     const token = try deserializer.readRaw(allocator);
+    try checkLength(bounds, token.bytes.len);
     if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
     return allocator.dupe(u8, token.bytes);
 }
@@ -798,11 +812,12 @@ fn deserializeStruct(
                 @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field_name);
             }
 
-            @field(ordered_result, field_name) = try deserializeFieldValue(field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name);
+            @field(ordered_result, field_name) = try deserializeFieldValue(field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, meta.effectiveBounds(T, field_name, cfg));
             ordered_seen[i] = true;
         }
 
         if (@hasDecl(DeserializerType, "endStructOrdered")) try deserializer.endStructOrdered(T);
+        try checkStruct(T, &ordered_result);
         return ordered_result;
     }
 
@@ -837,6 +852,7 @@ fn deserializeStruct(
         }
 
         try fillMissingFields(T, info, cfg, &result, &seen);
+        try checkStruct(T, &result);
         return result;
     }
 
@@ -859,7 +875,14 @@ fn deserializeStruct(
     }
 
     try fillMissingFields(T, info, cfg, &result, &seen);
+    try checkStruct(T, &result);
     return result;
+}
+
+/// A type's own `check` runs once the struct is built, for rules across fields. Its error is
+/// returned as it is; the fields already read are released.
+fn checkStruct(comptime T: type, result: *const T) anyerror!void {
+    if (comptime @hasDecl(T, "check")) try result.check();
 }
 
 /// Reads one struct field's value under the field's optional policy.
@@ -879,13 +902,13 @@ fn deserializeStructField(
 ) anyerror!FieldType {
     if (comptime isNestedOptional(FieldType)) {
         const Inner = @typeInfo(FieldType).optional.child;
-        const inner: Inner = try deserializeFieldValue(Inner, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name);
+        const inner: Inner = try deserializeFieldValue(Inner, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, meta.effectiveBounds(T, field_name, cfg));
         return inner;
     }
     if (comptime @typeInfo(FieldType) == .optional and meta.effectiveOptionalPolicy(T, field_name, cfg) == .absent) {
         if (try deserializer.peekKind() == .null) return error.UnexpectedType;
     }
-    return deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name);
+    return deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, meta.effectiveBounds(T, field_name, cfg));
 }
 
 /// Resolves fields the input did not name, after the object is fully consumed: a declared default,
@@ -935,6 +958,56 @@ fn deserializeIndexedValue(
     return value;
 }
 
+pub fn checkLength(comptime bounds: meta.Bounds, len: usize) error{LengthOutOfBounds}!void {
+    if (len < bounds.min_len or len > bounds.max_len) return error.LengthOutOfBounds;
+}
+
+/// Reads a value that has bounds: a text, byte, raw or array length, or an integer range. The
+/// length is checked before the memory it would take is allocated where the format states it first.
+fn deserializeBounded(
+    comptime T: type,
+    comptime bounds: meta.Bounds,
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track_diagnostics: bool,
+) anyerror!T {
+    switch (@typeInfo(T)) {
+        .optional => |info| {
+            if (try readNullIfPresent(deserializer)) return null;
+            return try deserializeBounded(info.child, bounds, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+        },
+        .int => {
+            const value = try deserializeValue(T, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+            if (bounds.min) |min| if (value < min) return error.ValueOutOfRange;
+            if (bounds.max) |max| if (value > max) return error.ValueOutOfRange;
+            return value;
+        },
+        .pointer => |info| {
+            if (info.size != .slice) @compileError("length bounds apply to a slice: " ++ @typeName(T));
+            return try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds);
+        },
+        .@"struct" => {
+            if (T == ByteString) return .{ .bytes = try readByteSlice(allocator, deserializer, bounds) };
+            if (T == Raw) return .{ .bytes = try readRawSlice(allocator, deserializer, bounds) };
+            @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T));
+        },
+        else => @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T)),
+    }
+}
+
+/// Consumes a null and returns true, or returns false and leaves the input alone.
+fn readNullIfPresent(deserializer: anytype) anyerror!bool {
+    const DeserializerType = @TypeOf(deserializer.*);
+    if (@hasDecl(DeserializerType, "readOptionalPresent")) return !try deserializer.readOptionalPresent();
+    if (try deserializer.peekKind() == .null) {
+        try deserializer.readNull();
+        return true;
+    }
+    return false;
+}
+
 fn deserializeFieldValue(
     comptime T: type,
     allocator: Allocator,
@@ -943,9 +1016,13 @@ fn deserializeFieldValue(
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
     comptime field_name: []const u8,
+    comptime bounds: meta.Bounds,
 ) anyerror!T {
     if (track_diagnostics) diagnostics.?.pushField(field_name);
-    const value = deserializeValue(T, allocator, deserializer, cfg, diagnostics, track_diagnostics) catch |err| return err;
+    const value = (if (comptime bounds.isDefault())
+        deserializeValue(T, allocator, deserializer, cfg, diagnostics, track_diagnostics)
+    else
+        deserializeBounded(T, bounds, allocator, deserializer, cfg, diagnostics, track_diagnostics)) catch |err| return err;
     if (track_diagnostics) diagnostics.?.pop();
     return value;
 }

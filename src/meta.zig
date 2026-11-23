@@ -55,6 +55,20 @@ pub const OptionalPolicy = enum {
 /// `.integer`.
 pub const EnumRepr = enum { name, integer };
 
+/// A field's bounds, from the field overrides `min_len`, `max_len` (text, bytes, raw and array
+/// length) and `min`, `max` (integer range). The reader checks them; the writer does not, since a
+/// sender does not re-validate its own output.
+pub const Bounds = struct {
+    min_len: usize = 0,
+    max_len: usize = std.math.maxInt(usize),
+    min: ?i128 = null,
+    max: ?i128 = null,
+
+    pub fn isDefault(comptime self: Bounds) bool {
+        return self.min_len == 0 and self.max_len == std.math.maxInt(usize) and self.min == null and self.max == null;
+    }
+};
+
 /// A format's field order: the order it uses when neither the call site nor the type names one,
 /// and whether it requires that order. A deterministic encoding requires its order, so asking such
 /// a format for another order is a compile error instead of output that only looks deterministic.
@@ -179,6 +193,22 @@ pub fn effectiveFieldKey(comptime T: type, comptime field_name: []const u8, comp
         return .{ .integer = fieldOverride(T.serde, field_name, "key") };
     }
     return .{ .text = effectiveFieldName(T, field_name, cfg) };
+}
+
+/// A field's bounds: each of `min_len`, `max_len`, `min` and `max` from the call site's field override,
+/// else the type's.
+pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) Bounds {
+    @setEvalBranchQuota(20_000);
+    var bounds: Bounds = .{};
+    inline for (.{ "min_len", "max_len", "min", "max" }) |option| {
+        const found: ?@FieldType(Bounds, option) = comptime blk: {
+            if (fieldOverrideHas(cfg, field_name, option)) break :blk fieldOverride(cfg, field_name, option);
+            if (@hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, option)) break :blk fieldOverride(T.serde, field_name, option);
+            break :blk null;
+        };
+        if (found) |value| @field(bounds, option) = value;
+    }
+    return bounds;
 }
 
 /// A field's `optional` policy, from a field override: the call site, then the type. Lenient by default.

@@ -148,6 +148,23 @@ MUTANTS = [
     ("json.zig", "            self.parser.skipWhitespace();\n            const start = self.parser.index;", "            const start = self.parser.index;"),
     ("typed.zig", "    return allocator.dupe(u8, token.bytes);\n}\n\nfn deserializeStruct(", "    return token.bytes;\n}\n\nfn deserializeStruct("),
     ("typed.zig", "if (@hasDecl(DeserializerType, \"borrowStrings\") and deserializer.borrowStrings()) return token.bytes;\n    return allocator.dupe(u8, token.bytes);\n}\n\nfn deserializeStruct(", "if (@hasDecl(DeserializerType, \"borrowStrings\") and deserializer.borrowStrings() and false) return token.bytes;\n    return allocator.dupe(u8, token.bytes);\n}\n\nfn deserializeStruct("),
+    # Bounds and check
+    ("typed.zig", "if (len < bounds.min_len or len > bounds.max_len) return error.LengthOutOfBounds;", "if (len > bounds.max_len) return error.LengthOutOfBounds;"),
+    ("typed.zig", "if (len < bounds.min_len or len > bounds.max_len) return error.LengthOutOfBounds;", "if (len < bounds.min_len) return error.LengthOutOfBounds;"),
+    ("typed.zig", "if (bounds.min) |min| if (value < min) return error.ValueOutOfRange;", "_ = bounds.min;"),
+    ("typed.zig", "if (bounds.max) |max| if (value > max) return error.ValueOutOfRange;", "_ = bounds.max;"),
+    ("typed.zig", "if (try readNullIfPresent(deserializer)) return null;", "if (false) return null;"),
+    ("typed.zig", "if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;", "_ = 0;"),
+    ("typed.zig", "            try checkLength(bounds, items.items.len);\n", "            _ = 0;\n"),
+    ("typed.zig", "                try checkLength(bounds, len);\n                const items = try allocator.alloc", "                const items = try allocator.alloc"),
+    ("typed.zig", "                try checkLength(bounds, token.bytes.len);\n                // Aliased", "                // Aliased"),
+    ("typed.zig", "    errdefer token.deinit(allocator);\n    try checkLength(bounds, token.bytes.len);\n", "    errdefer token.deinit(allocator);\n    _ = bounds;\n"),
+    ("typed.zig", "    try checkLength(bounds, token.bytes.len);\n    if (@hasDecl(DeserializerType, \"borrowStrings\")", "    _ = bounds;\n    if (@hasDecl(DeserializerType, \"borrowStrings\")"),
+    ("typed.zig", "if (comptime @hasDecl(T, \"check\")) try result.check();", "_ = result;"),
+    ("typed.zig", "        try checkStruct(T, &result);\n        return result;", "        return result;"),
+    ("typed.zig", "        try checkStruct(T, &ordered_result);\n", "        _ = 0;\n"),
+    ("meta.zig", "if (fieldOverrideHas(cfg, field_name, option)) break :blk fieldOverride(cfg, field_name, option);", "if (fieldOverrideHas(cfg, field_name, option) and false) break :blk fieldOverride(cfg, field_name, option);"),
+    ("meta.zig", "if (@hasDecl(T, \"serde\") and fieldOverrideHas(T.serde, field_name, option)) break :blk fieldOverride(T.serde, field_name, option);", "if (@hasDecl(T, \"serde\") and fieldOverrideHas(T.serde, field_name, option) and false) break :blk fieldOverride(T.serde, field_name, option);"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

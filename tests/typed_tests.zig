@@ -1245,3 +1245,128 @@ test "a JSON Raw is the value's own text without the whitespace around it" {
     try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(Framed, allocator, "{\"id\":1,\"meta\":[[1]]}", .{}, .{ .max_depth = 2 }));
     try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith(Framed, allocator, "{\"id\":1,\"meta\":[1,2,3]}", .{}, .{ .max_items = 5 }));
 }
+
+// ---- bounds and check ----------------------------------------------------------------------------------
+
+const Bounded = struct {
+    name: []const u8,
+    blob: zerde.ByteString,
+    items: []const u16,
+    level: u8,
+    note: ?[]const u8 = null,
+    low: i64 = 0,
+    meta: zerde.Raw,
+
+    pub const serde = .{ .fields = .{
+        .name = .{ .min_len = 1, .max_len = 4 },
+        .blob = .{ .max_len = 3 },
+        .items = .{ .min_len = 1, .max_len = 3 },
+        .level = .{ .min = 10, .max = 20 },
+        .note = .{ .max_len = 2 },
+        .low = .{ .min = -5 },
+        .meta = .{ .max_len = 4 },
+    } };
+};
+
+fn boundedJson(name: []const u8, blob: []const u8, items: []const u8, level: []const u8, extra: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"blob\":\"{s}\",\"items\":{s},\"level\":{s},\"meta\":1{s}}}", .{ name, blob, items, level, extra });
+}
+
+test "bounds are enforced on text, bytes, arrays, optionals, raw items and integers" {
+    const ok = try boundedJson("abcd", "abc", "[1,2,3]", "20", ",\"note\":\"ab\",\"low\":-5");
+    defer allocator.free(ok);
+    const parsed = try zerde.json.parseSlice(Bounded, allocator, ok);
+    zerde.free(allocator, parsed);
+
+    const cases = [_]struct { name: []const u8, blob: []const u8, items: []const u8, level: []const u8, extra: []const u8, err: anyerror }{
+        .{ .name = "", .blob = "a", .items = "[1]", .level = "10", .extra = "", .err = error.LengthOutOfBounds },
+        .{ .name = "abcde", .blob = "a", .items = "[1]", .level = "10", .extra = "", .err = error.LengthOutOfBounds },
+        .{ .name = "a", .blob = "abcd", .items = "[1]", .level = "10", .extra = "", .err = error.LengthOutOfBounds },
+        .{ .name = "a", .blob = "a", .items = "[]", .level = "10", .extra = "", .err = error.LengthOutOfBounds },
+        .{ .name = "a", .blob = "a", .items = "[1,2,3,4]", .level = "10", .extra = "", .err = error.LengthOutOfBounds },
+        .{ .name = "a", .blob = "a", .items = "[1]", .level = "9", .extra = "", .err = error.ValueOutOfRange },
+        .{ .name = "a", .blob = "a", .items = "[1]", .level = "21", .extra = "", .err = error.ValueOutOfRange },
+        .{ .name = "a", .blob = "a", .items = "[1]", .level = "10", .extra = ",\"note\":\"abc\"", .err = error.LengthOutOfBounds },
+        .{ .name = "a", .blob = "a", .items = "[1]", .level = "10", .extra = ",\"low\":-6", .err = error.ValueOutOfRange },
+    };
+    for (cases) |case| {
+        const text = try boundedJson(case.name, case.blob, case.items, case.level, case.extra);
+        defer allocator.free(text);
+        try expectJsonError(Bounded, case.err, text);
+    }
+    // A null optional has no length to bound; a raw item's own length is bounded.
+    const with_null = try boundedJson("a", "a", "[1]", "10", ",\"note\":null");
+    defer allocator.free(with_null);
+    zerde.free(allocator, try zerde.json.parseSlice(Bounded, allocator, with_null));
+    try expectJsonError(Bounded, error.LengthOutOfBounds, "{\"name\":\"a\",\"blob\":\"a\",\"items\":[1],\"level\":10,\"meta\":12345}");
+}
+
+test "bounds in CBOR, and a length is refused before anything is allocated" {
+    const a = [_]u8{ 0xa5, 0x64, 'n', 'a', 'm', 'e', 0x61, 'x', 0x64, 'b', 'l', 'o', 'b', 0x41, 0x01, 0x65, 'i', 't', 'e', 'm', 's', 0x81, 0x01, 0x65, 'l', 'e', 'v', 'e', 'l', 0x0a, 0x64, 'm', 'e', 't', 'a', 0x01 };
+    zerde.free(allocator, try zerde.cbor.parseSlice(Bounded, allocator, &a));
+
+    // An array that claims 1,000 items, with the bytes to hold them, against a bound of 3.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(allocator);
+    try big.appendSlice(allocator, &.{ 0xa1, 0x65, 'i', 't', 'e', 'm', 's', 0x99, 0x03, 0xe8 });
+    try big.appendNTimes(allocator, 0x01, 1000);
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Bounded, failing.allocator(), big.items));
+    // Text and bytes too long are refused by the same check.
+    const long_text = [_]u8{ 0xa1, 0x64, 'n', 'a', 'm', 'e', 0x65, 'a', 'b', 'c', 'd', 'e' };
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Bounded, failing.allocator(), &long_text));
+    const long_bytes = [_]u8{ 0xa1, 0x64, 'b', 'l', 'o', 'b', 0x44, 1, 2, 3, 4 };
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Bounded, failing.allocator(), &long_bytes));
+    // An indefinite array is counted as it is read.
+    const indefinite = [_]u8{ 0xa1, 0x65, 'i', 't', 'e', 'm', 's', 0x9f, 0x01, 0x02, 0x03, 0x04, 0xff };
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Bounded, allocator, &indefinite));
+}
+
+test "bounds can come from the call site, and are not checked on write" {
+    const cfg = .{ .fields = .{ .s = .{ .max_len = 2 }, .n = .{ .max = 5 } } };
+    const Plain = struct { s: []const u8, n: u8 };
+    try expectJsonText("{\"s\":\"abcdef\",\"n\":200}", Plain{ .s = "abcdef", .n = 200 }, cfg, .{});
+    const ok = try zerde.json.parseSliceWith(Plain, allocator, "{\"s\":\"ab\",\"n\":5}", cfg, .{});
+    zerde.free(allocator, ok);
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSliceWith(Plain, allocator, "{\"s\":\"abc\",\"n\":5}", cfg, .{}));
+    try std.testing.expectError(error.ValueOutOfRange, zerde.json.parseSliceWith(Plain, allocator, "{\"s\":\"ab\",\"n\":6}", cfg, .{}));
+}
+
+const Range = struct {
+    lo: u8,
+    label: []const u8,
+    hi: u8,
+
+    pub fn check(self: Range) error{Invalid}!void {
+        if (self.lo > self.hi) return error.Invalid;
+    }
+};
+
+test "a struct's check runs after it is read and its error is returned" {
+    const ok = try zerde.json.parseSlice(Range, allocator, "{\"lo\":1,\"label\":\"x\",\"hi\":2}");
+    zerde.free(allocator, ok);
+    try expectJsonError(Range, error.Invalid, "{\"lo\":3,\"label\":\"x\",\"hi\":2}");
+    const bad = [_]u8{ 0xa3, 0x62, 'l', 'o', 0x03, 0x65, 'l', 'a', 'b', 'e', 'l', 0x61, 'x', 0x62, 'h', 'i', 0x02 };
+    try expectCborError(Range, error.Invalid, &bad);
+    // A nested struct is checked too, and the failure leaks nothing (the testing allocator checks).
+    const Outer = struct { inner: Range, tag: []const u8 };
+    try expectJsonError(Outer, error.Invalid, "{\"tag\":\"t\",\"inner\":{\"lo\":9,\"label\":\"x\",\"hi\":2}}");
+}
+
+test "an indefinite array stops growing at its bound, and bin checks too" {
+    // 1,000 items in an indefinite array, a bound of 3, and an allocator that fails on its second call:
+    // the bound is hit before the list grows again.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(allocator);
+    try big.appendSlice(allocator, &.{ 0xa1, 0x65, 'i', 't', 'e', 'm', 's', 0x9f });
+    try big.appendNTimes(allocator, 0x01, 1000);
+    try big.append(allocator, 0xff);
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Bounded, failing.allocator(), big.items));
+
+    // The binary format reads fields in order and runs `check` as well.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try zerde.bin.serialize(&out.writer, Range{ .lo = 5, .label = "x", .hi = 1 });
+    try std.testing.expectError(error.Invalid, zerde.bin.parseSlice(Range, allocator, out.written()));
+}
