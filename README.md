@@ -293,6 +293,15 @@ What they refuse, and why:
   with its value
 - a JSON text that starts with a byte order mark
 
+### Raw items
+
+A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked
+and kept as its own bytes instead of decoded: a CBOR item, or the text of a JSON value without the
+whitespace around it. The read checks it as the mode and limits say, so a strict read refuses a
+non-deterministic item inside it, and a lenient read takes any well-formed one (CBOR tags included).
+Writing puts the bytes back unchanged, so a `Raw` must be written in the format it was read from. It is
+copied, or borrowed from the input in an aliased parse, like a `ByteString`.
+
 ### Reader modes and limits
 
 CBOR `ReadConfig.mode` is `.lenient` (the default, everything above) or `.strict`. A strict read

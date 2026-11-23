@@ -246,6 +246,11 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             try self.writer.writeAll(value);
         }
 
+        /// Writes an item that was read as `zerde.Raw`, unchanged.
+        pub fn emitRaw(self: *Self, value: []const u8) !void {
+            try self.writer.writeAll(value);
+        }
+
         pub fn emitEnum(self: *Self, comptime _: type, value: anytype) !void {
             try writeTextString(self.writer, @tagName(value));
         }
@@ -466,6 +471,16 @@ pub fn CborDeserializer(comptime Config: type) type {
 
         pub fn readByteToken(self: *Self, allocator: Allocator) !StringToken {
             return self.readBytes(allocator);
+        }
+
+        /// The next item as the bytes it was read from, checked as the mode and limits say. A
+        /// strict read refuses a non-deterministic item here too; a lenient one takes any well-formed
+        /// item, tags included.
+        pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
+            _ = allocator;
+            const start = self.index;
+            try self.skipItem(self.stack_len);
+            return .{ .bytes = self.input[start..self.index], .allocated = false };
         }
 
         pub fn beginArray(self: *Self) !void {

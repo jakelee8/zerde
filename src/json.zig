@@ -121,6 +121,11 @@ pub fn JsonSerializer(comptime Config: type) type {
             try writeEscapedString(self.writer, value);
         }
 
+        /// Writes JSON text that was read as `zerde.Raw`, unchanged.
+        pub fn emitRaw(self: *Self, value: []const u8) !void {
+            try self.writer.writeAll(value);
+        }
+
         pub fn emitBytes(self: *Self, value: []const u8) !void {
             switch (bytesEncoding(Config, self.cfg)) {
                 .string => {
@@ -479,6 +484,14 @@ pub fn JsonDeserializer(comptime Config: type) type {
             self.parser.skipWhitespace();
             if (self.parser.consume() != ':') return error.UnexpectedToken;
             return key;
+        }
+
+        /// The next value as the text it was read from, without the whitespace around it.
+        pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
+            self.parser.skipWhitespace();
+            const start = self.parser.index;
+            try self.skipValue(allocator);
+            return .{ .bytes = self.input[start..self.parser.index], .allocated = false };
         }
 
         pub fn skipValue(self: *Self, allocator: Allocator) !void {

@@ -1156,3 +1156,92 @@ test "strict checks the order of text keys in a union that also has integer keys
     try expectStrict(Wide, error.NonDeterministicEncoding, &.{ 0xa2, 0x61, 'a', 0x01, 0x05, 0x01 });
     _ = try zerde.cbor.parseSliceWith(Wide, allocator, &.{ 0xa1, 0x61, 'c', 0x01 }, .{}, strict);
 }
+
+// ---- Raw ---------------------------------------------------------------------------------------------
+
+const Framed = struct { id: u8, meta: zerde.Raw, after: ?u8 = null };
+
+test "a CBOR Raw is the item's own bytes, whatever its spelling" {
+    // meta is an indefinite map with a non-minimal head and a chunked string: a lenient read keeps it as it is.
+    const meta = [_]u8{ 0xbf, 0x61, 'k', 0x9f, 0x18, 0x01, 0x02, 0xff, 0x61, 'j', 0x7f, 0x61, 'a', 0x61, 'b', 0xff, 0xff };
+    const input = [_]u8{ 0xa3, 0x62, 'i', 'd', 0x07, 0x64, 'm', 'e', 't', 'a' } ++ meta ++ [_]u8{ 0x65, 'a', 'f', 't', 'e', 'r', 0x09 };
+    const decoded = try zerde.cbor.parseSlice(Framed, allocator, &input);
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqual(@as(u8, 7), decoded.id);
+    try std.testing.expectEqualSlices(u8, &meta, decoded.meta.bytes);
+    try std.testing.expectEqual(@as(?u8, 9), decoded.after);
+    // It is written back unchanged inside the deterministic map around it.
+    try expectCborBytes(&([_]u8{ 0xa3, 0x62, 'i', 'd', 0x07, 0x64, 'm', 'e', 't', 'a' } ++ meta ++ [_]u8{ 0x65, 'a', 'f', 't', 'e', 'r', 0x09 }), decoded, .{}, .{ .deterministic = true });
+    // Any item can be raw: a scalar, an array, a tagged value.
+    inline for (.{ &[_]u8{ 0x82, 0x01, 0x02 }, &[_]u8{ 0xc1, 0x1a, 0x00, 0x00, 0x00, 0x01 }, &[_]u8{0xf5} }) |item| {
+        const bytes = [_]u8{ 0xa2, 0x62, 'i', 'd', 0x00, 0x64, 'm', 'e', 't', 'a' } ++ item.*;
+        const one = try zerde.cbor.parseSlice(Framed, allocator, &bytes);
+        defer zerde.free(allocator, one);
+        try std.testing.expectEqualSlices(u8, item, one.meta.bytes);
+    }
+}
+
+test "a CBOR Raw is validated like any item, in the read's mode and limits" {
+    const head = [_]u8{ 0xa2, 0x62, 'i', 'd', 0x00, 0x64, 'm', 'e', 't', 'a' };
+    const cases = [_]struct { item: []const u8, err: anyerror }{
+        .{ .item = &.{ 0x82, 0x01 }, .err = error.UnexpectedEndOfInput }, // truncated
+        .{ .item = &.{ 0x62, 0xc3, 0x28 }, .err = error.InvalidUtf8 },
+        .{ .item = &.{ 0xa2, 0x01, 0x00, 0x01, 0x00 }, .err = error.DuplicateField },
+        .{ .item = &.{0xff}, .err = error.InvalidAdditionalInfo },
+        .{ .item = &.{ 0xf8, 0x10 }, .err = error.InvalidSimpleValue },
+    };
+    for (cases) |case| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        try input.appendSlice(allocator, &head);
+        try input.appendSlice(allocator, case.item);
+        try expectCborError(Framed, case.err, input.items);
+    }
+    // Strict refuses a Raw that is not deterministic; lenient takes it.
+    const loose = head ++ [_]u8{ 0x9f, 0x01, 0xff };
+    const kept = try zerde.cbor.parseSliceWith(Framed, allocator, &loose, .{}, .{});
+    zerde.free(allocator, kept);
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.cbor.parseSliceWith(Framed, allocator, &loose, .{}, strict));
+    // Limits count inside it: depth, items, string length, and NaN.
+    const deep = head ++ [_]u8{ 0x81, 0x81, 0x00 };
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(Framed, allocator, &deep, .{}, .{ .max_depth = 2 }));
+    try std.testing.expectError(error.TooManyItems, zerde.cbor.parseSliceWith(Framed, allocator, &deep, .{}, .{ .max_items = 6 }));
+    const nan = head ++ [_]u8{ 0xf9, 0x7e, 0x00 };
+    try std.testing.expectError(error.NonFiniteFloat, zerde.cbor.parseSliceWith(Framed, allocator, &nan, .{}, .{ .refuse_non_finite = true }));
+    const long = head ++ [_]u8{ 0x43, 1, 2, 3 };
+    try std.testing.expectError(error.StringTooLong, zerde.cbor.parseSliceWith(Framed, allocator, &long, .{}, .{ .max_string_len = 2 }));
+}
+
+test "Raw borrows the input when the parse aliases it, and owns a copy otherwise" {
+    const input = [_]u8{ 0xa2, 0x62, 'i', 'd', 0x00, 0x64, 'm', 'e', 't', 'a', 0x82, 0x01, 0x02 };
+    const aliased = try zerde.cbor.parseSliceAliased(Framed, allocator, &input);
+    const begin = @intFromPtr(&input);
+    try std.testing.expect(@intFromPtr(aliased.meta.bytes.ptr) >= begin and @intFromPtr(aliased.meta.bytes.ptr) < begin + input.len);
+    const owned = try zerde.cbor.parseSlice(Framed, allocator, &input);
+    defer zerde.free(allocator, owned);
+    try std.testing.expect(@intFromPtr(owned.meta.bytes.ptr) < begin or @intFromPtr(owned.meta.bytes.ptr) >= begin + input.len);
+}
+
+test "Raw in an array, an optional and a union" {
+    const Holder = struct { items: []const zerde.Raw, maybe: ?zerde.Raw };
+    const input = [_]u8{ 0xa2, 0x65, 'i', 't', 'e', 'm', 's', 0x82, 0x01, 0x61, 'x', 0x65, 'm', 'a', 'y', 'b', 'e', 0xf6 };
+    const decoded = try zerde.cbor.parseSlice(Holder, allocator, &input);
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqual(@as(usize, 2), decoded.items.len);
+    try std.testing.expectEqualSlices(u8, &.{0x01}, decoded.items[0].bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x61, 'x' }, decoded.items[1].bytes);
+    try std.testing.expectEqual(@as(?zerde.Raw, null), decoded.maybe);
+}
+
+test "a JSON Raw is the value's own text without the whitespace around it" {
+    const input = "{ \"id\" : 7 , \"meta\" :  { \"k\" : [ 1 , 2 ] , \"j\" : \"\\u0041\" }  , \"after\":9}";
+    const decoded = try zerde.json.parseSlice(Framed, allocator, input);
+    defer zerde.free(allocator, decoded);
+    try std.testing.expectEqualStrings("{ \"k\" : [ 1 , 2 ] , \"j\" : \"\\u0041\" }", decoded.meta.bytes);
+    try expectJsonText("{\"id\":7,\"meta\":{ \"k\" : [ 1 , 2 ] , \"j\" : \"\\u0041\" },\"after\":9}", decoded, .{}, .{});
+    // It is still checked: syntax, UTF-8, depth, items.
+    try expectJsonError(Framed, error.UnexpectedToken, "{\"id\":1,\"meta\":{\"a\":}}");
+    try expectJsonError(Framed, error.InvalidUtf8, "{\"id\":1,\"meta\":\"\xff\"}");
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(Framed, allocator, "{\"id\":1,\"meta\":[[1]]}", .{}, .{ .max_depth = 2 }));
+    try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith(Framed, allocator, "{\"id\":1,\"meta\":[1,2,3]}", .{}, .{ .max_items = 5 }));
+}

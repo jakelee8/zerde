@@ -141,6 +141,13 @@ MUTANTS = [
     ("json.zig", "if (self.items > self.max_items) return error.TooManyItems;", "if (self.items > self.max_items and false) return error.TooManyItems;"),
     ("json.zig", "if (self.stack_len >= self.max_depth) return error.JsonNestingTooDeep;", "if (self.stack_len >= self.stack.len) return error.JsonNestingTooDeep;"),
     ("json.zig", "if (token.bytes.len > self.max_string_len) {", "if (token.bytes.len > self.max_string_len and false) {"),
+    # Raw
+    ("cbor.zig", "            try self.skipItem(self.stack_len);\n            return .{ .bytes = self.input[start..self.index], .allocated = false };", "            if (self.index > self.input.len) try self.skipItem(self.stack_len);\n            return .{ .bytes = self.input[start..self.index], .allocated = false };"),
+    ("cbor.zig", "return .{ .bytes = self.input[start..self.index], .allocated = false };", "return .{ .bytes = self.input[start..start], .allocated = false };"),
+    ("json.zig", "            try self.skipValue(allocator);\n            return .{ .bytes = self.input[start..self.parser.index], .allocated = false };", "            if (start > self.input.len) try self.skipValue(allocator);\n            return .{ .bytes = self.input[start..self.parser.index], .allocated = false };"),
+    ("json.zig", "            self.parser.skipWhitespace();\n            const start = self.parser.index;", "            const start = self.parser.index;"),
+    ("typed.zig", "    return allocator.dupe(u8, token.bytes);\n}\n\nfn deserializeStruct(", "    return token.bytes;\n}\n\nfn deserializeStruct("),
+    ("typed.zig", "if (@hasDecl(DeserializerType, \"borrowStrings\") and deserializer.borrowStrings()) return token.bytes;\n    return allocator.dupe(u8, token.bytes);\n}\n\nfn deserializeStruct(", "if (@hasDecl(DeserializerType, \"borrowStrings\") and deserializer.borrowStrings() and false) return token.bytes;\n    return allocator.dupe(u8, token.bytes);\n}\n\nfn deserializeStruct("),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

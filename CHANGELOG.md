@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added `zerde.Raw`: a field kept as the bytes of one validated CBOR item or JSON value (checked by the read's mode and limits, written back unchanged)
 - added CBOR `ReadConfig.mode` (`.lenient`, `.strict`): strict accepts only RFC 8949 §4.2.1/§4.2.2 deterministic encoding (`error.NonDeterministicEncoding`, tags refused); added `max_depth`, `max_items` and `max_string_len` limits to the CBOR and JSON readers (`error.TooManyItems`, `error.StringTooLong`)
 - added integer union variant keys (`.fields = .{ .v = .{ .key = N } }` on a union; CBOR) and `enum_repr = .integer`, which writes an enum as its number and reads only a number
 - added CBOR `ReadConfig.refuse_non_finite`: NaN and infinity anywhere in the input are `error.NonFiniteFloat`

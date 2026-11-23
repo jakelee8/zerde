@@ -34,6 +34,15 @@ pub const ByteString = struct {
     bytes: []const u8,
 };
 
+/// One data item of the format being read, validated and kept as its own bytes instead of being
+/// decoded: a CBOR item, or JSON text. Reading checks it as the read's mode and limits say (a strict
+/// read refuses a non-deterministic item inside it) and returns exactly the bytes that were read;
+/// writing puts them back verbatim, so the format must be the one it was read from. `zerde.free`
+/// releases it like any slice.
+pub const Raw = struct {
+    bytes: []const u8,
+};
+
 pub const ValueKind = enum {
     null,
     bool,
@@ -277,6 +286,13 @@ fn serializeValue(
                 try emitByteString(serializer, value.bytes);
                 return;
             }
+            if (T == Raw) {
+                if (!@hasDecl(SerializerType, "emitRaw")) {
+                    @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a Raw item");
+                }
+                try serializer.emitRaw(value.bytes);
+                return;
+            }
             if (info.is_tuple) @compileError("tuple structs are not supported: " ++ @typeName(T));
 
             // TOML uses two passes so scalars appear before nested tables; JSON stays at one pass.
@@ -412,6 +428,8 @@ fn deserializeValue(
         .pointer => |info| try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         .@"struct" => |info| if (T == ByteString)
             ByteString{ .bytes = try readByteSlice(allocator, deserializer) }
+        else if (T == Raw)
+            Raw{ .bytes = try readRawSlice(allocator, deserializer) }
         else
             try deserializeStruct(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         else => error.UnsupportedType,
@@ -741,6 +759,17 @@ fn readByteSlice(allocator: Allocator, deserializer: anytype) anyerror![]const u
     const token = try readByteToken(allocator, deserializer);
     if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
     if (token.allocated) return token.bytes;
+    return allocator.dupe(u8, token.bytes);
+}
+
+/// Reads the next item as raw bytes into memory the caller owns, or into the input when the parse aliases it.
+fn readRawSlice(allocator: Allocator, deserializer: anytype) anyerror![]const u8 {
+    const DeserializerType = @TypeOf(deserializer.*);
+    if (!@hasDecl(DeserializerType, "readRaw")) {
+        @compileError("format " ++ @typeName(DeserializerType) ++ " cannot read a Raw item");
+    }
+    const token = try deserializer.readRaw(allocator);
+    if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
     return allocator.dupe(u8, token.bytes);
 }
 
