@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added `zerde.reflect`: comptime reflection of fields (wire keys, kinds, bounds, optional policies, defaults, extras), write order, union variants and enums, for generators
 - added wire-type hooks `zerdeDecode` (over a pull reader), `zerdeEncode` (over a streaming `Encoder`) and `zerdeFree`, for CBOR and JSON; `error.HookIncomplete`; `cbor.PullReader` and `json.PullReader` now hold a pointer to their deserializer
 - added `cbor.valueWriter` and `json.valueWriter`: a writer for runtime-defined values with `writeEvent`, definite CBOR lengths, maps sorted on close (CBOR with `deterministic`: encoded-key order and shortest floats; JSON: length-first `sort_keys`) and `error.DuplicateField` for a repeated key
 - added `cbor.pullReader` and `json.pullReader`: an event reader (`zerde.Event`) over one item, with `skip`, the mode and limits of a typed read, and the duplicate-key check

@@ -2379,3 +2379,134 @@ test "a hook that ends on a decoded string leaves nothing allocated" {
     const parsed = try zerde.json.parseSlice(struct { label: Label }, allocator, "{\"label\":\"a\\nb\"}");
     try std.testing.expectEqual(@as(usize, 3), parsed.label.len);
 }
+
+// ---- reflection ---------------------------------------------------------------------------------------------
+
+fn check(comptime ok: bool, comptime line: u32) void {
+    if (!ok) @compileError(std.fmt.comptimePrint("reflection expectation failed at line {d}", .{line}));
+}
+
+const Described = struct {
+    key: zerde.ByteString,
+    commit_time: [8]u8,
+    record_type: []const u8,
+    level: u8,
+    state: Level,
+    tags: []const u16,
+    nick: ?[]const u8 = null,
+    patch: ??u8 = null,
+    meta: zerde.Raw,
+    wired: Id,
+    rest: ?zerde.Raw = null,
+
+    pub const serde = .{
+        .extras = "rest",
+        .rename_all = .camelCase,
+        .fields = .{
+            .key = .{ .key = 0, .max_len = 1024 },
+            .commit_time = .{ .key = 1 },
+            .record_type = .{ .key = 2, .min_len = 1, .max_len = 63 },
+            .level = .{ .key = 3, .min = 1, .max = 9 },
+            .state = .{ .key = 4 },
+            .tags = .{ .rename = "labels", .max_len = 8 },
+            .nick = .{ .optional = .absent },
+        },
+    };
+};
+
+test "reflect lists the fields of a struct as the typed layer sees them" {
+    const info = comptime zerde.reflect.fields(Described, .{});
+    comptime {
+        check(info.len == 11, @src().line);
+        check(std.mem.eql(u8, info[0].name, "key") and info[0].wire.integer == 0 and info[0].kind == .byte_string, @src().line);
+        check(info[0].bounds.max_len == 1024 and info[0].bounds.min_len == 0, @src().line);
+        check(info[1].kind == .byte_array and info[1].wire.integer == 1, @src().line);
+        check(info[2].kind == .text and info[2].bounds.min_len == 1 and info[2].bounds.max_len == 63, @src().line);
+        check(info[3].kind == .int and info[3].type == u8 and info[3].bounds.min.? == 1 and info[3].bounds.max.? == 9, @src().line);
+        check(info[4].kind == .@"enum" and info[4].type == Level, @src().line);
+        // A rename wins over rename_all; a field with neither is camelCased.
+        check(info[5].kind == .list and std.mem.eql(u8, info[5].wire.text, "labels"), @src().line);
+        check(info[6].kind == .optional and info[6].optional == .absent and info[6].has_default and !info[6].nested_optional, @src().line);
+        check(info[7].nested_optional and info[7].kind == .optional, @src().line);
+        check(info[8].kind == .raw and !info[8].has_default and !info[8].extras, @src().line);
+        check(info[9].kind == .hook, @src().line);
+        check(info[10].extras and info[10].kind == .optional, @src().line);
+        check(!info[5].has_default and info[5].optional == .lenient, @src().line);
+    }
+    // A field whose default is null has a default (the outer optional is set), and its value is null.
+    try std.testing.expect(zerde.reflect.defaultOf(Described, "patch") != null);
+    try std.testing.expect(zerde.reflect.defaultOf(Described, "patch").? == null);
+    try std.testing.expect(zerde.reflect.defaultOf(Described, "level") == null);
+    try std.testing.expectEqual(@as(u8, 1), comptime zerde.reflect.intRange(u8).min + 1);
+    try std.testing.expectEqual(@as(i128, 255), comptime zerde.reflect.intRange(u8).max);
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(u64)), comptime zerde.reflect.intRange(u64).max);
+    try std.testing.expect(zerde.reflect.childOf([]const u16) == u16);
+}
+
+test "reflect follows the call site's overrides and renames" {
+    const Plain = struct { first_name: []const u8, age: u8 };
+    const info = comptime zerde.reflect.fields(Plain, .{ .rename_all = .camelCase, .fields = .{ .age = .{ .key = 7, .max = 120 } } });
+    comptime {
+        check(std.mem.eql(u8, info[0].wire.text, "firstName"), @src().line);
+        check(info[1].wire.integer == 7 and info[1].bounds.max.? == 120, @src().line);
+    }
+}
+
+test "reflect gives the order a write emits, extras left out" {
+    const declaration = comptime zerde.reflect.writeOrder(Described, zerde.cbor, .{}, .{});
+    const deterministic = comptime zerde.reflect.writeOrder(Described, zerde.cbor, .{}, .{ .deterministic = true });
+    comptime {
+        check(declaration.len == 10 and declaration[0] == 0 and declaration[9] == 9, @src().line);
+        // Integer keys ascending (0, 1, 2, 3, 4), then the text keys by length, then bytewise.
+        check(deterministic.len == 10, @src().line);
+        for (0..5) |index| check(deterministic[index] == index, @src().line);
+        // Then by length: "meta" (8) and "nick" (6), "patch" (7) and "wired" (9), "labels" (5).
+        check(deterministic[5] == 8 and deterministic[6] == 6 and deterministic[7] == 7 and deterministic[8] == 9 and deterministic[9] == 5, @src().line);
+    }
+}
+
+test "reflect describes unions and enums" {
+    const ops = comptime zerde.reflect.variants(Op, .{});
+    comptime {
+        check(ops.len == 3, @src().line);
+        check(ops[0].kind == .none and ops[0].wire.integer == 1 and std.mem.eql(u8, ops[0].name, "ping"), @src().line);
+        check(ops[1].kind == .int and ops[1].wire.integer == 2, @src().line);
+        check(ops[2].kind == .@"struct" and ops[2].wire.integer == 24, @src().line);
+    }
+    const names = comptime zerde.reflect.variants(Shape, .{});
+    comptime check(names[1].wire == .text and std.mem.eql(u8, names[1].wire.text, "circle"), @src().line);
+    const level = comptime zerde.reflect.enumInfo(Level, .{});
+    comptime {
+        check(level.repr == .integer and level.values.len == 2, @src().line);
+        check(level.values[1].value == 9 and std.mem.eql(u8, level.values[1].name, "high"), @src().line);
+    }
+    comptime check(zerde.reflect.enumInfo(enum { a, b }, .{}).repr == .name, @src().line);
+}
+
+/// A generator over the reflection: a TypeScript-like declaration of a struct, built at comptime.
+fn describeStruct(comptime T: type) []const u8 {
+    comptime {
+        var text: []const u8 = "{ ";
+        for (zerde.reflect.fields(T, .{})) |field| {
+            if (field.extras) continue;
+            const name = switch (field.wire) {
+                .text => |t| t,
+                .integer => |n| std.fmt.comptimePrint("{d}", .{n}),
+            };
+            const ts = switch (field.kind) {
+                .int, .float => "number",
+                .text => "string",
+                .byte_string, .byte_array => "bytes",
+                .list => "array",
+                .optional => "maybe",
+                else => "other",
+            };
+            text = text ++ name ++ ": " ++ ts ++ "; ";
+        }
+        return text ++ "}";
+    }
+}
+
+test "a generator can be written against the reflection alone" {
+    try std.testing.expectEqualStrings("{ 0: bytes; 1: bytes; 2: string; 3: number; 4: other; labels: array; nick: maybe; patch: maybe; meta: other; wired: other; }", comptime describeStruct(Described));
+}

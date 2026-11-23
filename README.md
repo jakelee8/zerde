@@ -376,6 +376,25 @@ that is an array of zero or one item, a union as `[tag, payload]`). Declare any 
 
 The hooks work for any struct, union or enum, as a field, an element or an optional, in CBOR and JSON.
 
+### Reflection
+
+`zerde.reflect` describes a schema type as the typed layer sees it, for generators (declarations,
+grammars, printers) that should not re-derive its rules. Everything is comptime and takes the `cfg` a read
+or write takes (`.{}` for none), because call-site overrides and `rename_all` change the wire form:
+
+- `kindOf(T)` is a `Kind`: `bool`, `int`, `float`, `text`, `byte_string`, `byte_array`, `raw`, `optional`,
+  `array`, `list`, `pointer`, `enum`, `struct`, `union`, `hook` or `none`.
+- `fields(T, cfg)` lists a struct's fields in declaration order: the Zig `name`, the `wire` key (text or
+  integer), the field `type` and its `kind`, its `bounds`, its `optional` policy, `nested_optional`,
+  `has_default` and whether it is the `extras` field. `defaultOf(T, name)` gives a default.
+- `writeOrder(T, Format, cfg, format_cfg)` gives the indexes of the members a write emits, in order,
+  for example `zerde.reflect.writeOrder(T, zerde.cbor, .{}, .{ .deterministic = true })`.
+- `variants(T, cfg)` lists a union's variants with their `wire` key and payload type; `enumInfo(T, cfg)`
+  an enum's values and how a write carries them; `intRange(T)` and `childOf(T)`.
+
+A description is shallow: a field carries its `type`, and a generator describes that in turn, so recursive
+types need no care. `tests/typed_tests.zig` builds a small declaration generator from it.
+
 ### Raw items
 
 A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked

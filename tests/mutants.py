@@ -245,6 +245,20 @@ MUTANTS = [
     ("json.zig", "                if (!frame.first) try self.writer.writeByte(',');\n                frame.first = false;\n            },\n            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {", "                frame.first = false;\n            },\n            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {"),
     ("json.zig", "            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {", "            .object => {},\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {"),
     ("json.zig", "        if (frame.kind == .object) frame.expect_key = true;\n    }\n\n    fn push(self: *Encoder", "        _ = frame;\n    }\n\n    fn push(self: *Encoder"),
+    # Reflection; a reflection expectation that fails is a compile error, which kills the mutant
+    ("reflect.zig", "if (comptime hasAnyHook(T)) return .hook;", "if (comptime hasAnyHook(T) and false) return .hook;"),
+    ("reflect.zig", "        .array => |info| if (info.child == u8) .byte_array else .array,", "        .array => .array,"),
+    ("reflect.zig", "            .slice => if (info.child == u8) .text else .list,", "            .slice => .list,"),
+    ("reflect.zig", "                .wire = meta.effectiveFieldKey(T, name, cfg),\n                .type = FieldType,", "                .wire = .{ .text = name },\n                .type = FieldType,"),
+    ("reflect.zig", "                .bounds = meta.effectiveBounds(T, name, cfg),", "                .bounds = .{},"),
+    ("reflect.zig", "                .optional = meta.effectiveOptionalPolicy(T, name, cfg),", "                .optional = .lenient,"),
+    ("reflect.zig", "                .has_default = attrs.defaultValue(FieldType) != null,", "                .has_default = false,"),
+    ("reflect.zig", "                .extras = meta.isExtrasField(T, name),", "                .extras = false,"),
+    ("reflect.zig", "                    .optional => |o| @typeInfo(o.child) == .optional,", "                    .optional => false,"),
+    ("reflect.zig", "            if (meta.isExtrasField(T, info.field_names[index])) continue;", "            _ = 0;"),
+    ("reflect.zig", "                .wire = meta.effectiveFieldKey(T, name, cfg),\n                .type = PayloadType,", "                .wire = .{ .text = name },\n                .type = PayloadType,"),
+    ("reflect.zig", "return .{ .repr = meta.effectiveEnumRepr(T, cfg), .values = &final };", "return .{ .repr = .name, .values = &final };"),
+    ("reflect.zig", "        const order = typed.structFieldOrder(T, Format, info, cfg, policy);", "        const order = typed.structFieldOrder(T, Format, info, cfg, meta.FieldOrderPolicy{});"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

@@ -120,7 +120,7 @@ fn fieldOrderPolicy(comptime Format: type, comptime format_cfg: anytype) meta.Fi
 }
 
 /// Indexes of `T`'s fields in the order they are written.
-fn structFieldOrder(
+pub fn structFieldOrder(
     comptime T: type,
     comptime Format: type,
     comptime info: std.builtin.Type.Struct,
