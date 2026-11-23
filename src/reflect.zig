@@ -26,7 +26,7 @@ pub const Kind = enum {
     byte_string,
     /// `[N]u8`: a byte string of exactly N bytes.
     byte_array,
-    /// `zerde.Raw`: an item kept as its bytes.
+    /// a `Raw`: an item kept as its bytes.
     raw,
     /// `?T`, and `??T` as a struct field (see `FieldInfo.nested_optional`).
     optional,
@@ -64,7 +64,7 @@ pub fn kindOf(comptime T: type) Kind {
             .slice => if (info.child == u8) .text else .list,
             else => .pointer,
         },
-        .@"struct" => if (T == typed.ByteString) .byte_string else if (T == typed.Raw) .raw else .@"struct",
+        .@"struct" => if (T == typed.ByteString) .byte_string else if (typed.isRaw(T)) .raw else .@"struct",
         else => @compileError("zerde has no wire form for " ++ @typeName(T)),
     };
 }

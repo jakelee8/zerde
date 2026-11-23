@@ -319,7 +319,7 @@ const Revision = struct {
 ### Extras
 
 A struct can collect the members it does not declare: `pub const serde = .{ .extras = "rest" }` names a
-field of type `zerde.Raw` (an empty map when there are none) or `?zerde.Raw` (null when there are none).
+field of type `cbor.Raw` or `json.Raw` (an empty map when there are none) or an optional one (null when there are none).
 The extras are one map item of the format, and the field is not a member itself, so a key spelled `rest`
 is just another extra. Unknown members go to it instead of being skipped or refused by
 `deny_unknown_fields`; their keys must be text (`error.UnexpectedType` otherwise) and their values are
@@ -407,11 +407,11 @@ that skips ASCII in vector chunks (native, or WebAssembly with SIMD) and the wor
 
 ### Raw items
 
-A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked
+A field of type `cbor.Raw` or `json.Raw` (each a `struct { bytes: []const u8 }` that carries its format in its type) is one item of that format, checked
 and kept as its own bytes instead of decoded: a CBOR item, or the text of a JSON value without the
 whitespace around it. The read checks it as the mode and limits say, so a strict read refuses a
 non-deterministic item inside it, and a lenient read takes any well-formed one (CBOR tags included).
-Writing puts the bytes back unchanged, so a `Raw` must be written in the format it was read from. It is
+A `cbor.Raw` cannot be written as JSON, nor a `json.Raw` as CBOR: that does not compile. It is
 copied, or borrowed from the input in an aliased parse, like a `ByteString`.
 
 ### Reader modes and limits

@@ -40,14 +40,32 @@ pub const ByteString = struct {
     bytes: []const u8,
 };
 
-/// One data item of the format being read, validated and kept as its own bytes instead of being
-/// decoded: a CBOR item, or JSON text. Reading checks it as the read's mode and limits say (a strict
-/// read refuses a non-deterministic item inside it) and returns exactly the bytes that were read;
-/// writing puts them back verbatim, so the format must be the one it was read from. `zerde.free`
-/// releases it like any slice.
-pub const Raw = struct {
-    bytes: []const u8,
-};
+/// The formats that keep an item as its bytes.
+pub const RawFormat = enum { cbor, json };
+
+/// One data item of one format, validated and kept as its own bytes instead of being decoded:
+/// `cbor.Raw` is a CBOR item, `json.Raw` is JSON text. The format is in the type, so a `Raw` of
+/// one format cannot be written in another (that does not compile). Reading checks it as the read's
+/// mode and limits say (a strict read refuses a non-deterministic item inside it) and returns
+/// exactly the bytes that were read; a write checks it again and puts it back, in canonical form
+/// when the write is deterministic. `zerde.free` releases it like any slice.
+pub fn RawOf(comptime format: RawFormat) type {
+    return struct {
+        bytes: []const u8,
+
+        pub const zerde_raw_format = format;
+    };
+}
+
+/// Whether `T` is a `Raw` of some format.
+pub fn isRaw(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "zerde_raw_format");
+}
+
+/// Whether `T` is a `Raw`, or an optional one: what an extras field may be.
+pub fn isRawOrOptional(comptime T: type) bool {
+    return isRaw(T) or (@typeInfo(T) == .optional and isRaw(@typeInfo(T).optional.child));
+}
 
 /// One step of a pull read: a scalar, or the start or end of an array or map. A map's events are
 /// its keys and values alternately, so a key is the event before its value. A text or byte string
@@ -318,9 +336,9 @@ fn serializeValue(
                 try emitByteString(serializer, value.bytes);
                 return;
             }
-            if (T == Raw) {
-                if (!@hasDecl(SerializerType, "emitRaw")) {
-                    @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a Raw item");
+            if (comptime isRaw(T)) {
+                if (!@hasDecl(SerializerType, "emitRaw") or SerializerType.raw_format != T.zerde_raw_format) {
+                    @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
                 }
                 try serializer.emitRaw(value.bytes);
                 return;
@@ -521,8 +539,8 @@ fn deserializeValue(
         .pointer => |info| try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}),
         .@"struct" => |info| if (T == ByteString)
             ByteString{ .bytes = try readByteSlice(allocator, deserializer, .{}) }
-        else if (T == Raw)
-            Raw{ .bytes = try readRawSlice(allocator, deserializer, .{}) }
+        else if (comptime isRaw(T))
+            T{ .bytes = try readRawSlice(T, allocator, deserializer, .{}) }
         else
             try deserializeStruct(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
         else => error.UnsupportedType,
@@ -872,10 +890,10 @@ fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: m
 }
 
 /// Reads the next item as raw bytes into memory the caller owns, or into the input when the parse aliases it.
-fn readRawSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
+fn readRawSlice(comptime T: type, allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
     const DeserializerType = @TypeOf(deserializer.*);
-    if (!@hasDecl(DeserializerType, "readRaw")) {
-        @compileError("format " ++ @typeName(DeserializerType) ++ " cannot read a Raw item");
+    if (!@hasDecl(DeserializerType, "readRaw") or DeserializerType.raw_format != T.zerde_raw_format) {
+        @compileError("format " ++ @typeName(DeserializerType) ++ " cannot read a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
     }
     const token = try deserializer.readRaw(allocator);
     try checkLength(bounds, token.bytes.len);
@@ -992,7 +1010,7 @@ fn deserializeStruct(
     return result;
 }
 
-/// The extras field holds one map item, as `zerde.Raw`, or `?zerde.Raw` that is null when there is none.
+/// The extras field holds one map item, as a `Raw`, or an optional one, that is null when there is none.
 fn checkExtrasField(comptime T: type, comptime info: std.builtin.Type.Struct, comptime DeserializerType: type) void {
     if (!@hasDecl(DeserializerType, "captureExtra")) {
         @compileError("format " ++ @typeName(DeserializerType) ++ " cannot collect extras: " ++ @typeName(T));
@@ -1000,8 +1018,8 @@ fn checkExtrasField(comptime T: type, comptime info: std.builtin.Type.Struct, co
     const name = comptime meta.extrasField(T).?;
     inline for (info.field_names, info.field_types) |field_name, field_type| {
         if (comptime std.mem.eql(u8, field_name, name)) {
-            if (field_type != Raw and field_type != ?Raw) {
-                @compileError("the extras field must be zerde.Raw or ?zerde.Raw: " ++ @typeName(T) ++ "." ++ name);
+            if (comptime !isRawOrOptional(field_type)) {
+                @compileError("the extras field must be a Raw or an optional Raw: " ++ @typeName(T) ++ "." ++ name);
             }
             return;
         }
@@ -1022,8 +1040,8 @@ fn storeExtras(
     const name = comptime meta.extrasField(T).?;
     inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
         if (comptime std.mem.eql(u8, field_name, name)) {
-            const owned = try deserializer.finishExtras(allocator, mark, field_type == Raw);
-            @field(result.*, field_name) = if (field_type == Raw) .{ .bytes = owned.? } else if (owned) |bytes| .{ .bytes = bytes } else null;
+            const owned = try deserializer.finishExtras(allocator, mark, isRaw(field_type));
+            @field(result.*, field_name) = if (comptime isRaw(field_type)) .{ .bytes = owned.? } else if (owned) |bytes| .{ .bytes = bytes } else null;
             seen[i] = true;
         }
     }
@@ -1145,7 +1163,7 @@ fn deserializeBounded(
         },
         .@"struct" => {
             if (T == ByteString) return .{ .bytes = try readByteSlice(allocator, deserializer, bounds) };
-            if (T == Raw) return .{ .bytes = try readRawSlice(allocator, deserializer, bounds) };
+            if (comptime isRaw(T)) return .{ .bytes = try readRawSlice(T, allocator, deserializer, bounds) };
             @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T));
         },
         else => @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T)),

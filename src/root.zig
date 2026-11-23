@@ -22,8 +22,10 @@ const typed = @import("typed.zig");
 pub const FieldCase = meta.FieldCase;
 /// A variable-length byte string field; see `typed.ByteString`.
 pub const ByteString = typed.ByteString;
-/// A validated item kept as its bytes; see `typed.Raw`.
-pub const Raw = typed.Raw;
+/// The format a `cbor.Raw` or `json.Raw` is an item of; see `typed.RawOf`.
+pub const RawFormat = typed.RawFormat;
+/// Whether a type is a `cbor.Raw` or a `json.Raw`.
+pub const isRaw = typed.isRaw;
 /// One step of a pull read; see `typed.Event`.
 pub const Event = typed.Event;
 pub const SerdeConfig = meta.SerdeConfig;

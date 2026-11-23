@@ -1162,7 +1162,11 @@ test "strict checks the order of text keys in a union that also has integer keys
 
 // ---- Raw ---------------------------------------------------------------------------------------------
 
-const Framed = struct { id: u8, meta: zerde.Raw, after: ?u8 = null };
+fn FramedOf(comptime R: type) type {
+    return struct { id: u8, meta: R, after: ?u8 = null };
+}
+const Framed = FramedOf(zerde.cbor.Raw);
+const FramedJson = FramedOf(zerde.json.Raw);
 
 test "a CBOR Raw is the item's own bytes, whatever its spelling" {
     // meta is an indefinite map with a non-minimal head and a chunked string: a lenient read keeps it as it is.
@@ -1226,50 +1230,54 @@ test "Raw borrows the input when the parse aliases it, and owns a copy otherwise
 }
 
 test "Raw in an array, an optional and a union" {
-    const Holder = struct { items: []const zerde.Raw, maybe: ?zerde.Raw };
+    const Holder = struct { items: []const zerde.cbor.Raw, maybe: ?zerde.cbor.Raw };
     const input = [_]u8{ 0xa2, 0x65, 'i', 't', 'e', 'm', 's', 0x82, 0x01, 0x61, 'x', 0x65, 'm', 'a', 'y', 'b', 'e', 0xf6 };
     const decoded = try zerde.cbor.parseSlice(Holder, allocator, &input);
     defer zerde.free(allocator, decoded);
     try std.testing.expectEqual(@as(usize, 2), decoded.items.len);
     try std.testing.expectEqualSlices(u8, &.{0x01}, decoded.items[0].bytes);
     try std.testing.expectEqualSlices(u8, &.{ 0x61, 'x' }, decoded.items[1].bytes);
-    try std.testing.expectEqual(@as(?zerde.Raw, null), decoded.maybe);
+    try std.testing.expectEqual(@as(?zerde.cbor.Raw, null), decoded.maybe);
 }
 
 test "a JSON Raw is the value's own text without the whitespace around it" {
     const input = "{ \"id\" : 7 , \"meta\" :  { \"k\" : [ 1 , 2 ] , \"j\" : \"\\u0041\" }  , \"after\":9}";
-    const decoded = try zerde.json.parseSlice(Framed, allocator, input);
+    const decoded = try zerde.json.parseSlice(FramedJson, allocator, input);
     defer zerde.free(allocator, decoded);
     try std.testing.expectEqualStrings("{ \"k\" : [ 1 , 2 ] , \"j\" : \"\\u0041\" }", decoded.meta.bytes);
     try expectJsonText("{\"id\":7,\"meta\":{ \"k\" : [ 1 , 2 ] , \"j\" : \"\\u0041\" },\"after\":9}", decoded, .{}, .{});
     // It is still checked: syntax, UTF-8, depth, items.
-    try expectJsonError(Framed, error.UnexpectedToken, "{\"id\":1,\"meta\":{\"a\":}}");
-    try expectJsonError(Framed, error.InvalidUtf8, "{\"id\":1,\"meta\":\"\xff\"}");
-    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(Framed, allocator, "{\"id\":1,\"meta\":[[1]]}", .{}, .{ .max_depth = 2 }));
-    try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith(Framed, allocator, "{\"id\":1,\"meta\":[1,2,3]}", .{}, .{ .max_items = 5 }));
+    try expectJsonError(FramedJson, error.UnexpectedToken, "{\"id\":1,\"meta\":{\"a\":}}");
+    try expectJsonError(FramedJson, error.InvalidUtf8, "{\"id\":1,\"meta\":\"\xff\"}");
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(FramedJson, allocator, "{\"id\":1,\"meta\":[[1]]}", .{}, .{ .max_depth = 2 }));
+    try std.testing.expectError(error.TooManyItems, zerde.json.parseSliceWith(FramedJson, allocator, "{\"id\":1,\"meta\":[1,2,3]}", .{}, .{ .max_items = 5 }));
 }
 
 // ---- bounds and check ----------------------------------------------------------------------------------
 
-const Bounded = struct {
-    name: []const u8,
-    blob: zerde.ByteString,
-    items: []const u16,
-    level: u8,
-    note: ?[]const u8 = null,
-    low: i64 = 0,
-    meta: zerde.Raw,
+fn BoundedOf(comptime R: type) type {
+    return struct {
+        name: []const u8,
+        blob: zerde.ByteString,
+        items: []const u16,
+        level: u8,
+        note: ?[]const u8 = null,
+        low: i64 = 0,
+        meta: R,
 
-    pub const serde = .{ .fields = .{
-        .name = .{ .min_len = 1, .max_len = 4 },
-        .blob = .{ .max_len = 3 },
-        .items = .{ .min_len = 1, .max_len = 3 },
-        .level = .{ .min = 10, .max = 20 },
-        .note = .{ .max_len = 2 },
-        .low = .{ .min = -5 },
-        .meta = .{ .max_len = 4 },
-    } };
-};
+        pub const serde = .{ .fields = .{
+            .name = .{ .min_len = 1, .max_len = 4 },
+            .blob = .{ .max_len = 3 },
+            .items = .{ .min_len = 1, .max_len = 3 },
+            .level = .{ .min = 10, .max = 20 },
+            .note = .{ .max_len = 2 },
+            .low = .{ .min = -5 },
+            .meta = .{ .max_len = 4 },
+        } };
+    };
+}
+const Bounded = BoundedOf(zerde.cbor.Raw);
+const BoundedJson = BoundedOf(zerde.json.Raw);
 
 fn boundedJson(name: []const u8, blob: []const u8, items: []const u8, level: []const u8, extra: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\",\"blob\":\"{s}\",\"items\":{s},\"level\":{s},\"meta\":1{s}}}", .{ name, blob, items, level, extra });
@@ -1278,7 +1286,7 @@ fn boundedJson(name: []const u8, blob: []const u8, items: []const u8, level: []c
 test "bounds are enforced on text, bytes, arrays, optionals, raw items and integers" {
     const ok = try boundedJson("abcd", "abc", "[1,2,3]", "20", ",\"note\":\"ab\",\"low\":-5");
     defer allocator.free(ok);
-    const parsed = try zerde.json.parseSlice(Bounded, allocator, ok);
+    const parsed = try zerde.json.parseSlice(BoundedJson, allocator, ok);
     zerde.free(allocator, parsed);
 
     const cases = [_]struct { name: []const u8, blob: []const u8, items: []const u8, level: []const u8, extra: []const u8, err: anyerror }{
@@ -1295,13 +1303,13 @@ test "bounds are enforced on text, bytes, arrays, optionals, raw items and integ
     for (cases) |case| {
         const text = try boundedJson(case.name, case.blob, case.items, case.level, case.extra);
         defer allocator.free(text);
-        try expectJsonError(Bounded, case.err, text);
+        try expectJsonError(BoundedJson, case.err, text);
     }
     // A null optional has no length to bound; a raw item's own length is bounded.
     const with_null = try boundedJson("a", "a", "[1]", "10", ",\"note\":null");
     defer allocator.free(with_null);
-    zerde.free(allocator, try zerde.json.parseSlice(Bounded, allocator, with_null));
-    try expectJsonError(Bounded, error.LengthOutOfBounds, "{\"name\":\"a\",\"blob\":\"a\",\"items\":[1],\"level\":10,\"meta\":12345}");
+    zerde.free(allocator, try zerde.json.parseSlice(BoundedJson, allocator, with_null));
+    try expectJsonError(BoundedJson, error.LengthOutOfBounds, "{\"name\":\"a\",\"blob\":\"a\",\"items\":[1],\"level\":10,\"meta\":12345}");
 }
 
 test "bounds in CBOR, and a length is refused before anything is allocated" {
@@ -1376,20 +1384,28 @@ test "an indefinite array stops growing at its bound, and bin checks too" {
 
 // ---- extras ----------------------------------------------------------------------------------------------
 
-const WithExtras = struct {
-    id: u8,
-    name: []const u8,
-    rest: zerde.Raw,
+fn WithExtrasOf(comptime R: type) type {
+    return struct {
+        id: u8,
+        name: []const u8,
+        rest: R,
 
-    pub const serde = .{ .extras = "rest" };
-};
+        pub const serde = .{ .extras = "rest" };
+    };
+}
+const WithExtras = WithExtrasOf(zerde.cbor.Raw);
+const WithExtrasJson = WithExtrasOf(zerde.json.Raw);
 
-const MaybeExtras = struct {
-    id: u8,
-    rest: ?zerde.Raw = null,
+fn MaybeExtrasOf(comptime R: type) type {
+    return struct {
+        id: u8,
+        rest: ?R = null,
 
-    pub const serde = .{ .extras = "rest", .deny_unknown_fields = true };
-};
+        pub const serde = .{ .extras = "rest", .deny_unknown_fields = true };
+    };
+}
+const MaybeExtras = MaybeExtrasOf(zerde.cbor.Raw);
+const MaybeExtrasJson = MaybeExtrasOf(zerde.json.Raw);
 
 test "CBOR extras collect the unknown members as one map in key order" {
     // id, name, then z, a and bb in that order, which is not key order.
@@ -1440,7 +1456,7 @@ test "without unknown members the extras are an empty map, or null for an option
     try std.testing.expectEqualSlices(u8, &.{0xa0}, decoded.rest.bytes);
     try expectCborBytes(&input, decoded, .{}, .{ .deterministic = true });
     const maybe = try zerde.cbor.parseSlice(MaybeExtras, allocator, &.{ 0xa1, 0x62, 'i', 'd', 0x01 });
-    try std.testing.expectEqual(@as(?zerde.Raw, null), maybe.rest);
+    try std.testing.expectEqual(@as(?zerde.cbor.Raw, null), maybe.rest);
     try expectCborBytes(&.{ 0xa1, 0x62, 'i', 'd', 0x01 }, maybe, .{}, .{ .deterministic = true });
     // The default write puts the extras after the declared members.
     const extra = try zerde.cbor.parseSlice(MaybeExtras, allocator, &.{ 0xa2, 0x61, 'a', 0x05, 0x62, 'i', 'd', 0x01 });
@@ -1481,7 +1497,7 @@ test "a struct with extras inside another keeps its own" {
     const Outer = struct {
         inner: WithExtras,
         tag: u8,
-        rest: zerde.Raw,
+        rest: zerde.cbor.Raw,
 
         pub const serde = .{ .extras = "rest" };
     };
@@ -1530,16 +1546,16 @@ test "a struct with extras inside another keeps its own" {
 
 test "JSON extras keep their members in input order, with values as read" {
     const input = "{\"id\":1,\"z\" : [ 1 , 2 ],\"name\":\"n\",\"k\\u00e9\":{ \"x\" : null }}";
-    const decoded = try zerde.json.parseSlice(WithExtras, allocator, input);
+    const decoded = try zerde.json.parseSlice(WithExtrasJson, allocator, input);
     defer zerde.free(allocator, decoded);
     try std.testing.expectEqualStrings("{\"z\":[ 1 , 2 ],\"k\xc3\xa9\":{ \"x\" : null }}", decoded.rest.bytes);
     try expectJsonText("{\"id\":1,\"name\":\"n\",\"z\":[ 1 , 2 ],\"k\xc3\xa9\":{ \"x\" : null }}", decoded, .{}, .{});
     // No unknown members: `{}`, or null; both write nothing.
-    const none = try zerde.json.parseSlice(WithExtras, allocator, "{\"id\":1,\"name\":\"n\"}");
+    const none = try zerde.json.parseSlice(WithExtrasJson, allocator, "{\"id\":1,\"name\":\"n\"}");
     defer zerde.free(allocator, none);
     try std.testing.expectEqualStrings("{}", none.rest.bytes);
     try expectJsonText("{\"id\":1,\"name\":\"n\"}", none, .{}, .{});
-    const maybe = try zerde.json.parseSlice(MaybeExtras, allocator, "{\"id\":1}");
+    const maybe = try zerde.json.parseSlice(MaybeExtrasJson, allocator, "{\"id\":1}");
     try expectJsonText("{\"id\":1}", maybe, .{}, .{});
 }
 
@@ -1547,26 +1563,26 @@ test "a JSON extras member that repeats a declared one is refused, however it is
     for ([_][]const u8{ "{\"id\":2}", "{\"\\u0069d\":2}", "{\"x\":1,\"i\\u0064\":2}", "{\"\\u0069\\u0064\":2}" }) |rest| {
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
-        const clash = MaybeExtras{ .id = 1, .rest = .{ .bytes = rest } };
+        const clash = MaybeExtrasJson{ .id = 1, .rest = .{ .bytes = rest } };
         try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.json, &out.writer, clash, .{}, .{}));
     }
     // Close but not equal is fine.
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try zerde.serializeWith(zerde.json, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = "{\"idx\":2,\"i\":3,\"\\u00e9\":4}" } }, .{}, .{});
+    try zerde.serializeWith(zerde.json, &out.writer, MaybeExtrasJson{ .id = 1, .rest = .{ .bytes = "{\"idx\":2,\"i\":3,\"\\u00e9\":4}" } }, .{}, .{});
     try std.testing.expectEqualStrings("{\"id\":1,\"idx\":2,\"i\":3,\"\\u00e9\":4}", out.written());
     // A repeated key in the input is still refused as a duplicate.
-    try expectJsonError(MaybeExtras, error.DuplicateField, "{\"id\":1,\"id\":2}");
+    try expectJsonError(MaybeExtrasJson, error.DuplicateField, "{\"id\":1,\"id\":2}");
 }
 
 test "JSON extras are checked while they are read" {
-    try expectJsonError(WithExtras, error.UnexpectedToken, "{\"id\":1,\"name\":\"n\",\"x\":{\"a\":}}");
-    try expectJsonError(WithExtras, error.InvalidUtf8, "{\"id\":1,\"name\":\"n\",\"x\":\"\xff\"}");
-    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(WithExtras, allocator, "{\"id\":1,\"name\":\"n\",\"x\":[[1]]}", .{}, .{ .max_depth = 2 }));
+    try expectJsonError(WithExtrasJson, error.UnexpectedToken, "{\"id\":1,\"name\":\"n\",\"x\":{\"a\":}}");
+    try expectJsonError(WithExtrasJson, error.InvalidUtf8, "{\"id\":1,\"name\":\"n\",\"x\":\"\xff\"}");
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(WithExtrasJson, allocator, "{\"id\":1,\"name\":\"n\",\"x\":[[1]]}", .{}, .{ .max_depth = 2 }));
 }
 
 test "extras keys are written escaped, and a malformed extras item is an error" {
-    const decoded = try zerde.json.parseSlice(MaybeExtras, allocator, "{\"id\":1,\"a\\\"b\":1,\"c\\nd\":2}");
+    const decoded = try zerde.json.parseSlice(MaybeExtrasJson, allocator, "{\"id\":1,\"a\\\"b\":1,\"c\\nd\":2}");
     defer zerde.free(allocator, decoded);
     try std.testing.expectEqualStrings("{\"a\\\"b\":1,\"c\\nd\":2}", decoded.rest.?.bytes);
     try expectJsonText("{\"id\":1,\"a\\\"b\":1,\"c\\nd\":2}", decoded, .{}, .{});
@@ -1576,7 +1592,7 @@ test "extras keys are written escaped, and a malformed extras item is an error" 
     try std.testing.expectError(error.UnexpectedType, zerde.serializeWith(zerde.cbor, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = &.{0x01} } }, .{}, .{}));
     try std.testing.expectError(error.UnexpectedType, zerde.serializeWith(zerde.cbor, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = &.{ 0xbf, 0xff } } }, .{}, .{}));
     try std.testing.expectError(error.UnexpectedEndOfInput, zerde.serializeWith(zerde.cbor, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = &.{ 0xa1, 0x61 } } }, .{}, .{}));
-    try std.testing.expectError(error.UnexpectedToken, zerde.serializeWith(zerde.json, &out.writer, MaybeExtras{ .id = 1, .rest = .{ .bytes = "[1]" } }, .{}, .{}));
+    try std.testing.expectError(error.UnexpectedToken, zerde.serializeWith(zerde.json, &out.writer, MaybeExtrasJson{ .id = 1, .rest = .{ .bytes = "[1]" } }, .{}, .{}));
 }
 
 test "extras that sort after a declared member are written after it" {
@@ -2398,9 +2414,9 @@ const Described = struct {
     tags: []const u16,
     nick: ?[]const u8 = null,
     patch: ??u8 = null,
-    meta: zerde.Raw,
+    meta: zerde.cbor.Raw,
     wired: Id,
-    rest: ?zerde.Raw = null,
+    rest: ?zerde.cbor.Raw = null,
 
     pub const serde = .{
         .extras = "rest",

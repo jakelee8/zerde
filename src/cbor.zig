@@ -37,6 +37,9 @@ pub const max_nesting = 128;
 /// The tag of self-described CBOR (RFC 8949 §3.4.6), which has no meaning to a reader.
 const self_described_tag = 55799;
 
+/// One CBOR data item kept as its bytes; see `typed.RawOf`.
+pub const Raw = typed.RawOf(.cbor);
+
 pub const ReadConfig = struct {
     max_input_bytes: usize = 16 * 1024 * 1024,
     borrow_strings: bool = false,
@@ -298,7 +301,9 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             return .{ .writer = self.writer, .deterministic = deterministic };
         }
 
-        /// Writes an item that was read as `zerde.Raw`, unchanged.
+        pub const raw_format: typed.RawFormat = .cbor;
+
+        /// Writes an item that was read as `cbor.Raw`, unchanged.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try self.writer.writeAll(value);
         }
@@ -552,6 +557,8 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// The next item as the bytes it was read from, checked as the mode and limits say. A
         /// strict read refuses a non-deterministic item here too; a lenient one takes any well-formed
         /// item, tags included.
+        pub const raw_format: typed.RawFormat = .cbor;
+
         pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
             _ = allocator;
             const start = self.index;
@@ -1565,7 +1572,7 @@ pub const ValueWriter = struct {
         try self.afterItem();
     }
 
-    /// Writes an item that is already CBOR, unchanged: a `zerde.Raw` that was read, say.
+    /// Writes an item that is already CBOR, unchanged: a `Raw` that was read, say.
     pub fn writeRaw(self: *ValueWriter, bytes: []const u8) !void {
         try self.beforeItem();
         try self.sink().writeAll(bytes);

@@ -26,6 +26,9 @@ pub const BytesEncoding = enum {
 };
 
 /// Reader-side limits and aliasing policy.
+/// One JSON value kept as its text; see `typed.RawOf`.
+pub const Raw = typed.RawOf(.json);
+
 pub const ReadConfig = struct {
     max_input_bytes: usize = 16 * 1024 * 1024,
     borrow_strings: bool = false,
@@ -194,7 +197,9 @@ pub fn JsonSerializer(comptime Config: type) type {
             return .{ .writer = self.writer, .encoding = bytesEncoding(Config, self.cfg) };
         }
 
-        /// Writes JSON text that was read as `zerde.Raw`, unchanged.
+        pub const raw_format: typed.RawFormat = .json;
+
+        /// Writes JSON text that was read as `json.Raw`, unchanged.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try self.writer.writeAll(value);
         }
@@ -593,6 +598,8 @@ pub fn JsonDeserializer(comptime Config: type) type {
         }
 
         /// The next value as the text it was read from, without the whitespace around it.
+        pub const raw_format: typed.RawFormat = .json;
+
         pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
             self.parser.skipWhitespace();
             const start = self.parser.index;
@@ -1010,7 +1017,7 @@ pub const ValueWriter = struct {
         try self.afterValue();
     }
 
-    /// Writes JSON text that is already valid, unchanged: a `zerde.Raw` that was read, say.
+    /// Writes JSON text that is already valid, unchanged: a `Raw` that was read, say.
     pub fn writeRaw(self: *ValueWriter, text: []const u8) !void {
         try self.beforeValue();
         try self.sink().writeAll(text);
