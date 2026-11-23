@@ -231,6 +231,20 @@ MUTANTS = [
     ("json.zig", "                try writeEscapedString(out, value);\n                try out.writeByte(':');", "                try out.writeAll(value);\n                try out.writeByte(':');"),
     ("json.zig", "    pub fn finish(self: *ValueWriter) !void {\n        if (self.depth != 0) return error.UnbalancedContainers;", "    pub fn finish(self: *ValueWriter) !void {\n        if (self.depth != 0 and false) return error.UnbalancedContainers;"),
     ("json.zig", "            if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;\n            try writeEscapedString(writer, value);", "            try writeEscapedString(writer, value);"),
+    # Wire type hooks
+    ("typed.zig", "        try value.zerdeEncode(&encoder);\n        return;", "        _ = &encoder;\n        return;"),
+    ("typed.zig", "        if (!reader.done) return error.HookIncomplete;", "        _ = 0;"),
+    ("typed.zig", "        var reader = deserializer.pullView(allocator);\n        defer reader.deinit();", "        var reader = deserializer.pullView(allocator);"),
+    ("typed.zig", "        if (!borrowed_strings) value.zerdeFree(allocator);", "        _ = value;"),
+    ("cbor.zig", "    pub fn beginArray(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 4, len);", "    pub fn beginArray(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 4, len + 1);"),
+    ("cbor.zig", "    pub fn beginMap(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 5, len);", "    pub fn beginMap(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 5, len + 1);"),
+    ("cbor.zig", "            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };", "            return .{ .d = d, .owns = false, .base = 0, .allocator = allocator };"),
+    ("cbor.zig", "            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };", "            return .{ .d = d, .owns = true, .base = d.stack_len, .allocator = allocator };"),
+    ("json.zig", "            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };", "            return .{ .d = d, .owns = false, .base = 0, .allocator = allocator };"),
+    ("json.zig", "                if (!frame.first) try self.writer.writeByte(',');\n                frame.first = false;\n                try writeEscapedString(self.writer, value);", "                frame.first = false;\n                try writeEscapedString(self.writer, value);"),
+    ("json.zig", "                if (!frame.first) try self.writer.writeByte(',');\n                frame.first = false;\n            },\n            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {", "                frame.first = false;\n            },\n            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {"),
+    ("json.zig", "            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {", "            .object => {},\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {"),
+    ("json.zig", "        if (frame.kind == .object) frame.expect_key = true;\n    }\n\n    fn push(self: *Encoder", "        _ = frame;\n    }\n\n    fn push(self: *Encoder"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

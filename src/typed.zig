@@ -23,6 +23,8 @@ pub const Error = Allocator.Error || error{
     LengthMismatch,
     /// A field's length (`min_len`, `max_len`) is outside its bounds.
     LengthOutOfBounds,
+    /// A decode hook left part of its item unread.
+    HookIncomplete,
     /// A field's integer value (`min`, `max`) is outside its bounds.
     ValueOutOfRange,
 };
@@ -194,6 +196,14 @@ fn serializeValue(
 ) !void {
     const T = @TypeOf(value);
     const SerializerType = @TypeOf(serializer.*);
+    if (comptime hasHook(T, "zerdeEncode")) {
+        if (!@hasDecl(SerializerType, "encoder")) {
+            @compileError("format " ++ @typeName(SerializerType) ++ " cannot call the encode hook of " ++ @typeName(T));
+        }
+        var encoder = serializer.encoder();
+        try value.zerdeEncode(&encoder);
+        return;
+    }
     switch (@typeInfo(T)) {
         .bool => try serializer.emitBool(value),
         .int, .comptime_int => try serializer.emitInteger(value),
@@ -421,6 +431,14 @@ fn declaredKeys(comptime T: type, comptime info: std.builtin.Type.Struct, compti
     }
 }
 
+/// Whether a user type declares the wire hook `name`: `zerdeDecode`, `zerdeEncode` or `zerdeFree`.
+fn hasHook(comptime T: type, comptime name: []const u8) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, name),
+        else => false,
+    };
+}
+
 /// Bytes go to the format's byte-string token; a format with none carries them as a string.
 fn emitByteString(serializer: anytype, bytes: []const u8) !void {
     if (@hasDecl(@TypeOf(serializer.*), "emitBytes")) {
@@ -458,6 +476,17 @@ fn deserializeValue(
     comptime track_diagnostics: bool,
 ) anyerror!T {
     const DeserializerType = @TypeOf(deserializer.*);
+    if (comptime hasHook(T, "zerdeDecode")) {
+        if (!@hasDecl(DeserializerType, "pullView")) {
+            @compileError("format " ++ @typeName(DeserializerType) ++ " cannot call the decode hook of " ++ @typeName(T));
+        }
+        var reader = deserializer.pullView(allocator);
+        defer reader.deinit();
+        const decoded = try T.zerdeDecode(allocator, &reader);
+        // The hook reads one whole item, no less.
+        if (!reader.done) return error.HookIncomplete;
+        return decoded;
+    }
     return switch (@typeInfo(T)) {
         .bool => try deserializer.readBool(),
         // Formats parse numbers once into a common token; the typed layer is responsible for exact casts.
@@ -1182,6 +1211,10 @@ fn freeTyped(comptime T: type, allocator: Allocator, value: T) void {
 }
 
 fn freeTypedPartial(comptime T: type, allocator: Allocator, value: T, borrowed_strings: bool) void {
+    if (comptime hasHook(T, "zerdeFree")) {
+        if (!borrowed_strings) value.zerdeFree(allocator);
+        return;
+    }
     switch (@typeInfo(T)) {
         .bool, .int, .comptime_int, .float, .comptime_float, .@"enum" => {},
         .optional => {

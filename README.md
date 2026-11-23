@@ -358,6 +358,24 @@ an unbalanced container is `error.UnbalancedContainers`. CBOR arrays and maps ar
 lengths are definite; JSON arrays are written as they come. JSON bytes follow the config's `bytes`
 encoding, and a NaN or infinity is refused.
 
+### Wire types with hooks
+
+A type decides its own wire form with hooks, for a layout the typed walk cannot derive (a span, an optional
+that is an array of zero or one item, a union as `[tag, payload]`). Declare any of:
+
+- `pub fn zerdeDecode(allocator: std.mem.Allocator, reader: anytype) anyerror!T`: reads exactly one item
+  from a pull reader (`next`, `skip`; see above) under the read's mode and limits. A hook that leaves part
+  of its item unread is `error.HookIncomplete`.
+- `pub fn zerdeEncode(self: T, encoder: anytype) anyerror!void`: writes one item through an `Encoder`:
+  `writeNull`, `writeBool`, `writeInt`, `writeFloat`, `writeText`, `writeBytes`, `writeRaw`, and
+  `beginArray(len)`/`endArray`, `beginMap(len)`/`endMap`. It streams, with no buffering and no
+  allocation, so the caller states each length up front and writes a map's entries in the order the output
+  needs (for deterministic CBOR, ascending by encoded key).
+- `pub fn zerdeFree(self: T, allocator: std.mem.Allocator) void`: what `zerde.free` calls to release what
+  `zerdeDecode` allocated. Without it the value is left alone.
+
+The hooks work for any struct, union or enum, as a field, an element or an optional, in CBOR and JSON.
+
 ### Raw items
 
 A field of type `zerde.Raw` (`struct { bytes: []const u8 }`) is one item of the format being read, checked

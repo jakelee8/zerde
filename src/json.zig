@@ -179,6 +179,11 @@ pub fn JsonSerializer(comptime Config: type) type {
             }
         }
 
+        /// A streaming writer for a wire type's encode hook; see `Encoder`.
+        pub fn encoder(self: *Self) Encoder {
+            return .{ .writer = self.writer, .encoding = bytesEncoding(Config, self.cfg) };
+        }
+
         /// Writes JSON text that was read as `zerde.Raw`, unchanged.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try self.writer.writeAll(value);
@@ -533,6 +538,11 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return key;
         }
 
+        /// A reader of the next value of this read, for a wire type's decode hook.
+        pub fn pullView(self: *Self, allocator: Allocator) PullReader(Config) {
+            return PullReader(Config).view(self, allocator);
+        }
+
         /// Where the extras of a struct begin, so a struct read inside another keeps its own.
         pub fn extrasMark(self: *Self) usize {
             return self.extras.items.len;
@@ -645,7 +655,10 @@ pub fn pullReader(allocator: Allocator, input: []const u8, comptime cfg: anytype
 
 pub fn PullReader(comptime Config: type) type {
     return struct {
-        d: JsonDeserializer(Config),
+        d: *JsonDeserializer(Config),
+        /// Whether this reader made `d` and frees it; see `cbor.PullReader`.
+        owns: bool,
+        base: usize,
         allocator: Allocator,
         scratch: ?[]u8 = null,
         done: bool = false,
@@ -655,22 +668,32 @@ pub fn PullReader(comptime Config: type) type {
         const Self = @This();
 
         fn init(allocator: Allocator, input: []const u8, cfg: Config) !Self {
-            return .{ .d = JsonDeserializer(Config).initBorrowed(input, cfg), .allocator = allocator };
+            const d = try allocator.create(JsonDeserializer(Config));
+            d.* = JsonDeserializer(Config).initBorrowed(input, cfg);
+            return .{ .d = d, .owns = true, .base = 0, .allocator = allocator };
+        }
+
+        /// A reader of the next value of a deserializer that is already reading.
+        pub fn view(d: *JsonDeserializer(Config), allocator: Allocator) Self {
+            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };
         }
 
         pub fn deinit(self: *Self) void {
             self.release();
-            self.d.deinit(self.allocator);
+            if (self.owns) {
+                self.d.deinit(self.allocator);
+                self.allocator.destroy(self.d);
+            }
         }
 
         /// The next event, or null after the value is complete.
         pub fn next(self: *Self) !?typed.Event {
             self.release();
-            const d = &self.d;
-            if (d.stack_len == 0) {
+            const d = self.d;
+            if (d.stack_len == self.base) {
                 if (self.done) return null;
                 const event = try self.valueEvent();
-                if (d.stack_len == 0) self.done = true;
+                if (d.stack_len == self.base) self.done = true;
                 return event;
             }
             const frame = d.current();
@@ -678,7 +701,7 @@ pub fn PullReader(comptime Config: type) type {
             switch (frame.kind) {
                 .array => {
                     if (!try d.nextArrayItem()) {
-                        self.done = d.stack_len == 0;
+                        self.done = d.stack_len == self.base;
                         return .array_end;
                     }
                     return try self.valueEvent();
@@ -689,7 +712,7 @@ pub fn PullReader(comptime Config: type) type {
                         return try self.valueEvent();
                     }
                     const key = (try d.nextObjectField(self.allocator)) orelse {
-                        self.done = d.stack_len == 0;
+                        self.done = d.stack_len == self.base;
                         return .map_end;
                     };
                     self.want_value[depth] = true;
@@ -728,7 +751,7 @@ pub fn PullReader(comptime Config: type) type {
         }
 
         fn valueEvent(self: *Self) !typed.Event {
-            const d = &self.d;
+            const d = self.d;
             switch (try d.peekKind()) {
                 .null => {
                     try d.readNull();
@@ -755,6 +778,125 @@ pub fn PullReader(comptime Config: type) type {
         }
     };
 }
+
+/// A writer for a wire type's encode hook: values go out as they are written, with no buffering
+/// and no allocation. A map's items are keys (text) and values alternately, in the order the caller
+/// wants them written, and the lengths given to `beginArray` and `beginMap` are ignored. Bytes follow
+/// the config's `bytes` encoding, and a NaN or infinity is refused.
+pub const Encoder = struct {
+    writer: *std.Io.Writer,
+    encoding: BytesEncoding,
+    frames: [128]struct { kind: ContainerKind, first: bool, expect_key: bool } = undefined,
+    depth: usize = 0,
+
+    pub fn writeNull(self: *Encoder) !void {
+        try self.beforeValue();
+        try self.writer.writeAll("null");
+        self.afterValue();
+    }
+
+    pub fn writeBool(self: *Encoder, value: bool) !void {
+        try self.beforeValue();
+        try self.writer.writeAll(if (value) "true" else "false");
+        self.afterValue();
+    }
+
+    pub fn writeInt(self: *Encoder, value: i128) !void {
+        try self.beforeValue();
+        try self.writer.print("{}", .{value});
+        self.afterValue();
+    }
+
+    pub fn writeFloat(self: *Encoder, value: f64) !void {
+        if (!std.math.isFinite(value)) return error.NonFiniteFloat;
+        try self.beforeValue();
+        try self.writer.print("{}", .{value});
+        self.afterValue();
+    }
+
+    /// In a map's key position, this is the key.
+    pub fn writeText(self: *Encoder, value: []const u8) !void {
+        if (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.kind == .object and frame.expect_key) {
+                if (!frame.first) try self.writer.writeByte(',');
+                frame.first = false;
+                try writeEscapedString(self.writer, value);
+                try self.writer.writeByte(':');
+                frame.expect_key = false;
+                return;
+            }
+        }
+        try self.beforeValue();
+        try writeEscapedString(self.writer, value);
+        self.afterValue();
+    }
+
+    pub fn writeBytes(self: *Encoder, value: []const u8) !void {
+        try self.beforeValue();
+        try writeBytesText(self.writer, self.encoding, value);
+        self.afterValue();
+    }
+
+    /// JSON text that is already valid, unchanged.
+    pub fn writeRaw(self: *Encoder, text: []const u8) !void {
+        try self.beforeValue();
+        try self.writer.writeAll(text);
+        self.afterValue();
+    }
+
+    pub fn beginArray(self: *Encoder, len: usize) !void {
+        _ = len;
+        try self.beforeValue();
+        try self.push(.array);
+        try self.writer.writeByte('[');
+    }
+
+    pub fn endArray(self: *Encoder) !void {
+        if (self.depth == 0 or self.frames[self.depth - 1].kind != .array) return error.UnbalancedContainers;
+        try self.writer.writeByte(']');
+        self.depth -= 1;
+        self.afterValue();
+    }
+
+    pub fn beginMap(self: *Encoder, len: usize) !void {
+        _ = len;
+        try self.beforeValue();
+        try self.push(.object);
+        try self.writer.writeByte('{');
+    }
+
+    pub fn endMap(self: *Encoder) !void {
+        if (self.depth == 0 or self.frames[self.depth - 1].kind != .object or !self.frames[self.depth - 1].expect_key) return error.UnbalancedContainers;
+        try self.writer.writeByte('}');
+        self.depth -= 1;
+        self.afterValue();
+    }
+
+    fn beforeValue(self: *Encoder) !void {
+        if (self.depth == 0) return;
+        const frame = &self.frames[self.depth - 1];
+        switch (frame.kind) {
+            .array => {
+                if (!frame.first) try self.writer.writeByte(',');
+                frame.first = false;
+            },
+            .object => if (frame.expect_key) return error.UnexpectedType,
+        }
+    }
+
+    fn afterValue(self: *Encoder) void {
+        if (self.depth == 0) return;
+        const frame = &self.frames[self.depth - 1];
+        if (frame.kind == .object) frame.expect_key = true;
+    }
+
+    fn push(self: *Encoder, kind: ContainerKind) !void {
+        if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;
+        self.frames[self.depth] = .{ .kind = kind, .first = true, .expect_key = true };
+        self.depth += 1;
+    }
+};
 
 /// A writer for a value whose shape is only known while writing; see `cbor.ValueWriter`. A map's
 /// keys are text, and the map is buffered until it closes so its members can be sorted: with

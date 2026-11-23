@@ -2109,3 +2109,273 @@ test "a JSON value writer puts shorter keys first, as deterministic CBOR does" {
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("{\"b\":2,\"aa\":1}", bytes);
 }
+
+// ---- wire types with hooks --------------------------------------------------------------------------------------
+
+/// An optional that is an empty or one-element array on the wire: `[]` or `[v]`.
+fn Opt(comptime T: type) type {
+    return struct {
+        value: ?T = null,
+
+        const Self = @This();
+
+        pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!Self {
+            _ = gpa;
+            const begin = (try reader.next()) orelse return error.UnexpectedEndOfInput;
+            if (begin != .array_begin) return error.UnexpectedType;
+            const first = (try reader.next()) orelse return error.UnexpectedEndOfInput;
+            switch (first) {
+                .array_end => return .{ .value = null },
+                .integer => |n| {
+                    const end = (try reader.next()) orelse return error.UnexpectedEndOfInput;
+                    if (end != .array_end) return error.LengthMismatch;
+                    return .{ .value = std.math.cast(T, n) orelse return error.IntegerOverflow };
+                },
+                else => return error.UnexpectedType,
+            }
+        }
+
+        pub fn zerdeEncode(self: Self, encoder: anytype) anyerror!void {
+            try encoder.beginArray(if (self.value == null) 0 else 1);
+            if (self.value) |v| try encoder.writeInt(v);
+            try encoder.endArray();
+        }
+    };
+}
+
+/// A fixed-size id carried as one integer.
+const Id = struct {
+    n: u32,
+
+    pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!Id {
+        _ = gpa;
+        const event = (try reader.next()) orelse return error.UnexpectedEndOfInput;
+        return switch (event) {
+            .integer => |n| .{ .n = std.math.cast(u32, n) orelse return error.IntegerOverflow },
+            else => error.UnexpectedType,
+        };
+    }
+
+    pub fn zerdeEncode(self: Id, encoder: anytype) anyerror!void {
+        try encoder.writeInt(self.n);
+    }
+};
+
+/// A union written as `[tag, payload]` with an integer tag, the shape a fixed-layout union has on the wire.
+const Cmd = union(enum) {
+    ping,
+    get: u32,
+    both: struct { a: u32, b: u32 },
+
+    pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!Cmd {
+        _ = gpa;
+        if (((try reader.next()) orelse return error.UnexpectedEndOfInput) != .array_begin) return error.UnexpectedType;
+        const tag = switch ((try reader.next()) orelse return error.UnexpectedEndOfInput) {
+            .integer => |n| n,
+            else => return error.UnexpectedType,
+        };
+        const result: Cmd = switch (tag) {
+            0 => .ping,
+            1 => .{ .get = try integer(reader) },
+            2 => .{ .both = .{ .a = try integer(reader), .b = try integer(reader) } },
+            else => return error.InvalidEnumTag,
+        };
+        if (((try reader.next()) orelse return error.UnexpectedEndOfInput) != .array_end) return error.LengthMismatch;
+        return result;
+    }
+
+    fn integer(reader: anytype) anyerror!u32 {
+        return switch ((try reader.next()) orelse return error.UnexpectedEndOfInput) {
+            .integer => |n| std.math.cast(u32, n) orelse error.IntegerOverflow,
+            else => error.UnexpectedType,
+        };
+    }
+
+    pub fn zerdeEncode(self: Cmd, encoder: anytype) anyerror!void {
+        switch (self) {
+            .ping => {
+                try encoder.beginArray(1);
+                try encoder.writeInt(0);
+            },
+            .get => |n| {
+                try encoder.beginArray(2);
+                try encoder.writeInt(1);
+                try encoder.writeInt(n);
+            },
+            .both => |p| {
+                try encoder.beginArray(3);
+                try encoder.writeInt(2);
+                try encoder.writeInt(p.a);
+                try encoder.writeInt(p.b);
+            },
+        }
+        try encoder.endArray();
+    }
+};
+
+const Wired = struct {
+    id: Id,
+    maybe: Opt(u8),
+    cmds: []const Cmd,
+    note: ?Id = null,
+};
+
+test "a wire type with hooks reads and writes in CBOR and JSON" {
+    const cmds = [_]Cmd{ .ping, .{ .get = 7 }, .{ .both = .{ .a = 1, .b = 2 } } };
+    const value = Wired{ .id = .{ .n = 9 }, .maybe = .{ .value = 5 }, .cmds = &cmds, .note = .{ .n = 3 } };
+    // Deterministic key order: id, cmds, note, maybe.
+    const expected = [_]u8{ 0xa4, 0x62, 'i', 'd', 0x09, 0x64, 'c', 'm', 'd', 's', 0x83, 0x81, 0x00, 0x82, 0x01, 0x07, 0x83, 0x02, 0x01, 0x02, 0x64, 'n', 'o', 't', 'e', 0x03, 0x65, 'm', 'a', 'y', 'b', 'e', 0x81, 0x05 };
+    try expectCborBytes(&expected, value, .{}, .{ .deterministic = true });
+    try expectJsonText("{\"id\":9,\"maybe\":[5],\"cmds\":[[0],[1,7],[2,1,2]],\"note\":3}", value, .{}, .{});
+
+    const cbor = try writeCbor(value, .{}, .{});
+    var bytes = cbor;
+    defer bytes.deinit();
+    const from_cbor = try zerde.cbor.parseSlice(Wired, allocator, bytes.written());
+    defer zerde.free(allocator, from_cbor);
+    try std.testing.expectEqualDeep(value, from_cbor);
+    const from_json = try zerde.json.parseSlice(Wired, allocator, "{ \"id\" : 9, \"maybe\" : [ 5 ], \"cmds\" : [[0],[1,7],[2,1,2]], \"note\":3 }");
+    defer zerde.free(allocator, from_json);
+    try std.testing.expectEqualDeep(value, from_json);
+
+    // An empty optional and an omitted field.
+    const empty = try zerde.json.parseSlice(Wired, allocator, "{\"id\":1,\"maybe\":[],\"cmds\":[]}");
+    defer zerde.free(allocator, empty);
+    try std.testing.expectEqual(@as(?u8, null), empty.maybe.value);
+    try std.testing.expectEqual(@as(?Id, null), empty.note);
+}
+
+test "a decode hook's errors, and what it leaves unread, are errors" {
+    try expectJsonError(Wired, error.IntegerOverflow, "{\"id\":4294967296,\"maybe\":[],\"cmds\":[]}");
+    try expectJsonError(Wired, error.UnexpectedType, "{\"id\":\"x\",\"maybe\":[],\"cmds\":[]}");
+    try expectJsonError(Wired, error.LengthMismatch, "{\"id\":1,\"maybe\":[1,2],\"cmds\":[]}");
+    try expectJsonError(Wired, error.InvalidEnumTag, "{\"id\":1,\"maybe\":[],\"cmds\":[[9]]}");
+    // A hook that stops short of the end of its item.
+    const Short = struct {
+        pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!@This() {
+            _ = gpa;
+            _ = try reader.next(); // the start of an array, and nothing more
+            return .{};
+        }
+    };
+    const Holder = struct { s: Short };
+    try expectJsonError(Holder, error.HookIncomplete, "{\"s\":[1,2]}");
+    const None = struct {
+        pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!@This() {
+            _ = gpa;
+            _ = reader;
+            return .{};
+        }
+    };
+    try expectJsonError(struct { s: None }, error.HookIncomplete, "{\"s\":1}");
+    // A hook that skips what it does not want reads past it whole.
+    const Skip = struct {
+        pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!@This() {
+            _ = gpa;
+            try reader.skip();
+            return .{};
+        }
+    };
+    const parsed = try zerde.json.parseSlice(struct { s: Skip, after: u8 }, allocator, "{\"s\":{\"a\":[1,{\"b\":2}]},\"after\":7}");
+    try std.testing.expectEqual(@as(u8, 7), parsed.after);
+}
+
+test "a decode hook reads under the read's mode and limits" {
+    const Doc = struct { id: Id, maybe: Opt(u8), cmds: []const Cmd };
+    // Strict CBOR refuses an indefinite array inside a hook, as it does anywhere.
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.cbor.parseSliceWith(Doc, allocator, &.{ 0xa3, 0x62, 'i', 'd', 0x01, 0x65, 'm', 'a', 'y', 'b', 'e', 0x9f, 0xff, 0x64, 'c', 'm', 'd', 's', 0x80 }, .{}, strict));
+    // A depth limit counts the container the hook opens.
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.parseSliceWith(Doc, allocator, &.{ 0xa3, 0x62, 'i', 'd', 0x01, 0x65, 'm', 'a', 'y', 'b', 'e', 0x80, 0x64, 'c', 'm', 'd', 's', 0x80 }, .{}, .{ .max_depth = 1 }));
+}
+
+/// A wire type that owns memory, with a hook to release it.
+const NameList = struct {
+    items: []const []const u8,
+
+    pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!NameList {
+        const begin = (try reader.next()) orelse return error.UnexpectedEndOfInput;
+        if (begin != .array_begin) return error.UnexpectedType;
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |item| gpa.free(item);
+            list.deinit(gpa);
+        }
+        while (try reader.next()) |event| {
+            switch (event) {
+                .array_end => return .{ .items = try list.toOwnedSlice(gpa) },
+                .text => |t| try list.append(gpa, try gpa.dupe(u8, t)),
+                else => return error.UnexpectedType,
+            }
+        }
+        return error.UnexpectedEndOfInput;
+    }
+
+    pub fn zerdeEncode(self: NameList, encoder: anytype) anyerror!void {
+        try encoder.beginArray(self.items.len);
+        for (self.items) |item| try encoder.writeText(item);
+        try encoder.endArray();
+    }
+
+    pub fn zerdeFree(self: NameList, gpa: std.mem.Allocator) void {
+        for (self.items) |item| gpa.free(item);
+        gpa.free(self.items);
+    }
+};
+
+test "a wire type that owns memory is released by its zerdeFree, also after a failure" {
+    const parsed = try zerde.json.parseSlice(struct { names: NameList, n: u8 }, allocator, "{\"names\":[\"a\",\"bc\"],\"n\":1}");
+    defer zerde.free(allocator, parsed);
+    try std.testing.expectEqual(@as(usize, 2), parsed.names.items.len);
+    try std.testing.expectEqualStrings("bc", parsed.names.items[1]);
+    // A later field fails: what the hook allocated is freed (the testing allocator checks).
+    try expectJsonError(struct { names: NameList, n: u8 }, error.InvalidNumber, "{\"names\":[\"a\"],\"n\":\"x\"}");
+    // And a hook that fails halfway frees its own partial list.
+    try expectJsonError(struct { names: NameList }, error.UnexpectedType, "{\"names\":[\"a\",\"b\",1]}");
+    try expectJsonText("{\"names\":[\"a\",\"bc\"],\"n\":1}", parsed, .{}, .{});
+}
+
+test "an encode hook for a map writes its entries in the order it chooses" {
+    const Dict = struct {
+        keys: []const []const u8,
+
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            try encoder.beginMap(self.keys.len);
+            for (self.keys, 0..) |key, index| {
+                try encoder.writeText(key);
+                try encoder.writeInt(@intCast(index));
+            }
+            try encoder.endMap();
+        }
+    };
+    const dict = Dict{ .keys = &.{ "a", "bb", "c" } };
+    try expectCborBytes(&.{ 0xa3, 0x61, 'a', 0x00, 0x62, 'b', 'b', 0x01, 0x61, 'c', 0x02 }, dict, .{}, .{ .deterministic = true });
+    try expectJsonText("{\"a\":0,\"bb\":1,\"c\":2}", dict, .{}, .{});
+    // A JSON hook must write a key where a key is due, and close what it opens.
+    const Bad = struct {
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            _ = self;
+            try encoder.beginMap(1);
+            try encoder.writeInt(1);
+        }
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.UnexpectedType, zerde.serializeWith(zerde.json, &out.writer, Bad{}, .{}, .{}));
+}
+
+test "a hook that ends on a decoded string leaves nothing allocated" {
+    const Label = struct {
+        len: usize,
+
+        pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!@This() {
+            _ = gpa;
+            return switch ((try reader.next()) orelse return error.UnexpectedEndOfInput) {
+                .text => |t| .{ .len = t.len },
+                else => error.UnexpectedType,
+            };
+        }
+    };
+    // The escape makes the reader own the joined text until the hook is done with it.
+    const parsed = try zerde.json.parseSlice(struct { label: Label }, allocator, "{\"label\":\"a\\nb\"}");
+    try std.testing.expectEqual(@as(usize, 3), parsed.label.len);
+}

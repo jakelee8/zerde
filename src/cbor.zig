@@ -290,6 +290,11 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             }
         }
 
+        /// A streaming writer for a wire type's encode hook; see `Encoder`.
+        pub fn encoder(self: *Self) Encoder {
+            return .{ .writer = self.writer, .deterministic = deterministic };
+        }
+
         /// Writes an item that was read as `zerde.Raw`, unchanged.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try self.writer.writeAll(value);
@@ -695,6 +700,11 @@ pub fn CborDeserializer(comptime Config: type) type {
             const header = try parseHeader(self.input, &self.index);
             if (header.major != 3) return error.UnexpectedType;
             return self.finishString(allocator, header);
+        }
+
+        /// A reader of the next item of this read, for a wire type's decode hook.
+        pub fn pullView(self: *Self, allocator: Allocator) PullReader(Config) {
+            return PullReader(Config).view(self, allocator);
         }
 
         /// Where the extras of a struct begin, so a struct read inside another keeps its own.
@@ -1234,7 +1244,12 @@ pub fn pullReader(allocator: Allocator, input: []const u8, comptime cfg: anytype
 
 pub fn PullReader(comptime Config: type) type {
     return struct {
-        d: CborDeserializer(Config),
+        d: *CborDeserializer(Config),
+        /// Whether this reader made `d` and frees it. A reader over a typed read's deserializer (a
+        /// wire type's decode hook) does not.
+        owns: bool,
+        /// The depth the item starts at: the reader is done when it is back there.
+        base: usize,
         allocator: Allocator,
         scratch: ?[]u8 = null,
         done: bool = false,
@@ -1244,22 +1259,32 @@ pub fn PullReader(comptime Config: type) type {
         const Self = @This();
 
         fn init(allocator: Allocator, input: []const u8, cfg: Config) !Self {
-            return .{ .d = CborDeserializer(Config).initBorrowed(allocator, input, cfg), .allocator = allocator };
+            const d = try allocator.create(CborDeserializer(Config));
+            d.* = CborDeserializer(Config).initBorrowed(allocator, input, cfg);
+            return .{ .d = d, .owns = true, .base = 0, .allocator = allocator };
+        }
+
+        /// A reader of the next item of a deserializer that is already reading.
+        pub fn view(d: *CborDeserializer(Config), allocator: Allocator) Self {
+            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };
         }
 
         pub fn deinit(self: *Self) void {
             self.release();
-            self.d.deinit(self.allocator);
+            if (self.owns) {
+                self.d.deinit(self.allocator);
+                self.allocator.destroy(self.d);
+            }
         }
 
         /// The next event, or null after the item is complete.
         pub fn next(self: *Self) !?typed.Event {
             self.release();
-            const d = &self.d;
-            if (d.stack_len == 0) {
+            const d = self.d;
+            if (d.stack_len == self.base) {
                 if (self.done) return null;
                 const event = try self.valueEvent();
-                if (d.stack_len == 0) self.done = true;
+                if (d.stack_len == self.base) self.done = true;
                 return event;
             }
             const frame = d.current();
@@ -1267,7 +1292,7 @@ pub fn PullReader(comptime Config: type) type {
             switch (frame.kind) {
                 .array => {
                     if (!try d.nextArrayItem()) {
-                        self.done = d.stack_len == 0;
+                        self.done = d.stack_len == self.base;
                         return .array_end;
                     }
                     return try self.valueEvent();
@@ -1278,7 +1303,7 @@ pub fn PullReader(comptime Config: type) type {
                         return try self.valueEvent();
                     }
                     if (try d.beginObjectEntry()) {
-                        self.done = d.stack_len == 0;
+                        self.done = d.stack_len == self.base;
                         return .map_end;
                     }
                     self.want_value[depth] = true;
@@ -1318,7 +1343,7 @@ pub fn PullReader(comptime Config: type) type {
         }
 
         fn valueEvent(self: *Self) !typed.Event {
-            const d = &self.d;
+            const d = self.d;
             switch (try d.peekKind()) {
                 .array => {
                     const len = try d.beginArrayLen();
@@ -1336,7 +1361,7 @@ pub fn PullReader(comptime Config: type) type {
         }
 
         fn scalarEvent(self: *Self, kind: ValueKind) !typed.Event {
-            const d = &self.d;
+            const d = self.d;
             switch (kind) {
                 .null => {
                     try d.readNull();
@@ -1355,7 +1380,7 @@ pub fn PullReader(comptime Config: type) type {
 
         /// A map key: a scalar, checked and recorded like any key of a typed read.
         fn keyEvent(self: *Self) !typed.Event {
-            const d = &self.d;
+            const d = self.d;
             const kind = try d.peekKind();
             if (kind == .array or kind == .object) return error.UnexpectedType;
             const start = d.index;
@@ -1381,6 +1406,62 @@ pub fn PullReader(comptime Config: type) type {
 pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
     return ValueWriter.init(allocator, writer, effectiveDeterministic(cfg));
 }
+
+/// A writer for a wire type's encode hook: items go out as they are written, with no buffering and
+/// no allocation, so a container's length is stated up front and the caller writes exactly that many
+/// items (twice as many for a map, keys and values alternately). Keys are written in the order the
+/// output needs: for deterministic CBOR, ascending by encoded bytes. The ends are no-ops here and
+/// are there so a hook reads the same for every format.
+pub const Encoder = struct {
+    writer: *std.Io.Writer,
+    deterministic: bool,
+
+    pub fn writeNull(self: *Encoder) !void {
+        try self.writer.writeByte(0xf6);
+    }
+
+    pub fn writeBool(self: *Encoder, value: bool) !void {
+        try self.writer.writeByte(if (value) 0xf5 else 0xf4);
+    }
+
+    pub fn writeInt(self: *Encoder, value: i128) !void {
+        try encodeInt(self.writer, value);
+    }
+
+    pub fn writeFloat(self: *Encoder, value: f64) !void {
+        if (self.deterministic) try writePreferredFloat(self.writer, value) else try encodeFloat(self.writer, value);
+    }
+
+    pub fn writeText(self: *Encoder, value: []const u8) !void {
+        try writeTextString(self.writer, value);
+    }
+
+    pub fn writeBytes(self: *Encoder, value: []const u8) !void {
+        try writeMajorValue(self.writer, 2, value.len);
+        try self.writer.writeAll(value);
+    }
+
+    /// An item that is already CBOR, unchanged.
+    pub fn writeRaw(self: *Encoder, bytes: []const u8) !void {
+        try self.writer.writeAll(bytes);
+    }
+
+    pub fn beginArray(self: *Encoder, len: usize) !void {
+        try writeMajorValue(self.writer, 4, len);
+    }
+
+    pub fn endArray(self: *Encoder) !void {
+        _ = self;
+    }
+
+    pub fn beginMap(self: *Encoder, len: usize) !void {
+        try writeMajorValue(self.writer, 5, len);
+    }
+
+    pub fn endMap(self: *Encoder) !void {
+        _ = self;
+    }
+};
 
 // The writer's methods share these names, so the file-level writers get others.
 const encodeInt = writeInt;
