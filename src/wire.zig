@@ -810,7 +810,8 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 }
 
 /// The two regions of `decodeInto`, in bytes: `output` holds the arrays and rewritten strings the wire value
-/// points at, `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON), and
+/// points at, `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
+/// a lenient CBOR `Raw` and the name spans of a JSON `Raw` otherwise), and
 /// together they are `maxArenaSize`. Each is an upper bound under the same rules, so a region of exactly its
 /// size is enough for any input the config allows.
 pub const Sizes = struct { output: usize, scratch: usize };
