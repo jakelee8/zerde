@@ -40,6 +40,8 @@ pub const reflect = @import("reflect.zig");
 pub const wire = @import("wire.zig");
 /// A typed value written in fixed windows, resumably; see `resumable.zig`.
 pub const resumable = @import("resumable.zig");
+/// A CBOR frame as a skeleton and references to the byte strings it leaves out; see `gather.zig`.
+pub const gather = @import("gather.zig");
 /// Word-at-a-time scans over strings, used by the JSON and CBOR backends.
 pub const bulk = @import("bulk.zig");
 pub const bin = bin_impl;

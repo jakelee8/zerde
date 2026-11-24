@@ -228,11 +228,36 @@ pub fn sliceDeserializer(allocator: Allocator, input: []const u8, comptime cfg: 
     return CborDeserializer(@TypeOf(cfg)).initBorrowed(allocator, input, cfg);
 }
 
+/// One byte string or `Raw` a gather write left out of its output: the skeleton has the head, and `len` bytes are to be
+/// inserted at `skeleton_offset`, which are at `offset` from the base address the write was given.
+pub const GatherRef = extern struct { skeleton_offset: u32, offset: u32, len: u32 };
+
+/// Where a gather write (see `gather.zig`) records the byte strings it leaves out: `refs` is filled in output order,
+/// for those of at least `min_len` bytes. The writer must be a fixed one, whose `end` is how much is written.
+pub const GatherState = struct {
+    refs: []GatherRef,
+    count: usize = 0,
+    base: usize,
+    min_len: usize,
+
+    fn add(self: *GatherState, at: usize, bytes: []const u8) !void {
+        if (self.count == self.refs.len) return error.NoSpaceLeft;
+        const address = @intFromPtr(bytes.ptr);
+        if (address < self.base) return error.OffsetOutOfRange;
+        const offset = address - self.base;
+        if (at > std.math.maxInt(u32) or offset > std.math.maxInt(u32) or bytes.len > std.math.maxInt(u32) - offset) return error.OffsetOutOfRange;
+        self.refs[self.count] = .{ .skeleton_offset = @intCast(at), .offset = @intCast(offset), .len = @intCast(bytes.len) };
+        self.count += 1;
+    }
+};
+
 /// `deterministic` is a type parameter, so the default write carries no runtime branch for it.
 pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type {
     return struct {
         writer: *std.Io.Writer,
         cfg: Config,
+        /// Set by a gather write: byte strings and `Raw` items it names are left out of the output.
+        gather: ?*GatherState = null,
 
         const Self = @This();
 
@@ -270,6 +295,13 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         }
 
         pub fn emitBytes(self: *Self, value: []const u8) !void {
+            try writeMajorValue(self.writer, 2, value.len);
+            if (self.gather) |state| if (value.len >= state.min_len) return state.add(self.writer.end, value);
+            try self.writer.writeAll(value);
+        }
+
+        /// A byte string whose bytes are a copy the typed walk made (a `[N]u8`), which a gather write cannot point at.
+        pub fn emitBytesInline(self: *Self, value: []const u8) !void {
             try writeMajorValue(self.writer, 2, value.len);
             try self.writer.writeAll(value);
         }
@@ -353,6 +385,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         /// promises whatever mode the item was read in.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try verifyItem(value, deterministic);
+            if (self.gather) |state| if (value.len >= state.min_len) return state.add(self.writer.end, value);
             try self.writer.writeAll(value);
         }
 

@@ -488,6 +488,17 @@ or head and the longest field name escaped: `error.WindowTooSmall` below it). No
 encode hooks and `bin`'s sequence path. The value must be the same in every call. `zig build bench-wire` measures
 the windows against the whole write on real text (`bench/WIRE.md`).
 
+### Gather encode
+
+`zerde.gather.encode(T, skeleton, refs, base, min_len, value, serde_cfg, cbor_cfg)` writes a CBOR frame without copying
+its large byte strings: everything else (heads, keys, small values) goes into the caller's `skeleton`, and each
+`ByteString` or `Raw` of at least `min_len` bytes has its head written and its bytes left out, with a `gather.Ref`
+`{ skeleton_offset, offset, len }` recorded in `refs` (the bytes at `offset` from `base`, an address as in `wire.Span`, go
+at `skeleton_offset`). A host that owns the buffer enqueues the pieces itself, so the payload never enters the region
+the skeleton is in. `gather.assemble(dst, gathered, memory)` builds the whole frame, which is the bytes `serializeWith`
+writes. Both regions are the caller's (`error.NoSpaceLeft` when short), a byte below `base` or beyond `u32` is
+`error.OffsetOutOfRange`, and a `[N]u8` field is copied into the skeleton, since the walk holds only a copy of it.
+
 ### Fixed-layout wire types
 
 `zerde.wire` generates, from a schema type, the same value laid out the way C lays out a struct, for code that

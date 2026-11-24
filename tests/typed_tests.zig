@@ -4625,6 +4625,97 @@ test "max_container_bytes counts what a nested container hands to the one around
     }
 }
 
+// ---- gather encode, a skeleton and references -----------------------------------------------------------------------
+
+const GatherFrame = struct {
+    id: [4]u8,
+    key: zerde.ByteString,
+    payload: zerde.ByteString,
+    meta: zerde.cbor.Raw,
+    note: ?zerde.ByteString = null,
+    name: []const u8,
+    pub const serde = .{ .fields = .{ .note = .{ .optional = .absent } } };
+};
+
+test "a gather encode is the skeleton and references that assemble to the bytes of the whole write" {
+    // The bytes the frame holds are in one region that the references are relative to.
+    var heap: [4096]u8 align(16) = undefined;
+    for (&heap, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    const meta = [_]u8{ 0xa1, 0x61, 'k', 0x01 };
+    @memcpy(heap[3000..][0..meta.len], &meta);
+    const frame: GatherFrame = .{
+        .id = .{ 1, 2, 3, 4 },
+        .key = .{ .bytes = heap[100..108] },
+        .payload = .{ .bytes = heap[1000..2500] },
+        .meta = .{ .bytes = heap[3000..][0..meta.len] },
+        .note = .{ .bytes = heap[200..204] },
+        .name = "frame",
+    };
+    var whole: std.Io.Writer.Allocating = .init(allocator);
+    defer whole.deinit();
+    try zerde.serializeWith(zerde.cbor, &whole.writer, frame, .{}, .{ .deterministic = true });
+
+    var skeleton: [256]u8 = undefined;
+    var refs: [8]zerde.gather.Ref = undefined;
+    const base = @intFromPtr(&heap);
+    const gathered = try zerde.gather.encode(GatherFrame, &skeleton, &refs, base, 1, frame, .{}, .{ .deterministic = true });
+    // Four byte strings and the raw item are left out; the array `id` and the text are in the skeleton.
+    try std.testing.expectEqual(@as(usize, 4), gathered.refs.len);
+    try std.testing.expectEqual(whole.written().len, gathered.len());
+    try std.testing.expect(gathered.skeleton.len < 64);
+    // The references are in output order, at the offsets of the bytes in the region and of the gaps in the skeleton.
+    try std.testing.expectEqual(@as(u32, 100), gathered.refs[0].offset);
+    try std.testing.expectEqual(@as(u32, 8), gathered.refs[0].len);
+    // In key order: key, meta (the raw item), note, payload.
+    try std.testing.expectEqual(@as(u32, 3000), gathered.refs[1].offset);
+    try std.testing.expectEqual(@as(u32, 200), gathered.refs[2].offset);
+    try std.testing.expectEqual(@as(u32, 1000), gathered.refs[3].offset);
+    try std.testing.expectEqual(@as(u32, 1500), gathered.refs[3].len);
+    for (gathered.refs[1..], gathered.refs[0 .. gathered.refs.len - 1]) |next, before| try std.testing.expect(next.skeleton_offset >= before.skeleton_offset);
+    var out: [2048]u8 = undefined;
+    const mem: wire.Memory = .{ .base = base, .regions = &.{&heap} };
+    try std.testing.expectEqualSlices(u8, whole.written(), try zerde.gather.assemble(&out, gathered, mem));
+
+    // Only the byte strings of at least min_len are left out: here the payload and nothing else.
+    var skeleton_small: [256]u8 = undefined;
+    var refs_small: [8]zerde.gather.Ref = undefined;
+    const big = try zerde.gather.encode(GatherFrame, &skeleton_small, &refs_small, base, 100, frame, .{}, .{ .deterministic = true });
+    try std.testing.expectEqual(@as(usize, 1), big.refs.len);
+    try std.testing.expectEqualSlices(u8, whole.written(), try zerde.gather.assemble(&out, big, mem));
+    // None at all: the skeleton is the whole frame.
+    var skeleton_all: [2048]u8 = undefined;
+    const none = try zerde.gather.encode(GatherFrame, &skeleton_all, &refs_small, base, 100_000, frame, .{}, .{ .deterministic = true });
+    try std.testing.expectEqual(@as(usize, 0), none.refs.len);
+    try std.testing.expectEqualSlices(u8, whole.written(), none.skeleton);
+}
+
+test "a gather encode refuses a short skeleton or list, bytes below its base, and a reference outside the memory" {
+    var heap: [512]u8 align(16) = @splat(7);
+    const frame: GatherFrame = .{ .id = .{ 0, 0, 0, 0 }, .key = .{ .bytes = heap[10..20] }, .payload = .{ .bytes = heap[100..300] }, .meta = .{ .bytes = &.{0xa0} }, .name = "n" };
+    var skeleton: [256]u8 = undefined;
+    var refs: [8]zerde.gather.Ref = undefined;
+    const base = @intFromPtr(&heap);
+    // The raw item is a literal outside the heap, so with a floor of one byte it is below `base` or beyond a u32.
+    const outside = zerde.gather.encode(GatherFrame, &skeleton, &refs, base, 1, frame, .{}, .{});
+    try std.testing.expectError(error.OffsetOutOfRange, outside);
+    // With a floor above its length the raw item stays in the skeleton, and the rest is inside the heap.
+    const ok = try zerde.gather.encode(GatherFrame, &skeleton, &refs, base, 2, frame, .{}, .{});
+    try std.testing.expectEqual(@as(usize, 2), ok.refs.len);
+    try std.testing.expectError(error.NoSpaceLeft, zerde.gather.encode(GatherFrame, &skeleton, refs[0..1], base, 2, frame, .{}, .{}));
+    try std.testing.expectError(error.NoSpaceLeft, zerde.gather.encode(GatherFrame, skeleton[0..10], &refs, base, 2, frame, .{}, .{}));
+    // The whole frame needs room, and each reference must name memory the caller says it holds.
+    var small: [10]u8 = undefined;
+    const mem: wire.Memory = .{ .base = base, .regions = &.{&heap} };
+    try std.testing.expectError(error.NoSpaceLeft, zerde.gather.assemble(&small, ok, mem));
+    var out: [1024]u8 = undefined;
+    const elsewhere: wire.Memory = .{ .base = base, .regions = &.{heap[0..50]} };
+    try std.testing.expectError(error.OffsetOutOfRange, zerde.gather.assemble(&out, ok, elsewhere));
+    // An offset that does not fit 32 bits is refused and not cut: with a base of zero the heap is far above 4 GiB on a 64-bit target.
+    if (@sizeOf(usize) > 4) try std.testing.expectError(error.OffsetOutOfRange, zerde.gather.encode(GatherFrame, &skeleton, &refs, 0, 2, frame, .{}, .{}));
+    // Bytes below the base are refused as they are written.
+    try std.testing.expectError(error.OffsetOutOfRange, zerde.gather.encode(GatherFrame, &skeleton, &refs, base + 100, 2, frame, .{}, .{}));
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;

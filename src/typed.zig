@@ -130,6 +130,11 @@ pub fn serialize(comptime Format: type, writer: *std.Io.Writer, value: anytype, 
     try serializeValue(&serializer, value, serde_cfg, Format, comptime fieldOrderPolicy(Format, format_cfg), NoResume{});
 }
 
+/// `serialize` with a serializer the caller made and keeps, for a format that has state to set up first (a gather write).
+pub fn serializeInto(serializer: anytype, value: anytype, comptime serde_cfg: anytype, comptime Format: type, comptime format_cfg: anytype) !void {
+    try serializeValue(serializer, value, serde_cfg, Format, comptime fieldOrderPolicy(Format, format_cfg), NoResume{});
+}
+
 /// One step of a resumable write: `value` into the window `state.window` is the writer of, with `serializer` (which
 /// is kept between steps, since the JSON one holds where it is). `error.WindowFull` says the window is full at a
 /// token and the step is to be repeated with a fresh window, the same `value` and `state`; success says the value
@@ -305,19 +310,20 @@ fn keyRoom(comptime key: meta.FieldKey) usize {
 
 /// Writes a string, byte string or `Raw`: whole, or for a resumable write as far as the window goes, which is
 /// `error.WindowFull` with `rc.leaf` saying where to go on.
-fn emitText(serializer: anytype, rc: anytype, comptime kind: enum { string, bytes, raw }, bytes: []const u8) !void {
+fn emitText(serializer: anytype, rc: anytype, comptime kind: enum { string, bytes, bytes_inline, raw }, bytes: []const u8) !void {
     const SerializerType = @TypeOf(serializer.*);
     if (comptime @TypeOf(rc) == NoResume) {
         switch (kind) {
             .string => try serializer.emitString(bytes),
             .bytes => try emitByteString(serializer, bytes),
+            .bytes_inline => if (@hasDecl(SerializerType, "emitBytesInline")) try serializer.emitBytesInline(bytes) else try emitByteString(serializer, bytes),
             .raw => try serializer.emitRaw(bytes),
         }
         return;
     }
     const part = switch (kind) {
         .string => "emitStringPart",
-        .bytes => if (@hasDecl(SerializerType, "emitBytesPart")) "emitBytesPart" else "emitStringPart",
+        .bytes, .bytes_inline => if (@hasDecl(SerializerType, "emitBytesPart")) "emitBytesPart" else "emitStringPart",
         .raw => "emitRawPart",
     };
     if (comptime !@hasDecl(SerializerType, part)) @compileError("format " ++ @typeName(SerializerType) ++ " has no resumable " ++ part);
@@ -444,7 +450,7 @@ fn serializeValue(
         },
         .array => |info| {
             if (info.child == u8) {
-                try emitText(serializer, rc, .bytes, value[0..]);
+                try emitText(serializer, rc, .bytes_inline, value[0..]);
                 return;
             }
 
