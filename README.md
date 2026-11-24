@@ -300,6 +300,13 @@ text, a `ByteString`, a `Raw` item or an array slice, and `.min` and `.max` for 
 to the value inside an optional. A length is checked before the memory for it is allocated wherever the
 format states it first (a CBOR definite array or string; an indefinite or JSON array is counted as it is read
 and stops at `max_len`). A violation is `error.LengthOutOfBounds` or `error.ValueOutOfRange`.
+A `Raw` field (or an optional `Raw`, or the elements of an array of them through `.elem`) can also carry
+`.validate = fn (allocator, bytes) !void`, which runs on the item's own bytes once the read has checked them and their
+length, for a rule the read cannot know, such as a profile for metadata (text keys, scalar values, finite floats). Its
+error is the read's error. It reads the item with a pull reader of the format (`cbor.pullReader(allocator, bytes, .{})`)
+and uses `reader.next()`, so the profile stays in the caller's code. Like the other bounds it is checked on read only, and
+it is a compile error on a field that is not a `Raw`.
+
 `.elem` bounds each element of an array field: `.keys = .{ .max_len = 8, .elem = .{ .min_len = 1, .max_len = 1024 } }` is
 at most eight keys of one to 1,024 bytes, and `.spans = .{ .elem = .{ .min = 0, .max = 65535 } }` bounds every integer.
 An `elem` can have an `elem` of its own for an array of arrays, and applies inside an optional element; each element
@@ -348,6 +355,10 @@ complete and nothing follows, and `deinit()` releases it. A reader checks what a
 takes the same configuration: the mode, the limits, no repeated key in a CBOR map, UTF-8. A CBOR map
 key must be a scalar. Text and byte strings borrow the input (which must outlive the reader) unless they
 were in chunks or escaped, and are valid until the next call.
+
+`reader.raw()` returns the next item whole as the bytes it was read from, where a value is expected (the item
+`readRaw` gives a `Raw` field, checked by the mode and limits; an end or a map key where a value is due is
+`error.UnexpectedType`). A decode hook uses it to keep the span it consumed.
 
 ### Value writer
 

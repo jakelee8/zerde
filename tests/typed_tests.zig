@@ -3411,3 +3411,204 @@ test "element bounds also apply in formats that state a length without a closing
         try std.testing.expectError(error.LengthOutOfBounds, Format.parseSlice(Short, allocator, out.written()));
     }
 }
+
+// ---- a pull reader's raw span, and a validator for a kept item --------------------------------------------
+
+test "a pull reader returns the span of the next item" {
+    // [1, {"a": [2, 3]}, "x"]: raw at the root, as an element, and as a map value.
+    const input = [_]u8{ 0x83, 0x01, 0xa1, 0x61, 'a', 0x82, 0x02, 0x03, 0x61, 'x' };
+    var whole = try zerde.cbor.pullReader(allocator, &input, .{});
+    defer whole.deinit();
+    try std.testing.expectEqualSlices(u8, &input, try whole.raw());
+    try whole.finish();
+    try std.testing.expectError(error.UnexpectedEndOfInput, whole.raw());
+
+    // One item only: a second one is not the reader's to take.
+    var two = try zerde.cbor.pullReader(allocator, &.{ 0x01, 0x02 }, .{});
+    defer two.deinit();
+    try std.testing.expectEqualSlices(u8, &.{0x01}, try two.raw());
+    try std.testing.expectError(error.UnexpectedEndOfInput, two.raw());
+    try std.testing.expectError(error.TrailingCharacters, two.finish());
+    var json_two = try zerde.json.pullReader(allocator, "1 2", .{});
+    defer json_two.deinit();
+    try std.testing.expectEqualStrings("1", try json_two.raw());
+    try std.testing.expectError(error.UnexpectedEndOfInput, json_two.raw());
+    try std.testing.expectError(error.TrailingCharacters, json_two.finish());
+
+    var pull = try zerde.cbor.pullReader(allocator, &input, .{});
+    defer pull.deinit();
+    try std.testing.expect((try pull.next()).? == .array_begin);
+    try std.testing.expectEqualSlices(u8, &.{0x01}, try pull.raw());
+    try std.testing.expect((try pull.next()).? == .map_begin);
+    // A map key is not a value.
+    try std.testing.expectError(error.UnexpectedType, pull.raw());
+    const key = (try pull.next()).?;
+    try std.testing.expectEqualStrings("a", key.text);
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, 0x02, 0x03 }, try pull.raw());
+    try std.testing.expect((try pull.next()).? == .map_end);
+    try std.testing.expectEqualSlices(u8, &.{ 0x61, 'x' }, try pull.raw());
+    // The array has ended where a value was due.
+    try std.testing.expectError(error.UnexpectedType, pull.raw());
+    try pull.finish();
+
+    // The item is checked as the mode says.
+    var strict_pull = try zerde.cbor.pullReader(allocator, &.{ 0x82, 0x18, 0x01, 0x02 }, .{ .mode = .strict });
+    defer strict_pull.deinit();
+    _ = try strict_pull.next();
+    try std.testing.expectError(error.NonDeterministicEncoding, strict_pull.raw());
+
+    // JSON: the text without the whitespace around it.
+    const json = " [1, {\"a\": [2, 3]} , \"x\"] ";
+    var json_pull = try zerde.json.pullReader(allocator, json, .{});
+    defer json_pull.deinit();
+    try std.testing.expect((try json_pull.next()).? == .array_begin);
+    try std.testing.expectEqualStrings("1", try json_pull.raw());
+    try std.testing.expect((try json_pull.next()).? == .map_begin);
+    try std.testing.expectError(error.UnexpectedType, json_pull.raw());
+    _ = try json_pull.next();
+    try std.testing.expectEqualStrings("[2, 3]", try json_pull.raw());
+    _ = try json_pull.next();
+    try std.testing.expectEqualStrings("\"x\"", try json_pull.raw());
+    try std.testing.expectError(error.UnexpectedType, json_pull.raw());
+    try json_pull.finish();
+    var bad = try zerde.json.pullReader(allocator, "[1,", .{});
+    defer bad.deinit();
+    _ = try bad.next();
+    _ = try bad.raw();
+    try std.testing.expectError(error.UnexpectedEndOfInput, bad.raw());
+}
+
+test "a decode hook can keep the span it consumed" {
+    const Framed2 = struct {
+        span: []const u8,
+
+        pub fn zerdeDecode(gpa: std.mem.Allocator, reader: anytype) anyerror!@This() {
+            return .{ .span = try gpa.dupe(u8, try reader.raw()) };
+        }
+
+        pub fn zerdeFree(self: @This(), gpa: std.mem.Allocator) void {
+            gpa.free(self.span);
+        }
+    };
+    const Holder = struct { a: Framed2, b: u8 };
+    const cbor = try zerde.cbor.parseSlice(Holder, allocator, &.{ 0xa2, 0x61, 'a', 0x82, 0x01, 0x02, 0x61, 'b', 0x07 });
+    defer zerde.free(allocator, cbor);
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, 0x01, 0x02 }, cbor.a.span);
+    const json = try zerde.json.parseSlice(Holder, allocator, "{\"a\": {\"x\": [1, 2] }, \"b\": 7}");
+    defer zerde.free(allocator, json);
+    try std.testing.expectEqualStrings("{\"x\": [1, 2] }", json.a.span);
+}
+
+/// The profile of a metadata map: text keys, values that are scalars or arrays of scalars, finite floats.
+fn checkMetaCbor(gpa: std.mem.Allocator, bytes: []const u8) anyerror!void {
+    var reader = try zerde.cbor.pullReader(gpa, bytes, .{});
+    defer reader.deinit();
+    if ((try reader.next()).? != .map_begin) return error.BadMeta;
+    while (try reader.next()) |event| {
+        switch (event) {
+            .map_end => return,
+            .text => {},
+            else => return error.BadMeta,
+        }
+        const value = (try reader.next()).?;
+        switch (value) {
+            .float => |f| if (!std.math.isFinite(f)) return error.BadMeta,
+            .array_begin => while (try reader.next()) |item| {
+                switch (item) {
+                    .array_end => break,
+                    .array_begin, .map_begin => return error.BadMeta,
+                    .float => |f| if (!std.math.isFinite(f)) return error.BadMeta,
+                    else => {},
+                }
+            },
+            .map_begin => return error.BadMeta,
+            else => {},
+        }
+    }
+}
+
+fn checkMetaJson(gpa: std.mem.Allocator, bytes: []const u8) anyerror!void {
+    var reader = try zerde.json.pullReader(gpa, bytes, .{});
+    defer reader.deinit();
+    if ((try reader.next()).? != .map_begin) return error.BadMeta;
+    while (try reader.next()) |event| {
+        if (event == .map_end) return;
+        const value = (try reader.next()).?;
+        switch (value) {
+            .array_begin => while (try reader.next()) |item| {
+                switch (item) {
+                    .array_end => break,
+                    .array_begin, .map_begin => return error.BadMeta,
+                    else => {},
+                }
+            },
+            .map_begin => return error.BadMeta,
+            else => {},
+        }
+    }
+}
+
+const Profiled = struct {
+    id: u8,
+    meta: zerde.cbor.Raw,
+    maybe: ?zerde.cbor.Raw = null,
+    all: []const zerde.cbor.Raw = &.{},
+
+    pub const serde = .{ .fields = .{
+        .meta = .{ .validate = checkMetaCbor },
+        .maybe = .{ .validate = checkMetaCbor },
+        .all = .{ .elem = .{ .validate = checkMetaCbor } },
+    } };
+};
+
+const ProfiledJson = struct {
+    id: u8,
+    meta: zerde.json.Raw,
+    pub const serde = .{ .fields = .{ .meta = .{ .validate = checkMetaJson } } };
+};
+
+test "a validator checks a kept item after the read has, and its error is the read's" {
+    // {"id": 1, "meta": {"k": 1, "l": [2.5, "x"]}}
+    const good = [_]u8{ 0xa2, 0x62, 'i', 'd', 0x01, 0x64, 'm', 'e', 't', 'a', 0xa2, 0x61, 'k', 0x01, 0x61, 'l', 0x82, 0xf9, 0x41, 0x40, 0x61, 'x' };
+    const parsed = try zerde.cbor.parseSlice(Profiled, allocator, &good);
+    defer zerde.free(allocator, parsed);
+    try std.testing.expectEqual(@as(u8, 1), parsed.id);
+    const aliased = try zerde.cbor.parseSliceAliasedWith(Profiled, allocator, &good, .{}, .{});
+    try std.testing.expectEqualSlices(u8, parsed.meta.bytes, aliased.meta.bytes);
+
+    const head = [_]u8{ 0xa2, 0x62, 'i', 'd', 0x01, 0x64, 'm', 'e', 't', 'a' };
+    const cases = [_]struct { meta: []const u8, err: anyerror }{
+        .{ .meta = &.{ 0xa1, 0x01, 0x01 }, .err = error.BadMeta }, // an integer key
+        .{ .meta = &.{ 0xa1, 0x61, 'k', 0xa0 }, .err = error.BadMeta }, // a map value
+        .{ .meta = &.{ 0xa1, 0x61, 'k', 0x81, 0x81, 0x01 }, .err = error.BadMeta }, // an array in an array
+        .{ .meta = &.{ 0xa1, 0x61, 'k', 0xf9, 0x7e, 0x00 }, .err = error.BadMeta }, // NaN
+        .{ .meta = &.{0x01}, .err = error.BadMeta }, // not a map
+        .{ .meta = &.{ 0xa1, 0x61, 'k', 0x1b }, .err = error.UnexpectedEndOfInput }, // the read's own error comes first
+    };
+    for (cases) |case| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        try input.appendSlice(allocator, &head);
+        try input.appendSlice(allocator, case.meta);
+        // The owned copy of a refused item is not leaked: the testing allocator checks.
+        try std.testing.expectError(case.err, zerde.cbor.parseSlice(Profiled, allocator, input.items));
+        try std.testing.expectError(case.err, zerde.cbor.parseSliceAliasedWith(Profiled, allocator, input.items, .{}, .{}));
+    }
+
+    // In an optional and in the elements of an array.
+    const with_maybe = [_]u8{0xa3} ++ head[1..].* ++ [_]u8{ 0xa0, 0x65, 'm', 'a', 'y', 'b', 'e', 0xa1, 0x01, 0x01 };
+    try std.testing.expectError(error.BadMeta, zerde.cbor.parseSlice(Profiled, allocator, &with_maybe));
+    const with_all = [_]u8{0xa3} ++ head[1..].* ++ [_]u8{ 0xa0, 0x63, 'a', 'l', 'l', 0x82, 0xa0, 0xa1, 0x01, 0x01 };
+    try std.testing.expectError(error.BadMeta, zerde.cbor.parseSlice(Profiled, allocator, &with_all));
+    const all_ok = [_]u8{0xa3} ++ head[1..].* ++ [_]u8{ 0xa0, 0x63, 'a', 'l', 'l', 0x82, 0xa0, 0xa1, 0x61, 'a', 0x01 };
+    const ok = try zerde.cbor.parseSlice(Profiled, allocator, &all_ok);
+    defer zerde.free(allocator, ok);
+    try std.testing.expectEqual(@as(usize, 2), ok.all.len);
+
+    // JSON.
+    const j = try zerde.json.parseSlice(ProfiledJson, allocator, "{\"id\":1,\"meta\":{\"k\":1,\"l\":[2.5,\"x\"]}}");
+    defer zerde.free(allocator, j);
+    try std.testing.expectError(error.BadMeta, zerde.json.parseSlice(ProfiledJson, allocator, "{\"id\":1,\"meta\":{\"k\":{}}}"));
+    try std.testing.expectError(error.BadMeta, zerde.json.parseSlice(ProfiledJson, allocator, "{\"id\":1,\"meta\":[1]}"));
+    try std.testing.expectError(error.UnexpectedEndOfInput, zerde.json.parseSlice(ProfiledJson, allocator, "{\"id\":1,\"meta\":{\"k\":"));
+}

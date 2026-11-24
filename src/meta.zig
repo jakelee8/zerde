@@ -79,9 +79,12 @@ pub const Bounds = struct {
     /// The bounds of each element of an array field (`.elem = .{ .max_len = 1024 }`), which may
     /// have an `elem` of its own for an array of arrays.
     elem: ?*const Bounds = null,
+    /// For a `Raw` field: a function that checks the item (`fn (allocator, bytes) !void`), run after
+    /// the read has checked it and its length, with the item's own bytes. Its error is the read's.
+    validate: ?*const fn (std.mem.Allocator, []const u8) anyerror!void = null,
 
     pub fn isDefault(comptime self: Bounds) bool {
-        return self.min_len == 0 and self.max_len == std.math.maxInt(usize) and self.min == null and self.max == null and self.elem == null;
+        return self.min_len == 0 and self.max_len == std.math.maxInt(usize) and self.min == null and self.max == null and self.elem == null and self.validate == null;
     }
 };
 
@@ -216,7 +219,7 @@ pub fn effectiveFieldKey(comptime T: type, comptime field_name: []const u8, comp
 pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) Bounds {
     @setEvalBranchQuota(20_000);
     var bounds: Bounds = .{};
-    inline for (.{ "min_len", "max_len", "min", "max" }) |option| {
+    inline for (.{ "min_len", "max_len", "min", "max", "validate" }) |option| {
         const found: ?@FieldType(Bounds, option) = comptime blk: {
             if (fieldOverrideHas(cfg, field_name, option)) break :blk fieldOverride(cfg, field_name, option);
             if (@hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, option)) break :blk fieldOverride(T.serde, field_name, option);
@@ -237,7 +240,7 @@ pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, compti
 /// The bounds a struct literal states, as `.{ .max_len = 8, .elem = .{ .min = 0 } }`.
 fn boundsOf(comptime attrs: anytype) Bounds {
     var bounds: Bounds = .{};
-    inline for (.{ "min_len", "max_len", "min", "max" }) |option| {
+    inline for (.{ "min_len", "max_len", "min", "max", "validate" }) |option| {
         if (comptime hasField(@TypeOf(attrs), option)) @field(bounds, option) = @field(attrs, option);
     }
     if (comptime hasField(@TypeOf(attrs), "elem")) {

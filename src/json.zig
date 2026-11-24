@@ -606,9 +606,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return try out.toOwnedSlice();
         }
 
-        /// The next value as the text it was read from, without the whitespace around it.
         pub const raw_format: typed.RawFormat = .json;
 
+        /// The next value as the text it was read from, without the whitespace around it.
         pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
             self.parser.skipWhitespace();
             const start = self.parser.index;
@@ -746,6 +746,36 @@ pub fn PullReader(comptime Config: type) type {
                     return .{ .text = self.keep(key) };
                 },
             }
+        }
+
+        /// The next value whole, as the bytes it was read from: what `readRaw` gives a `Raw` field. For
+        /// a wire type's decode hook, which can return the span it consumed. Call it where a value is
+        /// expected, as `next` would return one. The item is checked as the mode and limits say, and
+        /// the bytes are valid as long as the input is. An end or a map key where a value is due is
+        /// `error.UnexpectedType`.
+        pub fn raw(self: *Self) ![]const u8 {
+            self.release();
+            const d = self.d;
+            if (d.stack_len == self.base) {
+                if (self.done) return error.UnexpectedEndOfInput;
+                const token = try d.readRaw(self.allocator);
+                self.done = d.stack_len == self.base;
+                return token.bytes;
+            }
+            const depth = d.stack_len - 1;
+            switch (d.current().kind) {
+                .array => {
+                    if (!try d.nextArrayItem()) {
+                        self.done = d.stack_len == self.base;
+                        return error.UnexpectedType;
+                    }
+                },
+                .object => {
+                    if (!self.want_value[depth]) return error.UnexpectedType;
+                    self.want_value[depth] = false;
+                },
+            }
+            return (try d.readRaw(self.allocator)).bytes;
         }
 
         /// Consumes the next value whole; see `cbor.PullReader.skip`.

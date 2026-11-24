@@ -572,11 +572,11 @@ pub fn CborDeserializer(comptime Config: type) type {
             return self.readBytes(allocator) catch |err| if (err == error.StringTooLong and max < saved) error.LengthOutOfBounds else err;
         }
 
+        pub const raw_format: typed.RawFormat = .cbor;
+
         /// The next item as the bytes it was read from, checked as the mode and limits say. A
         /// strict read refuses a non-deterministic item here too; a lenient one takes any well-formed
         /// item, tags included.
-        pub const raw_format: typed.RawFormat = .cbor;
-
         pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
             _ = allocator;
             const start = self.index;
@@ -1476,6 +1476,36 @@ pub fn PullReader(comptime Config: type) type {
                     return try self.keyEvent();
                 },
             }
+        }
+
+        /// The next value whole, as the bytes it was read from: what `readRaw` gives a `Raw` field. For
+        /// a wire type's decode hook, which can return the span it consumed. Call it where a value is
+        /// expected, as `next` would return one. The item is checked as the mode and limits say, and
+        /// the bytes are valid as long as the input is. An end or a map key where a value is due is
+        /// `error.UnexpectedType`.
+        pub fn raw(self: *Self) ![]const u8 {
+            self.release();
+            const d = self.d;
+            if (d.stack_len == self.base) {
+                if (self.done) return error.UnexpectedEndOfInput;
+                const token = try d.readRaw(self.allocator);
+                self.done = d.stack_len == self.base;
+                return token.bytes;
+            }
+            const depth = d.stack_len - 1;
+            switch (d.current().kind) {
+                .array => {
+                    if (!try d.nextArrayItem()) {
+                        self.done = d.stack_len == self.base;
+                        return error.UnexpectedType;
+                    }
+                },
+                .object => {
+                    if (!self.want_value[depth]) return error.UnexpectedType;
+                    self.want_value[depth] = false;
+                },
+            }
+            return (try d.readRaw(self.allocator)).bytes;
         }
 
         /// Consumes the next item whole: a scalar, or a container with everything in it. Call it

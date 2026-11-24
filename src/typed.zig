@@ -898,6 +898,7 @@ fn readRawSlice(comptime T: type, allocator: Allocator, deserializer: anytype, c
     }
     const token = try deserializer.readRaw(allocator);
     try checkLength(bounds, token.bytes.len);
+    if (bounds.validate) |validate| try validate(allocator, token.bytes);
     if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
     return allocator.dupe(u8, token.bytes);
 }
@@ -1172,6 +1173,7 @@ fn deserializeBounded(
             return try deserializeBounded(info.child, bounds, allocator, deserializer, cfg, diagnostics, track_diagnostics);
         },
         .int => {
+            if (comptime bounds.validate != null) @compileError("validate applies to a Raw field: " ++ @typeName(T));
             const value = try deserializeValue(T, allocator, deserializer, cfg, diagnostics, track_diagnostics);
             if (bounds.min) |min| if (value < min) return error.ValueOutOfRange;
             if (bounds.max) |max| if (value > max) return error.ValueOutOfRange;
@@ -1179,9 +1181,11 @@ fn deserializeBounded(
         },
         .pointer => |info| {
             if (info.size != .slice) @compileError("length bounds apply to a slice: " ++ @typeName(T));
+            if (comptime bounds.validate != null) @compileError("validate applies to a Raw field: " ++ @typeName(T));
             return try deserializePointer(T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds);
         },
         .@"struct" => {
+            if (comptime bounds.validate != null and !isRaw(T)) @compileError("validate applies to a Raw field: " ++ @typeName(T));
             if (T == ByteString) return .{ .bytes = try readByteSlice(allocator, deserializer, bounds) };
             if (comptime isRaw(T)) return .{ .bytes = try readRawSlice(T, allocator, deserializer, bounds) };
             @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T));
