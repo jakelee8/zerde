@@ -4051,6 +4051,68 @@ test "a strict decode of a list of unions allocates the wire array and nothing e
     try std.testing.expect(arena.end_index <= comptime wire.maxArenaSize(zerde.cbor, WireList, .{}, cfg));
 }
 
+// ---- a decode into the caller's regions, with scratch of a size known at compile time -------------------------
+
+test "decodeInto gives the value of decode, with regions of exactly regionSizes and no allocator" {
+    const msg = sampleMsg();
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const write_cfg = if (Format == zerde.cbor) .{ .deterministic = true } else .{};
+        try zerde.serializeWith(Format, &out.writer, msg, .{}, write_cfg);
+        const read_cfg = if (Format == zerde.cbor) .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 256 } else wire_read_cfg;
+        const sizes = comptime wire.regionSizes(Format, WireMsg, .{}, read_cfg);
+        // The two regions are the one arena of `maxArenaSize`, and a strict CBOR read and a JSON read keep no scratch.
+        try std.testing.expectEqual(wire.maxArenaSize(Format, WireMsg, .{}, read_cfg), sizes.output + sizes.scratch);
+        try std.testing.expectEqual(@as(usize, 0), sizes.scratch);
+        var region: Region = .{};
+        const len = out.written().len;
+        @memcpy(region.bytes[0..len], out.written());
+        var scratch: [sizes.scratch]u8 align(16) = undefined;
+        const decoded = try wire.decodeInto(Format, WireMsg, region.bytes[1024..][0..sizes.output], &scratch, region.base(), region.bytes[0..len], .{}, read_cfg);
+        try expectSampleDecoded(region.memory(), decoded.value);
+        try std.testing.expect(decoded.used > 0 and decoded.used <= sizes.output);
+        // The same value as the allocator form gives, and the same bytes written back.
+        var arena = std.heap.FixedBufferAllocator.init(region.bytes[16384..]);
+        const same = try wire.decode(Format, WireMsg, &arena, region.base(), region.bytes[0..len], .{}, read_cfg);
+        try std.testing.expectEqual(arena.end_index, decoded.used);
+        try std.testing.expectEqual(same.effects.len, decoded.value.effects.len);
+        // An output region one byte short is refused, not overrun.
+        try std.testing.expectError(error.OutOfMemory, wire.decodeInto(Format, WireMsg, region.bytes[1024..][0 .. decoded.used - 1], &scratch, region.base(), region.bytes[0..len], .{}, read_cfg));
+    }
+}
+
+const RawBox = struct {
+    r: zerde.cbor.Raw,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .r = .{ .max_len = 400 } } };
+};
+
+test "what a lenient CBOR read keeps goes to the scratch region, which is free afterwards, and the output takes none of it" {
+    const sizes = comptime wire.regionSizes(zerde.cbor, RawBox, .{}, .{});
+    try std.testing.expectEqual(wire.maxArenaSize(zerde.cbor, RawBox, .{}, .{}), sizes.output + sizes.scratch);
+    try std.testing.expectEqual(@as(usize, 256), sizes.output);
+    try std.testing.expect(sizes.scratch > 100_000);
+    // A raw item of 130 integer keys in descending order: a lenient read records every key to find a repeat.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x61, 'r', 0xb8, 130 });
+    for (0..130) |index| try input.appendSlice(allocator, &.{ 0x18, @as(u8, @intCast(153 - index)), 0x00 });
+    var region: [4096]u8 align(16) = undefined;
+    @memcpy(region[0..input.items.len], input.items);
+    var scratch: [sizes.scratch]u8 align(16) = undefined;
+    const decoded = try wire.decodeInto(zerde.cbor, RawBox, region[1024..][0..sizes.output], &scratch, @intFromPtr(&region), region[0..input.items.len], .{}, .{});
+    try std.testing.expectEqual(@as(usize, 0), decoded.used);
+    try std.testing.expectEqual(@as(u32, @intCast(input.items.len - 3)), decoded.value.r.len);
+    // The scratch is what a read of that item needs: too little is OutOfMemory, and the output is untouched by it.
+    try std.testing.expectError(error.OutOfMemory, wire.decodeInto(zerde.cbor, RawBox, region[1024..][0..sizes.output], scratch[0..64], @intFromPtr(&region), region[0..input.items.len], .{}, .{}));
+    // A repeat is found through the records, as before.
+    input.items[input.items.len - 2] = 0x99;
+    @memcpy(region[0..input.items.len], input.items);
+    try std.testing.expectError(error.DuplicateField, wire.decodeInto(zerde.cbor, RawBox, region[1024..][0..sizes.output], &scratch, @intFromPtr(&region), region[0..input.items.len], .{}, .{}));
+    // A strict read needs none.
+    try std.testing.expectEqual(@as(usize, 0), wire.regionSizes(zerde.cbor, RawBox, .{}, strict).scratch);
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;

@@ -348,9 +348,10 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
 /// Reads one `T` from `input` in `Format` (`zerde.cbor` or `zerde.json`) and returns its wire
 /// layout. The read is aliased and applies every rule of `T` and of `format_cfg` (strict mode,
 /// limits, bounds, validators, keys, optional policies) as a typed read does. `arena` is a fixed
-/// buffer of at least `maxArenaSize(Format, T, serde_cfg, format_cfg)` bytes; on an error it is put back as
-/// it was. `base` is the address spans are relative to. The wire value points into `input` and
-/// `arena`, which must stay where they are.
+/// buffer of at least `maxArenaSize(Format, T, serde_cfg, format_cfg)` bytes, for the arrays and
+/// strings it writes and for what the reader keeps; on an error it is put back as it was. `base` is the
+/// address spans are relative to. The wire value points into `input` and `arena`, which must stay where
+/// they are. `decodeInto` keeps the reader's scratch apart from the arrays, in a region of its own.
 pub fn decode(
     comptime Format: type,
     comptime T: type,
@@ -360,18 +361,59 @@ pub fn decode(
     comptime serde_cfg: anytype,
     comptime format_cfg: anytype,
 ) !Wire(T) {
+    const mark = arena.end_index;
+    errdefer arena.end_index = mark;
+    return run(Format, T, arena, arena, base, input, serde_cfg, format_cfg);
+}
+
+/// The result of `decodeInto`: the wire value and the bytes of `output` that hold what it points at.
+pub fn Decoded(comptime T: type) type {
+    return struct { value: Wire(T), used: usize };
+}
+
+/// A decode into the caller's regions, with no allocator in the API: `output` (at least
+/// `regionSizes(...).output` bytes) takes the arrays and rewritten strings the wire value points at, and
+/// stays; `scratch` (at least `regionSizes(...).scratch` bytes, a size known at compile time) takes what the
+/// reader keeps while it reads (the key records of a lenient CBOR read of a `Raw`), is free for reuse as soon
+/// as the call returns, and is empty for a strict CBOR read and for JSON. A region too small is
+/// `error.OutOfMemory`. `base` is the address spans are relative to, and the input and `output` must be
+/// memory it reaches. Everything else is `decode`.
+pub fn decodeInto(
+    comptime Format: type,
+    comptime T: type,
+    output: []u8,
+    scratch: []u8,
+    base: usize,
+    input: []const u8,
+    comptime serde_cfg: anytype,
+    comptime format_cfg: anytype,
+) !Decoded(T) {
+    var out = std.heap.FixedBufferAllocator.init(output);
+    var work = std.heap.FixedBufferAllocator.init(scratch);
+    const value = try run(Format, T, &out, &work, base, input, serde_cfg, format_cfg);
+    return .{ .value = value, .used = out.end_index };
+}
+
+/// The read of `decode` and `decodeInto`: the arrays and strings come from `arena`, what the reader keeps from `work`.
+fn run(
+    comptime Format: type,
+    comptime T: type,
+    arena: *std.heap.FixedBufferAllocator,
+    work: *std.heap.FixedBufferAllocator,
+    base: usize,
+    input: []const u8,
+    comptime serde_cfg: anytype,
+    comptime format_cfg: anytype,
+) !Wire(T) {
     if (comptime meta.hasField(@TypeOf(format_cfg), "max_input_bytes")) {
         if (input.len > format_cfg.max_input_bytes) return error.InputTooLarge;
     }
-    const mark = arena.end_index;
-    errdefer arena.end_index = mark;
-    const allocator = arena.allocator();
     const regions = [2][]const u8{ input, arena.buffer };
     const sink: WireSink = .{ .base = base, .memory = .{ .base = base, .regions = &regions }, .arena = arena };
-    var deserializer = try Format.sliceDeserializer(allocator, input, format_cfg);
-    defer deserializer.deinit(allocator);
+    var deserializer = try Format.sliceDeserializer(work.allocator(), input, format_cfg);
+    defer deserializer.deinit(work.allocator());
     deserializer.can_borrow_strings = true;
-    const value = try typed.deserializeInto(sink, T, allocator, &deserializer, serde_cfg);
+    const value = try typed.deserializeInto(sink, T, arena.allocator(), &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
 }
@@ -750,10 +792,21 @@ fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const
 /// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
 /// members (they would cost without limit: set `deny_unknown_fields`), or when it collects extras.
 pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
-    return comptime computeBound(Format, T, serde_cfg, format_cfg);
+    const sizes = comptime computeSizes(Format, T, serde_cfg, format_cfg);
+    return sizes.output + sizes.scratch;
 }
 
-fn computeBound(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
+/// The two regions of `decodeInto`, in bytes: `output` holds the arrays and rewritten strings the wire value
+/// points at, `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON), and
+/// together they are `maxArenaSize`. Each is an upper bound under the same rules, so a region of exactly its
+/// size is enough for any input the config allows.
+pub const Sizes = struct { output: usize, scratch: usize };
+
+pub fn regionSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) Sizes {
+    return comptime computeSizes(Format, T, serde_cfg, format_cfg);
+}
+
+fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) Sizes {
     @setEvalBranchQuota(1_000_000);
     const limits = comptime limitsOf(Format, format_cfg);
     const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0);
@@ -777,9 +830,9 @@ fn computeBound(comptime Format: type, comptime T: type, comptime serde_cfg: any
         text = @min(text, 2 * input);
         transient = @min(transient, building(input));
     }
-    const total = lists + text + transient + cost.scratch + slack;
-    if (total > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
-    return @intCast(total);
+    const output = lists + text + transient + slack;
+    if (output + cost.scratch > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
+    return .{ .output = @intCast(output), .scratch = @intCast(cost.scratch) };
 }
 
 /// How much more than its final `n` bytes a string takes while it is built: its buffer is an array list,

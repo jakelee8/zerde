@@ -501,6 +501,13 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   and chunked strings, base64 payloads, a chain of maps used as keys) into an arena of exactly the bound, and the bound is
   between one and four times what they use. Without `max_input_bytes` the text bound is the sum of the fields' own
   `max_len`, which with a large `max_len` is large.
+- `wire.decodeInto(Format, T, output, scratch, base, input, serde_cfg, format_cfg)` is `decode` with no allocator in the
+  API: `output` and `scratch` are byte slices, and it returns `Decoded(T)`, the value and `used`, the bytes of `output`
+  that hold what it points at. `wire.regionSizes(Format, T, serde_cfg, format_cfg)` gives at compile time their sizes,
+  `.output` for the arrays and rewritten strings (which stay) and `.scratch` for what the reader keeps while it reads
+  (the key records of a lenient CBOR read of a `Raw`; nothing for a strict CBOR read or for JSON), which together are
+  `maxArenaSize` and are each an upper bound of their own. The scratch is free again when the call returns, so one
+  region serves every decode and the output region stays as small as the value. A region too small is `error.OutOfMemory`.
 - `wire.encode(Format, T, arena, memory, wire, writer, serde_cfg, format_cfg)` writes a wire value as the typed value would be
   written (same order, keys, optional policy, determinism). It rebuilds the typed value first, in `arena` (put back after), because
   the writers stream and keep no memory of their own. A wire value that came from outside is not trusted: `memory` is a
