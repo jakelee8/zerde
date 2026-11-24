@@ -3308,3 +3308,106 @@ test "trusted_text skips the UTF-8 check on write" {
     try zerde.serializeWith(zerde.json, &out.writer, Hook{}, .{}, .{ .trusted_text = true });
     try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.json, &out.writer, Hook{}, .{}, .{}));
 }
+
+// ---- bounds on the elements of an array --------------------------------------------------------------------
+
+const Elems = struct {
+    keys: []const []const u8,
+    spans: []const u16,
+    grid: []const []const u16,
+    maybe: ?[]const u16 = null,
+
+    pub const serde = .{ .fields = .{
+        .keys = .{ .max_len = 3, .elem = .{ .min_len = 1, .max_len = 4 } },
+        .spans = .{ .elem = .{ .min = 1, .max = 100 } },
+        .grid = .{ .max_len = 2, .elem = .{ .max_len = 2, .elem = .{ .max = 9 } } },
+        .maybe = .{ .elem = .{ .max = 5 } },
+    } };
+};
+
+fn expectElems(comptime format: type, comptime encode: anytype, comptime err: ?anyerror, value: Elems) !void {
+    var out = try encode(value, .{}, .{});
+    defer out.deinit();
+    if (err) |expected| {
+        try std.testing.expectError(expected, format.parseSlice(Elems, allocator, out.written()));
+    } else {
+        const parsed = try format.parseSlice(Elems, allocator, out.written());
+        zerde.free(allocator, parsed);
+    }
+}
+
+test "bounds on elements are checked for every element, in both formats" {
+    const ok = Elems{ .keys = &.{ "a", "abcd" }, .spans = &.{ 1, 100 }, .grid = &.{ &.{ 1, 9 }, &.{} }, .maybe = &.{ 5, 0 } };
+    inline for (.{ .{ zerde.cbor, writeCbor }, .{ zerde.json, writeJson } }) |pair| {
+        try expectElems(pair[0], pair[1], null, ok);
+        var bad = ok;
+        bad.keys = &.{ "a", "abcde" };
+        try expectElems(pair[0], pair[1], error.LengthOutOfBounds, bad);
+        bad = ok;
+        bad.keys = &.{ "a", "" };
+        try expectElems(pair[0], pair[1], error.LengthOutOfBounds, bad);
+        bad = ok;
+        bad.keys = &.{ "a", "b", "c", "d" };
+        try expectElems(pair[0], pair[1], error.LengthOutOfBounds, bad);
+        bad = ok;
+        bad.spans = &.{ 1, 0 };
+        try expectElems(pair[0], pair[1], error.ValueOutOfRange, bad);
+        bad = ok;
+        bad.spans = &.{ 101, 5 };
+        try expectElems(pair[0], pair[1], error.ValueOutOfRange, bad);
+        bad = ok;
+        bad.grid = &.{ &.{ 1, 2, 3 }, &.{} };
+        try expectElems(pair[0], pair[1], error.LengthOutOfBounds, bad);
+        bad = ok;
+        bad.grid = &.{&.{10}};
+        try expectElems(pair[0], pair[1], error.ValueOutOfRange, bad);
+        bad = ok;
+        bad.maybe = &.{6};
+        try expectElems(pair[0], pair[1], error.ValueOutOfRange, bad);
+        bad = ok;
+        bad.maybe = null;
+        try expectElems(pair[0], pair[1], null, bad);
+    }
+}
+
+test "an element bound stops an oversized element before it is joined or allocated" {
+    const Capped = struct {
+        keys: []const []const u8,
+        pub const serde = .{ .fields = .{ .keys = .{ .elem = .{ .max_len = 2 } } } };
+    };
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x64, 'k', 'e', 'y', 's', 0x81, 0x7f });
+    for (0..64) |_| try input.appendSlice(allocator, &.{ 0x64, 'a', 'b', 'c', 'd' });
+    try input.append(allocator, 0xff);
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Capped, failing.allocator(), input.items));
+    try std.testing.expect(failing.allocated_bytes <= 32);
+    // The call site can bound the elements too, and a read without bounds is unaffected.
+    const Plain = struct { keys: []const []const u8 };
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSliceWith(Plain, allocator, "{\"keys\":[\"abc\"]}", .{ .fields = .{ .keys = .{ .elem = .{ .max_len = 2 } } } }, .{}));
+    const free = try zerde.json.parseSlice(Plain, allocator, "{\"keys\":[\"abc\"]}");
+    zerde.free(allocator, free);
+    // A struct check still runs after element bounds, and reflection reports them.
+    const info = comptime zerde.reflect.fields(Elems, .{});
+    try std.testing.expect(info[0].bounds.elem.?.max_len == 4);
+    try std.testing.expect(info[2].bounds.elem.?.elem.?.max.? == 9);
+    try std.testing.expect(info[3].bounds.elem.?.max.? == 5);
+}
+
+test "element bounds also apply in formats that state a length without a closing check" {
+    const Short = struct {
+        keys: []const []const u8,
+        pub const serde = .{ .fields = .{ .keys = .{ .elem = .{ .max_len = 2 } } } };
+    };
+    inline for (.{ zerde.bson, zerde.msgpack, zerde.yaml, zerde.toml, zerde.zon }) |Format| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try zerde.serializeWith(Format, &out.writer, Short{ .keys = &.{ "ab", "c" } }, .{}, .{});
+        const ok = try Format.parseSlice(Short, allocator, out.written());
+        zerde.free(allocator, ok);
+        out.clearRetainingCapacity();
+        try zerde.serializeWith(Format, &out.writer, Short{ .keys = &.{ "ab", "cde" } }, .{}, .{});
+        try std.testing.expectError(error.LengthOutOfBounds, Format.parseSlice(Short, allocator, out.written()));
+    }
+}

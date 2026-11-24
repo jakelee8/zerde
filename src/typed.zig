@@ -806,14 +806,14 @@ fn deserializePointer(
 
                 if (@hasDecl(DeserializerType, "finishKnownLenArray")) {
                     for (0..len) |index| {
-                        items[index] = try deserializeIndexedValue(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index);
+                        items[index] = try deserializeElement(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index, bounds);
                         initialized = index + 1;
                     }
                     try deserializer.finishKnownLenArray();
                 } else {
                     for (0..len) |index| {
                         if (!try deserializer.nextArrayItem()) return error.LengthMismatch;
-                        items[index] = try deserializeIndexedValue(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index);
+                        items[index] = try deserializeElement(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index, bounds);
                         initialized = index + 1;
                     }
 
@@ -831,7 +831,7 @@ fn deserializePointer(
 
             while (try deserializer.nextArrayItem()) {
                 if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;
-                const item = try deserializeIndexedValue(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len);
+                const item = try deserializeElement(info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len, bounds);
                 errdefer freeTypedPartial(info.child, allocator, item, borrowed_strings);
                 try items.append(allocator, item);
             }
@@ -1110,6 +1110,25 @@ fn structHasIntegerKeys(comptime T: type, comptime info: std.builtin.Type.Struct
         if (meta.effectiveFieldKey(T, field_name, cfg) == .integer) return true;
     }
     return false;
+}
+
+/// One element of an array field: read as the field's `elem` bounds say, if it has any.
+fn deserializeElement(
+    comptime T: type,
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track_diagnostics: bool,
+    index: usize,
+    comptime bounds: meta.Bounds,
+) anyerror!T {
+    if (comptime bounds.elem == null) return deserializeIndexedValue(T, allocator, deserializer, cfg, diagnostics, track_diagnostics, index);
+    const elem = comptime bounds.elem.?;
+    if (track_diagnostics) diagnostics.?.pushIndex(index);
+    const value = deserializeBounded(T, elem.*, allocator, deserializer, cfg, diagnostics, track_diagnostics) catch |err| return err;
+    if (track_diagnostics) diagnostics.?.pop();
+    return value;
 }
 
 fn deserializeIndexedValue(

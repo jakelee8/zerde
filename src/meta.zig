@@ -76,9 +76,12 @@ pub const Bounds = struct {
     max_len: usize = std.math.maxInt(usize),
     min: ?i128 = null,
     max: ?i128 = null,
+    /// The bounds of each element of an array field (`.elem = .{ .max_len = 1024 }`), which may
+    /// have an `elem` of its own for an array of arrays.
+    elem: ?*const Bounds = null,
 
     pub fn isDefault(comptime self: Bounds) bool {
-        return self.min_len == 0 and self.max_len == std.math.maxInt(usize) and self.min == null and self.max == null;
+        return self.min_len == 0 and self.max_len == std.math.maxInt(usize) and self.min == null and self.max == null and self.elem == null;
     }
 };
 
@@ -220,6 +223,26 @@ pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, compti
             break :blk null;
         };
         if (found) |value| @field(bounds, option) = value;
+    }
+    if (comptime fieldOverrideHas(cfg, field_name, "elem")) {
+        const elem = comptime boundsOf(fieldOverride(cfg, field_name, "elem"));
+        bounds.elem = &elem;
+    } else if (comptime @hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, "elem")) {
+        const elem = comptime boundsOf(fieldOverride(T.serde, field_name, "elem"));
+        bounds.elem = &elem;
+    }
+    return bounds;
+}
+
+/// The bounds a struct literal states, as `.{ .max_len = 8, .elem = .{ .min = 0 } }`.
+fn boundsOf(comptime attrs: anytype) Bounds {
+    var bounds: Bounds = .{};
+    inline for (.{ "min_len", "max_len", "min", "max" }) |option| {
+        if (comptime hasField(@TypeOf(attrs), option)) @field(bounds, option) = @field(attrs, option);
+    }
+    if (comptime hasField(@TypeOf(attrs), "elem")) {
+        const elem = comptime boundsOf(@field(attrs, "elem"));
+        bounds.elem = &elem;
     }
     return bounds;
 }
