@@ -498,7 +498,6 @@ MUTANTS = [
     ("resumable.zig", "            if (self.finished) return .{ .len = 0, .done = true };\n", ""),
     ("resumable.zig", "            self.finished = true;\n", ""),
     ("resumable.zig", "                error.WindowFull => return .{ .len = writer.end, .done = false },", "                error.WindowFull => return .{ .len = writer.end, .done = true },"),
-    ("typed.zig", ".float => |info| if (info.bits <= 32) atomic_room else if (info.bits == 64) 340 else 5000,", ".float => |info| if (info.bits <= 32) atomic_room else if (info.bits == 64) 64 else 5000,"),
     ("cbor.zig", "        if (add > self.max_container_bytes -| used) return error.ContainerTooLarge;\n    }\n\n    pub fn writeNull", "    }\n\n    pub fn writeNull"),
     ("cbor.zig", "        if (self.depth == 0) return;\n        const used = self.frames[self.depth - 1].buf.written().len;", "        const used = self.frames[self.depth - 1].buf.written().len;"),
     ("cbor.zig", "        try self.room(9 + value.len);\n        try encodeText", "        try encodeText"),
@@ -552,6 +551,9 @@ MUTANTS = [
     ("typed.zig", "        if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;\n        const key: []const u8", "        const key: []const u8"),
     ("typed.zig", "    if (comptime @hasDecl(@TypeOf(deserializer.*), \"nextSortedKey\")) return deserializer.nextSortedKey(allocator);\n", ""),
     ("json.zig", "const exponent_cap = 1 << 50;", "const exponent_cap = 1_000_000;"),
+    ("json.zig", "if (k <= point and point <= 21) {", "if (k <= point and point <= 22) {"),
+    ("json.zig", "} else if (-6 < point and point <= 0) {", "} else if (-7 < point and point <= 0) {"),
+    ("json.zig", "        if (exponent > 0) {\n            buffer[length] = '+';", "        if (exponent > 1000) {\n            buffer[length] = '+';"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

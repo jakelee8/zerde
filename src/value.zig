@@ -269,7 +269,10 @@ fn writeJson(writer: *std.Io.Writer, value: Value) !void {
         .null => try writer.writeAll("null"),
         .bool => |b| try writer.writeAll(if (b) "true" else "false"),
         .integer => |n| try writer.print("{}", .{n}),
-        .float => |n| try writer.print("{}", .{n}),
+        .float => |n| {
+            var buffer: [json_format.float_text_max]u8 = undefined;
+            try writer.writeAll(json_format.floatText(&buffer, n));
+        },
         .string => |s| try writeDoubleQuotedString(writer, s.bytes),
         .bytes => |bytes| try writeJsonByteArray(writer, bytes.bytes),
         .array => |items| {

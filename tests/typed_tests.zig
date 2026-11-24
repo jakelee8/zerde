@@ -6552,3 +6552,92 @@ test "an escaped string ends at max_string_len, and a long key is no name, in JS
     const matched = try zerde.json.parseSlice(Holder6, allocator, "{\"u\":{\"ab\\u0063\\u0064\":7}}");
     try std.testing.expectEqual(@as(u8, 7), matched.u.abcd);
 }
+
+// ---- JSON float text: the shortest digits, laid out as ECMAScript's Number::toString (RFC 8785) -----------------------
+
+fn expectFloatText(expected: []const u8, value: anytype) !void {
+    var buffer: [zerde.json.float_text_max]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, zerde.json.floatText(&buffer, value));
+}
+
+test "a JSON float is written as the shortest digits that read back, in ECMAScript's layout" {
+    // Decimal from 1e-6 up to 1e21, whole numbers without a point.
+    try expectFloatText("0", @as(f64, 0));
+    try expectFloatText("-0", @as(f64, -0.0));
+    try expectFloatText("1", @as(f64, 1));
+    try expectFloatText("100", @as(f64, 100));
+    try expectFloatText("-1.5", @as(f64, -1.5));
+    try expectFloatText("0.1", @as(f64, 0.1));
+    var tenth: f64 = 0.1;
+    tenth += 0.2;
+    try expectFloatText("0.30000000000000004", tenth);
+    try expectFloatText("123456789012345680000", @as(f64, 123456789012345678901.0));
+    try expectFloatText("0.000001", @as(f64, 1e-6));
+    try expectFloatText("0.0000012345", @as(f64, 1.2345e-6));
+    // Scientific beyond them, with a sign on a positive exponent.
+    try expectFloatText("1e+21", @as(f64, 1e21));
+    try expectFloatText("1.5e+300", @as(f64, 1.5e300));
+    try expectFloatText("1e-7", @as(f64, 1e-7));
+    try expectFloatText("1.2345e-7", @as(f64, 1.2345e-7));
+    try expectFloatText("1.7976931348623157e+308", std.math.floatMax(f64));
+    try expectFloatText("-1.7976931348623157e+308", -std.math.floatMax(f64));
+    try expectFloatText("5e-324", std.math.floatTrueMin(f64));
+    try expectFloatText("3.4028235e+38", std.math.floatMax(f32));
+    try expectFloatText("1e-45", std.math.floatTrueMin(f32));
+    try expectFloatText("0.1", @as(f32, 0.1));
+}
+
+test "a JSON float round-trips exactly, and no float of any type is longer than float_text_max, or 25 bytes for f64" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var buffer: [zerde.json.float_text_max]u8 = undefined;
+    for (0..20_000) |_| {
+        const bits = random.int(u64);
+        const value: f64 = @bitCast(bits);
+        if (!std.math.isFinite(value)) continue;
+        const text = zerde.json.floatText(&buffer, value);
+        try std.testing.expect(text.len <= 25);
+        try std.testing.expectEqual(bits, @as(u64, @bitCast(try std.fmt.parseFloat(f64, text))));
+        const small: f32 = @bitCast(random.int(u32));
+        if (!std.math.isFinite(small)) continue;
+        const small_text = zerde.json.floatText(&buffer, small);
+        try std.testing.expectEqual(@as(u32, @bitCast(small)), @as(u32, @bitCast(try std.fmt.parseFloat(f32, small_text))));
+    }
+    // The widest types, at their extremes.
+    inline for (.{ f16, f80, f128 }) |T| {
+        inline for (.{ std.math.floatMax(T), -std.math.floatMax(T), std.math.floatTrueMin(T), -std.math.floatTrueMin(T), std.math.floatMin(T), -std.math.floatMin(T), std.math.floatEps(T) }) |value| {
+            const text = zerde.json.floatText(&buffer, value);
+            try std.testing.expect(text.len <= zerde.json.float_text_max);
+            try std.testing.expectEqual(value, try std.fmt.parseFloat(T, text));
+        }
+    }
+}
+
+test "every JSON writer writes a float alike, and a window of min_window holds the widest float of either format" {
+    const Reals = struct { a: f64, b: f64, c: f32, d: f64 };
+    const value: Reals = .{ .a = -std.math.floatMax(f64), .b = std.math.floatTrueMin(f64), .c = -1.2345e-7, .d = 1e21 };
+    try expectJsonText("{\"a\":-1.7976931348623157e+308,\"b\":5e-324,\"c\":-1.2345e-7,\"d\":1e+21}", value, .{}, .{});
+    // The dynamic value writers and the value tree agree with the typed writer.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = zerde.json.valueWriter(allocator, &out.writer, .{});
+    try writer.beginArray();
+    try writer.writeFloat(1e21);
+    var tenth: f64 = 0.1;
+    tenth += 0.2;
+    try writer.writeFloat(tenth);
+    try writer.endArray();
+    try writer.finish();
+    try std.testing.expectEqualStrings("[1e+21,0.30000000000000004]", out.written());
+    try expectWindows(zerde.json, Reals, value, .{}, .{});
+    try expectWindows(zerde.cbor, Reals, value, .{}, .{});
+    try expectWindows(zerde.cbor, Reals, value, .{}, .{ .deterministic = true });
+    // Floats in an array are not covered by a field's room: each reserves its own.
+    const Series = struct { xs: []const f64 };
+    const series: Series = .{ .xs = &.{ -std.math.floatMax(f64), 1.5, std.math.floatTrueMin(f64), 1e21, -1.2345e-7, 100 } };
+    try expectWindows(zerde.json, Series, series, .{}, .{});
+    try expectWindows(zerde.cbor, Series, series, .{}, .{});
+    // One window size for both formats: a float no longer sets it.
+    try std.testing.expectEqual(zerde.resumable.Writer(zerde.json, Reals, .{}, .{}).min_window, zerde.resumable.Writer(zerde.cbor, Reals, .{}, .{}).min_window);
+    try std.testing.expectEqual(zerde.typed.atomic_room + 6 * 1 + 7, zerde.resumable.Writer(zerde.json, Reals, .{}, .{}).min_window);
+}

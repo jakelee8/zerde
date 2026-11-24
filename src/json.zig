@@ -141,7 +141,8 @@ pub fn JsonSerializer(comptime Config: type) type {
         /// refused instead of written as `nan` or `inf`, which no JSON parser accepts.
         pub fn emitFloat(self: *Self, value: anytype) !void {
             if (!std.math.isFinite(value)) return error.NonFiniteFloat;
-            try self.writer.print("{}", .{value});
+            var buffer: [float_text_max]u8 = undefined;
+            try self.writer.writeAll(floatText(&buffer, value));
         }
 
         pub fn emitString(self: *Self, value: []const u8) !void {
@@ -1002,7 +1003,8 @@ pub const Encoder = struct {
     pub fn writeFloat(self: *Encoder, value: f64) !void {
         if (!std.math.isFinite(value)) return error.NonFiniteFloat;
         try self.beforeValue();
-        try self.writer.print("{}", .{value});
+        var buffer: [float_text_max]u8 = undefined;
+        try self.writer.writeAll(floatText(&buffer, value));
         self.afterValue();
     }
 
@@ -1204,8 +1206,10 @@ pub const ValueWriter = struct {
     pub fn writeFloat(self: *ValueWriter, value: f64) !void {
         if (!std.math.isFinite(value)) return error.NonFiniteFloat;
         try self.beforeValue();
-        try self.room(std.fmt.count("{}", .{value}) + 1);
-        try self.sink().print("{}", .{value});
+        var buffer: [float_text_max]u8 = undefined;
+        const text = floatText(&buffer, value);
+        try self.room(text.len + 1);
+        try self.sink().writeAll(text);
         try self.afterValue();
     }
 
@@ -1448,6 +1452,81 @@ pub fn parseSliceAliasedWith(
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
+}
+
+/// The most bytes `floatText` writes, for any float type: 25 for an `f64`, 41 for an `f128`.
+pub const float_text_max = 64;
+
+/// A finite float as JSON number text: the shortest digits that read back to the same value (what Zig's `std.fmt.float`
+/// renders), laid out as ECMAScript's Number::toString does, which RFC 8785 (JCS) takes for JSON: decimal for magnitudes
+/// from 1e-6 up to 1e21, otherwise scientific, `d.ddde-7` or `de+21`. A whole number is written without a point
+/// (`100`, not `100.0`), so it reads into an integer field as before. It differs from ECMAScript in one case: `-0` is
+/// written as `-0`, which reads back as negative zero, where ECMAScript writes `0`. The text is in `buffer`; a value that is
+/// not finite is Zig's `nan`/`inf`, which callers refuse before.
+pub fn floatText(buffer: *[float_text_max]u8, value: anytype) []const u8 {
+    var scientific: [std.fmt.float.min_buffer_size]u8 = undefined;
+    const rendered = std.fmt.float.render(&scientific, value, .{}) catch unreachable;
+    if (!std.math.isFinite(value)) {
+        @memcpy(buffer[0..rendered.len], rendered);
+        return buffer[0..rendered.len];
+    }
+    var digits: [48]u8 = undefined;
+    var count: usize = 0;
+    var at: usize = 0;
+    const negative = rendered[0] == '-';
+    if (negative) at = 1;
+    while (rendered[at] != 'e') : (at += 1) {
+        if (rendered[at] == '.') continue;
+        digits[count] = rendered[at];
+        count += 1;
+    }
+    const exponent = std.fmt.parseInt(i32, rendered[at + 1 ..], 10) catch unreachable;
+    // `point` digits come before the decimal point.
+    const point: i32 = exponent + 1;
+    const k: i32 = @intCast(count);
+    var length: usize = 0;
+    if (negative) {
+        buffer[0] = '-';
+        length = 1;
+    }
+    if (k <= point and point <= 21) {
+        @memcpy(buffer[length..][0..count], digits[0..count]);
+        length += count;
+        @memset(buffer[length..][0..@intCast(point - k)], '0');
+        length += @intCast(point - k);
+    } else if (0 < point and point <= 21) {
+        const before: usize = @intCast(point);
+        @memcpy(buffer[length..][0..before], digits[0..before]);
+        length += before;
+        buffer[length] = '.';
+        length += 1;
+        @memcpy(buffer[length..][0 .. count - before], digits[before..count]);
+        length += count - before;
+    } else if (-6 < point and point <= 0) {
+        @memcpy(buffer[length..][0..2], "0.");
+        length += 2;
+        @memset(buffer[length..][0..@intCast(-point)], '0');
+        length += @intCast(-point);
+        @memcpy(buffer[length..][0..count], digits[0..count]);
+        length += count;
+    } else {
+        buffer[length] = digits[0];
+        length += 1;
+        if (count > 1) {
+            buffer[length] = '.';
+            length += 1;
+            @memcpy(buffer[length..][0 .. count - 1], digits[1..count]);
+            length += count - 1;
+        }
+        buffer[length] = 'e';
+        length += 1;
+        if (exponent > 0) {
+            buffer[length] = '+';
+            length += 1;
+        }
+        length += (std.fmt.bufPrint(buffer[length..], "{d}", .{exponent}) catch unreachable).len;
+    }
+    return buffer[0..length];
 }
 
 /// The integer a JSON number's text has as its exact decimal value, for `ReadConfig.integral_numbers`: the digits times a

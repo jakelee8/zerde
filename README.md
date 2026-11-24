@@ -486,6 +486,11 @@ maps that hold it; `error.OutOfMemory` when short). It differs from `canonicaliz
 an array or a map, and `canonicalizeInto` refuses it with `error.UnexpectedType`, as the pull reader does, because ordering it would need its own
 canonical form kept, which has no bound. Repeated keys (any spelling, and 0.0 with -0.0) are `error.DuplicateField`.
 
+JSON writes a float as the shortest digits that read back to the same value, laid out as ECMAScript's Number::toString does
+(RFC 8785): decimal from 1e-6 up to 1e21 (a whole number has no point: `100`), otherwise scientific with a signed exponent
+(`1e+21`, `1.2345e-7`), so `JSON.stringify` writes the same bytes; negative zero is the one difference, written `-0`
+so it reads back as itself. No float is longer than 25 bytes (`f64`) or 41 (`f128`).
+
 ### Resumable writes
 
 `zerde.resumable.Writer(Format, T, serde_cfg, format_cfg)` writes a `T` as JSON or CBOR in fixed windows. `init()`
@@ -494,8 +499,8 @@ the next piece into `window` and returns `.{ .len, .done }`, so a stream can be 
 window of, say, 64 KiB, a window at a time as the consumer has room. Nothing is buffered, sorted or written twice: a
 window ends at a token or inside a long string, byte string or `Raw`, which goes on from its byte, and the next call
 goes down the same path of containers by the indexes the cursor keeps. It is the typed walk of `serializeWith`, so the
-bytes are the same and every rule of the schema holds. A window must hold one token, `Writer.min_window` (a number
-or head and the longest field name escaped: `error.WindowTooSmall` below it). Not supported (compile errors): extras,
+bytes are the same and every rule of the schema holds. A window must hold one token, `Writer.min_window` (64 bytes for a number or head, which holds any float of either format,
+plus the longest field name escaped and 7: `error.WindowTooSmall` below it). Not supported (compile errors): extras,
 encode hooks and `bin`'s sequence path. The value must be the same in every call. `zig build bench-wire` measures
 the windows against the whole write on real text (`bench/WIRE.md`).
 

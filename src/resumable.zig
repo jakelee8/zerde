@@ -42,7 +42,7 @@ pub fn Writer(comptime Format: type, comptime T: type, comptime serde_cfg: anyty
 
         /// The smallest window `fill` can make progress in: the largest token the schema writes, which is a
         /// number or a head and the longest field name, escaped.
-        pub const min_window: usize = @max(typed.atomic_room, widestFloat(T, 0)) + 6 * longestKey(T, serde_cfg, 0) + 7;
+        pub const min_window: usize = typed.atomic_room + 6 * longestKey(T, serde_cfg, 0) + 7;
 
         pub fn init() Self {
             return .{ .serializer = Format.serializer(@as(*std.Io.Writer, undefined), format_cfg) };
@@ -95,29 +95,5 @@ fn longestKey(comptime T: type, comptime cfg: anytype, comptime depth: usize) us
             else => {},
         }
         break :blk longest;
-    };
-}
-
-/// The room the widest float `T` holds can take as text; see `typed.floatRoom`.
-fn widestFloat(comptime T: type, comptime depth: usize) usize {
-    @setEvalBranchQuota(1_000_000);
-    if (depth == 16) return 0;
-    return comptime blk: {
-        var widest: usize = 0;
-        switch (@typeInfo(T)) {
-            .float => widest = typed.floatRoom(T),
-            .@"struct" => |info| {
-                if (typed.isRaw(T) or T == typed.ByteString) break :blk 0;
-                for (info.field_types) |FieldType| widest = @max(widest, widestFloat(FieldType, depth + 1));
-            },
-            .@"union" => |info| for (info.field_types) |PayloadType| {
-                if (PayloadType != void) widest = @max(widest, widestFloat(PayloadType, depth + 1));
-            },
-            .optional => |info| widest = widestFloat(info.child, depth + 1),
-            .array => |info| widest = widestFloat(info.child, depth + 1),
-            .pointer => |info| widest = widestFloat(info.child, depth + 1),
-            else => {},
-        }
-        break :blk widest;
     };
 }

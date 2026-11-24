@@ -261,17 +261,9 @@ pub const TextState = struct { at: usize = 0, started: bool = false };
 pub const resume_max_depth = 128;
 
 /// The most bytes any token of a resumable write takes, that a window must have room for (a number, a head, a
-/// bracket); a name adds its own, which `keyRoom` counts.
+/// bracket, a float: at most 25 bytes of JSON for an `f64`, 41 for an `f128`, 9 of CBOR); a name adds its own, which
+/// `keyRoom` counts.
 pub const atomic_room = 64;
-
-/// The room a float can take as text: JSON writes the digits of a double in full (a value near 1e308 is 309 of them, and one
-/// near 1e-308 as many after the point), so a window must have room for that.
-pub fn floatRoom(comptime T: type) usize {
-    return switch (@typeInfo(T)) {
-        .float => |info| if (info.bits <= 32) atomic_room else if (info.bits == 64) 340 else 5000,
-        else => atomic_room,
-    };
-}
 
 /// Marks a write that is not resumable: every resume step compiles to nothing.
 pub const NoResume = struct {};
@@ -368,7 +360,7 @@ fn serializeValue(
             try serializer.emitInteger(value);
         },
         .float, .comptime_float => {
-            try reserveRoom(rc, floatRoom(T));
+            try reserveRoom(rc, atomic_room);
             try serializer.emitFloat(value);
         },
         .optional => |info| {

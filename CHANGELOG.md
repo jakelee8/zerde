@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- changed (JSON output): a float is written as the shortest digits that read back to the same value, laid out as ECMAScript's Number::toString does (RFC 8785): decimal from 1e-6 up to 1e21, otherwise scientific with a signed exponent (`1e+21`, `1.2345e-7`, `5e-324`, `1.7976931348623157e+308`); `-0` stays `-0`. Before, the digits were written out in full (`1.7976931348623157e308` was 309 digits, `5e-324` 326 bytes). Values between 1e-6 and 1e21 are byte-identical to before; no JSON corpus fixture changes. At most 25 bytes for an `f64`, 41 for an `f128` (`json.floatText`, `float_text_max`), in the typed writer, `valueWriter`, `Encoder` and `Value` to JSON
+- changed (`resumable.Writer.min_window`): a float needs no room of its own in either format (JSON at most 41 bytes, CBOR 9), so the window is `typed.atomic_room + 6 * longest key + 7` for both: 71 bytes plus the key room where it was 353 (`typed.floatRoom` is removed)
 - fixed: `integral_numbers` kept the true exponent: the exponent used to saturate at 1,000,000, which a fraction of that many digits cancelled, so `0.` + 999,999 zeros + `1e2000000` read as `1` and `1` + 1,500,000 zeros + `e-2000000` was `error.IntegerOverflow` for `error.UnexpectedType`; it now saturates at 2^50
 - fixed: a `SortedMap` read checks `max_len` at each entry (an indefinite or JSON map was checked only after it was read, 10,008 allocations for 5,000 entries against a bound of 4); a lenient CBOR `SortedMap` read records no key for the repeated-key check (`nextSortedKey`), which `regionSizes` did not count and which ran a decode of exactly `regionSizes` out of memory
 - fixed (JSON): `-0` is read into an unsigned integer as 0 (it was `error.IntegerOverflow`), as `-0.0` is with `integral_numbers`
