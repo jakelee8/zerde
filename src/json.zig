@@ -1091,9 +1091,14 @@ pub const Encoder = struct {
 /// `sort_keys` (the default) shorter keys come first and equal lengths bytewise, which is the order of
 /// deterministic CBOR keys, and a repeated key is `error.DuplicateField`. Arrays are written as they
 /// come. Bytes are written in the config's `bytes` encoding, and a NaN or infinity is refused.
+/// `cfg` may set `sort_keys`, `bytes`, `trusted_text` and `max_container_bytes`: the most output the buffer of one open map
+/// may hold (default unbounded). A map is held whole to be sorted, with the arrays inside it, so this bounds the one place the
+/// writer buffers: a write that would pass it is `error.ContainerTooLarge`, before anything is allocated for it. Output
+/// outside every map goes straight to `writer` and is not counted.
 pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
     var result = ValueWriter.init(allocator, writer, readLimitFlag(cfg, "sort_keys", true), bytesEncoding(@TypeOf(cfg), cfg));
     result.trusted_text = readLimitFlag(cfg, "trusted_text", false);
+    if (comptime meta.hasField(@TypeOf(cfg), "max_container_bytes")) result.max_container_bytes = @field(cfg, "max_container_bytes");
     return result;
 }
 
@@ -1103,6 +1108,7 @@ pub const ValueWriter = struct {
     sort_keys: bool,
     encoding: BytesEncoding,
     trusted_text: bool = false,
+    max_container_bytes: usize = std.math.maxInt(usize),
     frames: [128]Frame = undefined,
     depth: usize = 0,
 
@@ -1138,20 +1144,39 @@ pub const ValueWriter = struct {
         if (self.depth != 0) return error.UnbalancedContainers;
     }
 
+    /// Refuses `add` bytes more in the buffer of the map that holds the output at `level` open containers when they would pass
+    /// `max_container_bytes`.
+    fn roomAt(self: *ValueWriter, level: usize, add: usize) !void {
+        var at = level;
+        while (at > 0) : (at -= 1) {
+            if (self.frames[at - 1].kind != .object) continue;
+            const used = self.frames[at - 1].buf.written().len;
+            if (add > self.max_container_bytes -| used) return error.ContainerTooLarge;
+            return;
+        }
+    }
+
+    fn room(self: *ValueWriter, add: usize) !void {
+        try self.roomAt(self.depth, add);
+    }
+
     pub fn writeNull(self: *ValueWriter) !void {
         try self.beforeValue();
+        try self.room(5);
         try self.sink().writeAll("null");
         try self.afterValue();
     }
 
     pub fn writeBool(self: *ValueWriter, value: bool) !void {
         try self.beforeValue();
+        try self.room(6);
         try self.sink().writeAll(if (value) "true" else "false");
         try self.afterValue();
     }
 
     pub fn writeInt(self: *ValueWriter, value: i128) !void {
         try self.beforeValue();
+        try self.room(std.fmt.count("{}", .{value}) + 1);
         try self.sink().print("{}", .{value});
         try self.afterValue();
     }
@@ -1159,6 +1184,7 @@ pub const ValueWriter = struct {
     pub fn writeFloat(self: *ValueWriter, value: f64) !void {
         if (!std.math.isFinite(value)) return error.NonFiniteFloat;
         try self.beforeValue();
+        try self.room(std.fmt.count("{}", .{value}) + 1);
         try self.sink().print("{}", .{value});
         try self.afterValue();
     }
@@ -1169,6 +1195,8 @@ pub const ValueWriter = struct {
             const frame = &self.frames[self.depth - 1];
             if (frame.kind == .object and frame.expect_key) {
                 const out = &frame.buf.writer;
+                // The key and its colon, and the comma that will join the entry to the one before it.
+                try self.room(escapedLen(value) + 3 + 1);
                 frame.entry_start = frame.buf.written().len;
                 try writeStringText(out, value, self.trusted_text);
                 try out.writeByte(':');
@@ -1180,12 +1208,18 @@ pub const ValueWriter = struct {
             }
         }
         try self.beforeValue();
+        try self.room(escapedLen(value) + 1);
         try writeStringText(self.sink(), value, self.trusted_text);
         try self.afterValue();
     }
 
     pub fn writeBytes(self: *ValueWriter, value: []const u8) !void {
         try self.beforeValue();
+        try self.room(switch (self.encoding) {
+            .string => escapedLen(value) + 1,
+            .base64 => std.base64.standard.Encoder.calcSize(value.len) + 3,
+            .base64url => std.base64.url_safe_no_pad.Encoder.calcSize(value.len) + 3,
+        });
         try writeBytesText(self.sink(), self.encoding, value);
         try self.afterValue();
     }
@@ -1194,18 +1228,21 @@ pub const ValueWriter = struct {
     pub fn writeRaw(self: *ValueWriter, text: []const u8) !void {
         try verifyText(text);
         try self.beforeValue();
+        try self.room(text.len + 1);
         try self.sink().writeAll(text);
         try self.afterValue();
     }
 
     pub fn beginArray(self: *ValueWriter) !void {
         try self.beforeValue();
+        try self.room(2);
         try self.push(.array);
         try self.sink().writeByte('[');
     }
 
     pub fn endArray(self: *ValueWriter) !void {
         if (self.depth == 0 or self.frames[self.depth - 1].kind != .array) return error.UnbalancedContainers;
+        try self.room(1);
         try self.sink().writeByte(']');
         self.depth -= 1;
         try self.afterValue();
@@ -1239,6 +1276,8 @@ pub const ValueWriter = struct {
                 if (std.mem.eql(u8, keys[before.key_start..][0..before.key_len], keys[entry.key_start..][0..entry.key_len])) return error.DuplicateField;
             }
         }
+        // The map's text goes to the map around it: its entries, the commas between them and the braces.
+        try self.roomAt(self.depth - 1, body.len + entries.len + 2);
         const out = self.sinkAt(self.depth - 1);
         try out.writeByte('{');
         for (entries, 0..) |entry, index| {
@@ -1491,6 +1530,19 @@ fn writeStringText(writer: *std.Io.Writer, value: []const u8, trusted: bool) !vo
 pub fn writeEscapedString(writer: *std.Io.Writer, bytes: []const u8) !void {
     if (!bulk.validUtf8(bytes)) return error.InvalidUtf8;
     try writeQuoted(writer, bytes);
+}
+
+/// The bytes the JSON string literal of `value` takes between its quotes: the text, and the extra of each escape.
+fn escapedLen(value: []const u8) usize {
+    var total = value.len;
+    var at: usize = 0;
+    while (true) {
+        at = bulk.findStringSpecial(value, at);
+        if (at >= value.len) return total;
+        var escape: [6]u8 = undefined;
+        total += bulk.escapeInto(&escape, value[at]) - 1;
+        at += 1;
+    }
 }
 
 /// A string literal for text already known to be UTF-8.

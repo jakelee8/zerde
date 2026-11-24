@@ -2075,8 +2075,14 @@ pub fn PullReader(comptime Config: type) type {
 /// its keys (RFC 8949 §4.2.1; a repeated key is `error.DuplicateField`) and a float is written in its
 /// shortest exact width; without it entries keep the order they were written in and a float is a
 /// double. A map's items are keys and values alternately, and a key can be any item.
+/// `cfg` may set `deterministic`, `trusted_text` and `max_container_bytes`: the most output one open container may hold
+/// (default unbounded). A container is held whole because a map is sorted when it closes and a length precedes its items,
+/// so this is the bound of the one place the writer buffers: a write that would pass it is `error.ContainerTooLarge`,
+/// before anything is allocated for it. Output at the top level goes straight to `writer` and is not counted.
 pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
-    return ValueWriter.init(allocator, writer, effectiveDeterministic(cfg), readOption(cfg, "trusted_text", false));
+    var result = ValueWriter.init(allocator, writer, effectiveDeterministic(cfg), readOption(cfg, "trusted_text", false));
+    result.max_container_bytes = readOption(cfg, "max_container_bytes", std.math.maxInt(usize));
+    return result;
 }
 
 /// A writer for a wire type's encode hook: items go out as they are written, with no buffering and
@@ -2264,6 +2270,7 @@ pub const ValueWriter = struct {
     out: *std.Io.Writer,
     deterministic: bool,
     trusted_text: bool = false,
+    max_container_bytes: usize = std.math.maxInt(usize),
     frames: [max_nesting]Frame = undefined,
     depth: usize = 0,
 
@@ -2299,38 +2306,51 @@ pub const ValueWriter = struct {
         if (self.depth != 0) return error.UnbalancedContainers;
     }
 
+    /// Refuses `add` bytes more in the container being written when they would pass `max_container_bytes`.
+    fn room(self: *ValueWriter, add: usize) !void {
+        if (self.depth == 0) return;
+        const used = self.frames[self.depth - 1].buf.written().len;
+        if (add > self.max_container_bytes -| used) return error.ContainerTooLarge;
+    }
+
     pub fn writeNull(self: *ValueWriter) !void {
         try self.beforeItem();
+        try self.room(1);
         try self.sink().writeByte(0xf6);
         try self.afterItem();
     }
 
     pub fn writeBool(self: *ValueWriter, value: bool) !void {
         try self.beforeItem();
+        try self.room(1);
         try self.sink().writeByte(if (value) 0xf5 else 0xf4);
         try self.afterItem();
     }
 
     pub fn writeInt(self: *ValueWriter, value: i128) !void {
         try self.beforeItem();
+        try self.room(9);
         try encodeInt(self.sink(), value);
         try self.afterItem();
     }
 
     pub fn writeFloat(self: *ValueWriter, value: f64) !void {
         try self.beforeItem();
+        try self.room(9);
         if (self.deterministic) try writePreferredFloat(self.sink(), value) else try encodeFloat(self.sink(), value);
         try self.afterItem();
     }
 
     pub fn writeText(self: *ValueWriter, value: []const u8) !void {
         try self.beforeItem();
+        try self.room(9 + value.len);
         try encodeText(self.sink(), value, self.trusted_text);
         try self.afterItem();
     }
 
     pub fn writeBytes(self: *ValueWriter, value: []const u8) !void {
         try self.beforeItem();
+        try self.room(9 + value.len);
         const out = self.sink();
         try writeMajorValue(out, 2, value.len);
         try out.writeAll(value);
@@ -2342,6 +2362,8 @@ pub const ValueWriter = struct {
     /// leniently comes out as a strict read accepts it.
     pub fn writeRaw(self: *ValueWriter, bytes: []const u8) !void {
         try self.beforeItem();
+        // The canonical form is never longer than the item, so its length bounds both.
+        try self.room(bytes.len);
         if (self.deterministic) {
             const canonical = try canonicalize(self.allocator, bytes);
             defer self.allocator.free(canonical);
@@ -2359,6 +2381,7 @@ pub const ValueWriter = struct {
 
     pub fn endArray(self: *ValueWriter) !void {
         const frame = try self.closing(.array);
+        try self.parentRoom(9 + frame.buf.written().len);
         const out = self.parentSink();
         try writeMajorValue(out, 4, frame.count);
         try out.writeAll(frame.buf.written());
@@ -2373,6 +2396,7 @@ pub const ValueWriter = struct {
     pub fn endMap(self: *ValueWriter) !void {
         const frame = try self.closing(.object);
         if (!frame.expect_key) return error.UnbalancedContainers;
+        try self.parentRoom(9 + frame.buf.written().len);
         const out = self.parentSink();
         const body = frame.buf.written();
         try writeMajorValue(out, 5, frame.count);
@@ -2415,6 +2439,13 @@ pub const ValueWriter = struct {
     fn sink(self: *ValueWriter) *std.Io.Writer {
         if (self.depth == 0) return self.out;
         return &self.frames[self.depth - 1].buf.writer;
+    }
+
+    /// `room` for the container around the innermost one, which takes the innermost one's output when it closes.
+    fn parentRoom(self: *ValueWriter, add: usize) !void {
+        if (self.depth <= 1) return;
+        const used = self.frames[self.depth - 2].buf.written().len;
+        if (add > self.max_container_bytes -| used) return error.ContainerTooLarge;
     }
 
     fn parentSink(self: *ValueWriter) *std.Io.Writer {

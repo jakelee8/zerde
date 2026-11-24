@@ -4509,6 +4509,122 @@ test "a resumable write keeps 128 open containers, and refuses a deeper value in
     }
 }
 
+// ---- max_container_bytes, the bound of what an event-fed writer buffers --------------------------------------------
+
+/// `{"a": text, "b": [1, 2, 3], "c": {"d": true}, "e": text as bytes}` as events into a value writer of `Format` with `cfg`; the output length.
+fn scriptedMap(comptime Format: type, limit: usize, text: []const u8, allocator_in: std.mem.Allocator) !usize {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = Format.valueWriter(allocator_in, &out.writer, .{});
+    defer writer.deinit();
+    writer.max_container_bytes = limit;
+    try writer.beginMap();
+    try writer.writeText("a");
+    try writer.writeText(text);
+    try writer.writeText("b");
+    try writer.beginArray();
+    for (1..4) |number| try writer.writeInt(number);
+    try writer.endArray();
+    try writer.writeText("c");
+    try writer.beginMap();
+    try writer.writeText("d");
+    try writer.writeBool(true);
+    try writer.endMap();
+    try writer.writeText("e");
+    try writer.writeBytes(text);
+    try writer.endMap();
+    try writer.finish();
+    return out.written().len;
+}
+
+test "max_container_bytes is an error before an allocation, in the JSON and the CBOR value writer" {
+    inline for (.{ zerde.json, zerde.cbor }) |Format| {
+        const unbounded = try scriptedMap(Format, std.math.maxInt(usize), "xxxx", allocator);
+        // The smallest limit that passes is at most the output plus what each item is counted over by (a byte or eight);
+        // one that is much smaller is refused, and the limit never makes a different output.
+        var smallest: usize = 0;
+        while (true) : (smallest += 1) {
+            if (scriptedMap(Format, smallest, "xxxx", allocator)) |length| {
+                try std.testing.expectEqual(unbounded, length);
+                break;
+            } else |err| try std.testing.expectEqual(error.ContainerTooLarge, err);
+        }
+        try std.testing.expect(smallest <= unbounded + 40);
+        try std.testing.expect(smallest + 40 >= unbounded);
+        // Every larger limit passes too.
+        _ = try scriptedMap(Format, smallest + 1, "xxxx", allocator);
+        _ = try scriptedMap(Format, std.math.maxInt(usize), "xxxx", allocator);
+        // Text that is mostly escapes costs what it takes escaped.
+        const quotes: [60]u8 = @splat('"');
+        const loud = try scriptedMap(Format, std.math.maxInt(usize), &quotes, allocator);
+        var loud_smallest: usize = 0;
+        while (std.meta.isError(scriptedMap(Format, loud_smallest, &quotes, allocator))) loud_smallest += 1;
+        try std.testing.expect(loud_smallest + 40 >= loud);
+        // A CBOR array that closes into a map around it, and a key, are counted too (a JSON array streams into the map).
+        if (Format == zerde.cbor) {
+            var sink: std.Io.Writer.Allocating = .init(allocator);
+            defer sink.deinit();
+            var w = Format.valueWriter(allocator, &sink.writer, .{});
+            defer w.deinit();
+            w.max_container_bytes = 40;
+            try w.beginMap();
+            try w.writeText("k");
+            try w.beginArray();
+            for (0..2) |_| try w.writeText("some text here");
+            try std.testing.expectError(error.ContainerTooLarge, w.endArray());
+        }
+        // A text of a megabyte in a container of 100 bytes is refused before its bytes are copied: nothing near it is allocated.
+        const huge = try allocator.alloc(u8, 1 << 20);
+        defer allocator.free(huge);
+        @memset(huge, 'x');
+        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        try std.testing.expectError(error.ContainerTooLarge, scriptedMap(Format, 100, huge, counting.allocator()));
+        try std.testing.expect(counting.allocated_bytes < 4096);
+        {
+            var sink: std.Io.Writer.Allocating = .init(allocator);
+            defer sink.deinit();
+            var w = Format.valueWriter(allocator, &sink.writer, .{});
+            defer w.deinit();
+            w.max_container_bytes = 100;
+            try w.beginMap();
+            try std.testing.expectError(error.ContainerTooLarge, w.writeText(huge));
+        }
+        // At the top level there is no container: output goes to the writer, and the limit does not count it.
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var top = Format.valueWriter(allocator, &out.writer, .{ .max_container_bytes = 10 });
+        defer top.deinit();
+        try top.writeText(huge[0..4096]);
+        try std.testing.expect(out.written().len > 4096);
+    }
+}
+
+test "max_container_bytes counts base64 bytes as the characters they become" {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var w = zerde.json.valueWriter(allocator, &out.writer, .{ .bytes = zerde.json.BytesEncoding.base64, .max_container_bytes = 40 });
+    defer w.deinit();
+    try w.beginMap();
+    try w.writeText("k");
+    try std.testing.expectError(error.ContainerTooLarge, w.writeBytes("0123456789012345678901234"));
+}
+
+test "max_container_bytes counts what a nested container hands to the one around it when it closes" {
+    inline for (.{ zerde.json, zerde.cbor }) |Format| {
+        // The inner map is small enough alone and too large once it joins the outer one.
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var w = Format.valueWriter(allocator, &out.writer, .{ .max_container_bytes = 40 });
+        defer w.deinit();
+        try w.beginMap();
+        try w.writeText("outer-key-one");
+        try w.beginMap();
+        try w.writeText("inner");
+        try w.writeText("value-of-some-size");
+        try std.testing.expectError(error.ContainerTooLarge, w.endMap());
+    }
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;
