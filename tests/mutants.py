@@ -245,8 +245,8 @@ MUTANTS = [
     ("bulk.zig", "        if (end + 8 > bytes.len) end = bytes.len;\n", "        _ = 0;\n"),
     ("bulk.zig", "        if (!std.unicode.utf8ValidateSlice(bytes[i..end])) return false;\n        i = end;", "        i = end;"),
     ("bulk.zig", "        if (at > start) try writer.writeAll(bytes[start..at]);", "        _ = 0;"),
-    ("bulk.zig", "            0x08 => try writer.writeAll(\"\\\\b\"),", "            0x08 => try writer.writeAll(\"\\\\f\"),"),
-    ("bulk.zig", "hex[c >> 4], hex[c & 0xf] }", "hex[c & 0xf], hex[c >> 4] }"),
+    ("bulk.zig", "        0x08 => out[1] = 'b',", "        0x08 => out[1] = 'c',"),
+    ("bulk.zig", "            out[4] = hex[c >> 4];\n            out[5] = hex[c & 0xf];", "            out[4] = hex[c & 0xf];\n            out[5] = hex[c >> 4];"),
     ("bulk.zig", "        start = at + 1;\n    }\n}", "        start = at;\n    }\n}"),
     ("json.zig", "    fn push(self: *Encoder, kind: ContainerKind, len: u64) !void {\n        if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;", "    fn push(self: *Encoder, kind: ContainerKind, len: u64) !void {\n        _ = len;"),
     ("typed.zig", "            freeTypedPartial(T, allocator, decoded, @hasDecl(DeserializerType, \"borrowStrings\") and deserializer.borrowStrings());\n", "            _ = 0;\n"),
@@ -371,6 +371,13 @@ MUTANTS = [
     ("wire.zig", "            break :blk n * @sizeOf(Wire(Elem)) + 16 + n * wireOwned(Elem, elem_bounds, cfg, limits);", "            break :blk n * @sizeOf(Wire(Elem)) + 16;"),
     ("wire.zig", "    return (3 * n + 64) * size + 40 * alignment;", "    return (2 * n) * size;"),
     ("wire.zig", "            break :blk 3 * (n / 2 + 8) * 40 + 3 * n + 40 * 8;", "            break :blk 0;"),
+    ("bulk.zig", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x20)));", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk < @as(Vector, @splat(0x20)));"),
+    ("bulk.zig", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x20)));", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x1f)));"),
+    ("bulk.zig", "        if (std.simd.firstTrue(special)) |offset| return i + offset;", "        if (std.simd.firstTrue(special)) |offset| return i + offset + 1;"),
+    ("bulk.zig", "        const spare = writer.buffer.len - writer.end;\n        if (spare >= escape.len) {", "        const spare = writer.buffer.len - writer.end;\n        if (spare > 0) {"),
+    ("bulk.zig", "            writer.end += length;", "            writer.end += escape.len;"),
+    ("bulk.zig", "            @memcpy(writer.buffer[writer.end..][0..escape.len], &escape);\n", "            _ = &escape;\n"),
+    ("bulk.zig", "            return 6;\n        },\n    }\n    return 2;", "            return 5;\n        },\n    }\n    return 2;"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
@@ -389,7 +396,7 @@ def run(index):
         cmd = ["flock", os.environ["MUTANT_LOCK"]] + cmd
     # A mutant can loop forever. A run that does not end in two minutes is a kill, and its whole
     # process group is ended, test binary included.
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True)
     try:
         output, _ = process.communicate(timeout=120)
         returncode = process.returncode

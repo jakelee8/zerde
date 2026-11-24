@@ -434,6 +434,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zbor", .module = zbor_dep.module("zbor") },
                 .{ .name = "zbench", .module = zbench_dep.module("zbench") },
                 .{ .name = "zig_yaml", .module = zig_yaml_mod },
+                // Real text for the string benchmarks: source with many quotes, newlines and backslashes, and prose.
+                .{ .name = "corpus_code", .module = b.createModule(.{ .root_source_file = b.path("tests/typed_tests.zig") }) },
+                .{ .name = "corpus_more_code", .module = b.createModule(.{ .root_source_file = b.path("src/cbor.zig") }) },
+                .{ .name = "corpus_prose", .module = b.createModule(.{ .root_source_file = b.path("README.md") }) },
             },
         }),
     });

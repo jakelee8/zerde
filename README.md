@@ -419,8 +419,9 @@ types need no care. `tests/typed_tests.zig` builds a small declaration generator
 ### Bulk string scans
 
 The JSON and CBOR backends find the end of a string, escape text and validate UTF-8 over runs of
-bytes (`zerde.bulk`), with 64-bit integer operations only, so they behave the same on every target and
-a WebAssembly build without `simd128` gets the same speedup. Escaping is a run at a time and writes
+bytes (`zerde.bulk`). The scan for the end of a string uses vectors where the target has them (native, or
+WebAssembly with `simd128`) and 64-bit integer operations elsewhere, so a build without `simd128` still gets
+a speedup. Escaping is a run at a time, writes each escape into the writer's spare buffer when it fits, and writes
 exactly what `std.json.Stringify` writes. UTF-8 validation uses the standard library's validator where
 that skips ASCII in vector chunks (native, or WebAssembly with SIMD) and the word-at-a-time one
 (`validUtf8Words`) elsewhere. `zig build bench-bulk -Doptimize=ReleaseFast` compares them; numbers are in

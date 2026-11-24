@@ -44,6 +44,24 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
         try report(out, input.name, "find special", try time(io, scanBulk, input.bytes, &sink.writer), try time(io, scanByte, input.bytes, &sink.writer), input.bytes.len);
     }
 
+    // Real text: source files (many quotes, newlines, backslashes) and prose, as the JSON string they would be.
+    const corpora = [_]struct { name: []const u8, bytes: []const u8 }{
+        .{ .name = "code 1", .bytes = @embedFile("corpus_code") },
+        .{ .name = "code 2", .bytes = @embedFile("corpus_more_code") },
+        .{ .name = "prose", .bytes = @embedFile("corpus_prose") },
+    };
+    var big_sink: std.Io.Writer.Allocating = .init(allocator);
+    defer big_sink.deinit();
+    try big_sink.ensureTotalCapacity(8 * 1024 * 1024);
+    try out.writeAll("string scans on real text, vectors or words and one write per escape against the code before\n");
+    for (corpora) |corpus| {
+        var specials: usize = 0;
+        for (corpus.bytes) |c| specials += @intFromBool(c == '"' or c == '\\' or c < 0x20);
+        try out.print("  {s}: {d} bytes, {d} bytes to escape\n", .{ corpus.name, corpus.bytes.len, specials });
+        try report(out, corpus.name, "find special", try time(io, scanBulk, corpus.bytes, &big_sink.writer), try time(io, scanWords, corpus.bytes, &big_sink.writer), corpus.bytes.len);
+        try report(out, corpus.name, "escape", try time(io, escapeBulk, corpus.bytes, &big_sink.writer), try time(io, escapeBefore, corpus.bytes, &big_sink.writer), corpus.bytes.len);
+    }
+
     // A strict CBOR read of a long text, rendered as JSON: checked on the way in and out, and trusted.
     var cbor_text: std.Io.Writer.Allocating = .init(allocator);
     defer cbor_text.deinit();
@@ -124,6 +142,41 @@ fn scanBulk(bytes: []const u8, _: *std.Io.Writer) anyerror!usize {
         if (at >= bytes.len) return count;
         count += 1;
         at += 1;
+    }
+}
+
+fn scanWords(bytes: []const u8, _: *std.Io.Writer) anyerror!usize {
+    var count: usize = 0;
+    var at: usize = 0;
+    while (true) {
+        at = zerde.bulk.findStringSpecialWords(bytes, at);
+        if (at >= bytes.len) return count;
+        count += 1;
+        at += 1;
+    }
+}
+
+/// `writeEscaped` as it was before the direct write: the word scan and one `writeAll` per escape.
+fn escapeBefore(bytes: []const u8, sink: *std.Io.Writer) anyerror!usize {
+    var start: usize = 0;
+    while (true) {
+        const at = zerde.bulk.findStringSpecialWords(bytes, start);
+        if (at > start) try sink.writeAll(bytes[start..at]);
+        if (at >= bytes.len) return sink.end;
+        switch (bytes[at]) {
+            '"' => try sink.writeAll("\\\""),
+            '\\' => try sink.writeAll("\\\\"),
+            0x08 => try sink.writeAll("\\b"),
+            0x0c => try sink.writeAll("\\f"),
+            '\n' => try sink.writeAll("\\n"),
+            '\r' => try sink.writeAll("\\r"),
+            '\t' => try sink.writeAll("\\t"),
+            else => |c| {
+                const hex = "0123456789abcdef";
+                try sink.writeAll(&.{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0xf] });
+            },
+        }
+        start = at + 1;
     }
 }
 

@@ -1,9 +1,10 @@
-//! Scans over runs of bytes, a word at a time, for the string paths of the JSON and CBOR backends.
+//! Scans over runs of bytes for the string paths of the JSON and CBOR backends.
 //!
-//! They use 64-bit integer operations only, so they behave the same on every target and need no SIMD:
-//! a WebAssembly build without `simd128` gets the same speedup, and one with it is not qualified
-//! differently. Each function has an obvious byte-wise reference in the tests, which it must match
-//! on every input.
+//! The word versions use 64-bit integer operations only, so they behave the same on every target and
+//! need no SIMD: a WebAssembly build without `simd128` gets their speedup. Where the target has
+//! vectors (`std.simd.suggestVectorLength`: a native target, or WebAssembly with `simd128`) the scan for
+//! the end of a string uses them instead. Each function has an obvious byte-wise reference in the
+//! tests, which it must match on every input.
 
 const std = @import("std");
 
@@ -21,8 +22,31 @@ fn hasBelow(word: u64, comptime limit: u8) bool {
 }
 
 /// The index of the first byte of `bytes` at or after `from` that a JSON string cannot hold as it
-/// is: `"`, `\` or a control character below 0x20. `bytes.len` when there is none.
+/// is: `"`, `\` or a control character below 0x20. `bytes.len` when there is none. It looks at a
+/// vector of bytes at a time where the target has vectors, and a word at a time elsewhere.
 pub fn findStringSpecial(bytes: []const u8, from: usize) usize {
+    if (comptime std.simd.suggestVectorLength(u8)) |width| return findStringSpecialVector(width, bytes, from);
+    return findStringSpecialWords(bytes, from);
+}
+
+/// `findStringSpecial` with vectors of `width` bytes.
+pub fn findStringSpecialVector(comptime width: usize, bytes: []const u8, from: usize) usize {
+    const Vector = @Vector(width, u8);
+    var i = from;
+    while (i + width <= bytes.len) : (i += width) {
+        const chunk: Vector = bytes[i..][0..width].*;
+        const special = (chunk == @as(Vector, @splat('"'))) | (chunk == @as(Vector, @splat('\\'))) | (chunk < @as(Vector, @splat(0x20)));
+        if (std.simd.firstTrue(special)) |offset| return i + offset;
+    }
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        if (c == '"' or c == '\\' or c < 0x20) return i;
+    }
+    return bytes.len;
+}
+
+/// `findStringSpecial` a word at a time, for a target without vectors.
+pub fn findStringSpecialWords(bytes: []const u8, from: usize) usize {
     var i = from;
     while (i + 8 <= bytes.len) : (i += 8) {
         const word = std.mem.readInt(u64, bytes[i..][0..8], .little);
@@ -66,28 +90,51 @@ pub fn validUtf8Words(bytes: []const u8) bool {
 
 /// Writes `bytes` as the characters of a JSON string (no quotes): runs that need no escape go out in
 /// one write each, and the rest as `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t` or `\u00xx`. The output is
-/// what `std.json.Stringify.encodeJsonStringChars` writes.
+/// what `std.json.Stringify.encodeJsonStringChars` writes. An escape is written straight into the
+/// writer's spare buffer when it fits, which costs a fraction of going through `writeAll`.
 pub fn writeEscaped(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
     var start: usize = 0;
     while (true) {
         const at = findStringSpecial(bytes, start);
         if (at > start) try writer.writeAll(bytes[start..at]);
         if (at >= bytes.len) return;
-        switch (bytes[at]) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            0x08 => try writer.writeAll("\\b"),
-            0x0c => try writer.writeAll("\\f"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => |c| {
-                const hex = "0123456789abcdef";
-                try writer.writeAll(&.{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0xf] });
-            },
+        var escape: [6]u8 = undefined;
+        const length = escapeInto(&escape, bytes[at]);
+        const spare = writer.buffer.len - writer.end;
+        if (spare >= escape.len) {
+            // `end` is how much of the buffer holds output; the escape lands after it.
+            @memcpy(writer.buffer[writer.end..][0..escape.len], &escape);
+            writer.end += length;
+        } else {
+            try writer.writeAll(escape[0..length]);
         }
         start = at + 1;
     }
+}
+
+/// The escape of byte `c` (a `"`, a `\` or a control character) as the characters of a JSON string,
+/// written to the start of `out`; how many bytes it is.
+fn escapeInto(out: *[6]u8, c: u8) usize {
+    const hex = "0123456789abcdef";
+    out[0] = '\\';
+    switch (c) {
+        '"' => out[1] = '"',
+        '\\' => out[1] = '\\',
+        0x08 => out[1] = 'b',
+        0x0c => out[1] = 'f',
+        '\n' => out[1] = 'n',
+        '\r' => out[1] = 'r',
+        '\t' => out[1] = 't',
+        else => {
+            out[1] = 'u';
+            out[2] = '0';
+            out[3] = '0';
+            out[4] = hex[c >> 4];
+            out[5] = hex[c & 0xf];
+            return 6;
+        },
+    }
+    return 2;
 }
 
 fn referenceSpecial(bytes: []const u8, from: usize) usize {
@@ -97,29 +144,49 @@ fn referenceSpecial(bytes: []const u8, from: usize) usize {
     return bytes.len;
 }
 
-test "findStringSpecial matches the byte-wise scan at every position and length" {
-    // Every special byte at every offset of a buffer long enough for several words, with plain bytes
-    // (ASCII and not) around it.
-    var buffer: [37]u8 = undefined;
+fn expectFinder(comptime find: anytype) !void {
+    // Every special byte at every offset of a buffer long enough for several words and vectors, with
+    // plain bytes (ASCII and not) around it.
+    var buffer: [71]u8 = undefined;
     for ([_]u8{ 'a', 0x7f, 0x80, 0xff, 0x20 }) |filler| {
         @memset(&buffer, filler);
         for (0..buffer.len) |position| {
             for ([_]u8{ '"', '\\', 0x00, 0x1f, 0x0a }) |special| {
                 buffer[position] = special;
                 for (0..buffer.len + 1) |from| {
-                    try std.testing.expectEqual(referenceSpecial(&buffer, from), findStringSpecial(&buffer, from));
+                    try std.testing.expectEqual(referenceSpecial(&buffer, from), find(&buffer, from));
                 }
                 buffer[position] = filler;
             }
         }
-        for (0..buffer.len + 1) |from| try std.testing.expectEqual(buffer.len, findStringSpecial(&buffer, from));
+        for (0..buffer.len + 1) |from| try std.testing.expectEqual(buffer.len, find(&buffer, from));
     }
     // Bytes next to the special ones are not mistaken for them: `#` is `"` plus one, `]` is `\` plus one.
     const near = "!#$[]^ ~\x7f\x80\xa2\xdc\xdd\xde";
-    try std.testing.expectEqual((near ++ near ++ near).len, findStringSpecial(near ++ near ++ near, 0));
+    try std.testing.expectEqual((near ++ near ++ near).len, find(near ++ near ++ near, 0));
     var many: [64]u8 = undefined;
     for (&many, 0..) |*c, i| c.* = near[i % near.len];
-    try std.testing.expectEqual(many.len, findStringSpecial(&many, 0));
+    try std.testing.expectEqual(many.len, find(&many, 0));
+}
+
+fn vector8(bytes: []const u8, from: usize) usize {
+    return findStringSpecialVector(8, bytes, from);
+}
+
+fn vector16(bytes: []const u8, from: usize) usize {
+    return findStringSpecialVector(16, bytes, from);
+}
+
+fn vector32(bytes: []const u8, from: usize) usize {
+    return findStringSpecialVector(32, bytes, from);
+}
+
+test "findStringSpecial matches the byte-wise scan at every position and length, whichever way it scans" {
+    try expectFinder(findStringSpecial);
+    try expectFinder(findStringSpecialWords);
+    try expectFinder(vector8);
+    try expectFinder(vector16);
+    try expectFinder(vector32);
 }
 
 test "validUtf8 and validUtf8Words agree with the standard library on valid and invalid input" {
@@ -214,4 +281,30 @@ test "writeEscaped writes what the standard library writes" {
     out.clearRetainingCapacity();
     try writeEscaped(&out.writer, "");
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "writeEscaped fills the spare room of the writer exactly, and falls back when an escape does not fit" {
+    const text = "\"\\\n\x01 plain \t\"\x1f\r\"";
+    var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected.deinit();
+    try std.json.Stringify.encodeJsonStringChars(text, .{}, &expected.writer);
+    // A buffer of exactly the output: the last escapes do not have six bytes of room and must not overrun.
+    var exact: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(exact[0..expected.written().len]);
+    try writeEscaped(&writer, text);
+    try std.testing.expectEqualStrings(expected.written(), writer.buffered());
+    // One byte less is an error, not a write past the buffer.
+    var short = std.Io.Writer.fixed(exact[0 .. expected.written().len - 1]);
+    try std.testing.expectError(error.WriteFailed, writeEscaped(&short, text));
+    // A buffer too small to hold an escape at all drains as it goes.
+    var sink: [3]u8 = undefined;
+    var counting = std.Io.Writer.Discarding.init(&sink);
+    try writeEscaped(&counting.writer, text);
+    try std.testing.expectEqual(@as(u64, expected.written().len), counting.fullCount() + counting.writer.end);
+    // Output already in the buffer is kept in front of the escape.
+    var prefixed: [64]u8 = undefined;
+    var after = std.Io.Writer.fixed(&prefixed);
+    try after.writeAll("pre:");
+    try writeEscaped(&after, "\"x\n");
+    try std.testing.expectEqualStrings("pre:\\\"x\\n", after.buffered());
 }

@@ -68,3 +68,42 @@ reader into the JSON value writer, with UTF-8 checked on the way in and out agai
 the rest is the scan for characters to escape and the copy, about 63 µs. So the option removes the checks but not the cost that
 dominates a long-text render; a faster scan or a copy of text known to need no escapes would be what gets near a plain `memcpy`.
 On wasm without SIMD validation costs more (see the table above), so the option is worth more there; it was not measured.
+
+## 2026-11-24 - vector scan and direct escape writes
+
+Changes since previous run: `findStringSpecial` scans a `@Vector` of `std.simd.suggestVectorLength(u8)` bytes where there is one (native; WebAssembly
+with `simd128`), the word version elsewhere; `writeEscaped` writes each escape into the writer's spare buffer when it has room, instead of one
+`writeAll` per escape. The JSON parser and writer both go through these two functions.
+
+Real text, not generated: `tests/typed_tests.zig` (212,041 bytes, 7,420 to escape: source with quotes, newlines, backslashes), `src/cbor.zig`
+(111,309 bytes, 2,814 to escape) and `README.md` (30,822 bytes, 558 to escape), each escaped as the characters of a JSON string. Rows compare the new
+code with the code before this change (word scan, one `writeAll` per escape).
+
+### Native (`zig build bench-bulk -Doptimize=ReleaseFast`, ns per whole input, 2000 iterations, one run)
+
+| Input | Operation | new ns | before ns | Relative |
+| --- | --- | ---: | ---: | --- |
+| code 1 | find special | 117347 | 190732 | 1.63x faster |
+| code 1 | escape | 161152 | 231391 | 1.44x faster |
+| code 2 | find special | 49317 | 87561 | 1.78x faster |
+| code 2 | escape | 57498 | 98762 | 1.72x faster |
+| prose | find special | 8343 | 14839 | 1.78x faster |
+| prose | escape | 11698 | 23079 | 1.97x faster |
+
+The 270 KiB ASCII text of the first entry: escape 24.9 µs (was 62.9), find special 13.3 µs (was 68.2). The strict CBOR to JSON render of it
+fell from 75.2 µs to 37.9 µs (trusted) and from 82.9 to 42.6 µs (checked).
+
+### WebAssembly (`-target wasm32-freestanding -OReleaseFast`, Node's V8, 200 calls each, three runs: the range)
+
+| Input | Operation | no simd128, new (µs) | no simd128, before | simd128 (vector 16), new | simd128, before |
+| --- | --- | --- | --- | --- | --- |
+| code 1 | find special | 182-187 | 182-193 | 146-163 | 179-186 |
+| code 1 | escape | 274-305 | 342-427 | 225-249 | 371-394 |
+| code 2 | find special | 78-84 | 71-80 | 56-61 | 73-80 |
+| code 2 | escape | 108-140 | 133-151 | 89-99 | 138-163 |
+| prose | find special | 12-19 | 11-13 | 9-15 | 11-21 |
+| prose | escape | 19-22 | 24-29 | 15-22 | 24-25 |
+
+Without simd128 the scan is the same code as before (no change, within the noise), and the direct escape write gains 10-30% on code 1 and prose
+and nothing clear on code 2. With simd128 the vector scan is 1.2-1.3x faster and the escapes 1.6x faster. Escapes in this text come every 30 to 70 bytes,
+so the cost is mostly per escape; on long runs without one the vector scan is what counts (the ASCII row above).

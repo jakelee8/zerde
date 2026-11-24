@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- changed: `bulk.findStringSpecial` scans a vector of bytes where the target has vectors (`findStringSpecialWords` elsewhere), and `bulk.writeEscaped` writes each escape into the writer's spare buffer; real-text numbers in `bench/BULK.md` (escape 1.4-2x on native, 1.6x on wasm with simd128)
 - changed (`zerde.wire`, unreleased): `decode` takes a `*std.heap.FixedBufferAllocator` and restores it on an error; `fromWire` and `encode` take a `wire.Memory` (base and valid ranges) and refuse a span outside it, misaligned or overflowing; an enum is an 8-, 16-, 32- or 64-bit integer, and `usize`, C types and odd widths are a compile error; a list of scalars is not copied; added `maxArenaSize` and `HookedWith`
 - added `tests/mutants.py --check`, which lists patterns the source no longer contains; 9 stale mutants removed and 11 re-pointed
 - added `zerde.wire`: `Wire(T)`, a fixed-layout (C) type generated from a schema type, with `Span`, `Opt`, tagged unions as `{ tag, payload }`; `decode`, `encode`, `toWire`, `fromWire`, `describe` (offsets of every member), and `Hooked(T)` for a decode hook; `PullReader.readTyped` and `userData`, a `user_data` word on the CBOR and JSON deserializers, and `zerde.typed` exported
