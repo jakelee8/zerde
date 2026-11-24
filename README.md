@@ -274,7 +274,10 @@ What they refuse, and why:
   of the wrong type (CBOR). In JSON this includes a lone surrogate escape such as `"\udc00"`, which is
   grammatical (RFC 8259 §8.2) but has no UTF-8 form (`error.InvalidUnicodeSurrogate`)
 - a float for an integer field, even `1.0`; a number too large for its float field (`1e999` is
-  `error.FloatOutOfRange`, not infinity)
+  `error.FloatOutOfRange`, not infinity). JSON can opt in to the exact-value rule for integer fields with
+  `.integral_numbers = true` in the read config: a number such as `1.0`, `1e2` or `12300e-2` is then taken when its
+  exact decimal value, worked out from its digits and never from a binary64 value, is an integer that fits the field
+  (`1.0000000000000001` and `1.5` are still `error.UnexpectedType`, `256.0` for a `u8` is `error.IntegerOverflow`)
 - more than 128 open containers (`error.CborNestingTooDeep`, `error.JsonNestingTooDeep`), so a hostile
   input cannot exhaust the stack; and a CBOR length that claims more items than the input has bytes
 - a CBOR map with two equal keys (`error.DuplicateField`), checked in every map including those in

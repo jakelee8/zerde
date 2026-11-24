@@ -4716,6 +4716,105 @@ test "a gather encode refuses a short skeleton or list, bytes below its base, an
     try std.testing.expectError(error.OffsetOutOfRange, zerde.gather.encode(GatherFrame, &skeleton, &refs, base + 100, 2, frame, .{}, .{}));
 }
 
+// ---- an integral JSON number into an integer, by its exact decimal value ------------------------------------------
+
+const integral = .{ .integral_numbers = true };
+
+fn expectIntegral(comptime T: type, expected: T, text: []const u8) !void {
+    const got = try zerde.json.parseSliceWith(T, allocator, text, .{}, integral);
+    try std.testing.expectEqual(expected, got);
+}
+
+fn expectIntegralError(comptime T: type, expected: anyerror, text: []const u8) !void {
+    try std.testing.expectError(expected, zerde.json.parseSliceWith(T, allocator, text, .{}, integral));
+}
+
+test "integral_numbers takes a number whose exact decimal value is an integer, whatever its spelling" {
+    try expectIntegral(i64, 1, "1.0");
+    try expectIntegral(i64, 100, "1e2");
+    try expectIntegral(i64, 100, "1E+2");
+    try expectIntegral(i64, 100, "1.00e2");
+    try expectIntegral(i64, 1, "10e-1");
+    try expectIntegral(i64, 5, "0.5e1");
+    try expectIntegral(i64, 15, "1.50e1");
+    try expectIntegral(i64, 123, "12300e-2");
+    try expectIntegral(i64, -42, "-4.2e1");
+    try expectIntegral(i64, 0, "0.0");
+    try expectIntegral(i64, 0, "-0.0");
+    try expectIntegral(i64, 0, "0e5");
+    try expectIntegral(i64, 0, "0e999999999999");
+    try expectIntegral(i64, 7, "7.000000000000000000000000000000000000000000000");
+    try expectIntegral(i64, 70, "7.000000000000000000000000000000000000000000000e1");
+    // Integers still read as before.
+    try expectIntegral(i64, 12, "12");
+    try expectIntegral(u8, 255, "255.0");
+    try expectIntegral(u8, 0, "-0e0");
+    // More digits than a binary64 holds are exact: these are not rounded.
+    try expectIntegral(u128, 100000000000000000000, "100000000000000000000.0");
+    try expectIntegral(i128, std.math.maxInt(i128), "170141183460469231731687303715884105727.0");
+    try expectIntegral(i128, std.math.maxInt(i128), "1.70141183460469231731687303715884105727e38");
+    try expectIntegral(i128, std.math.minInt(i128), "-170141183460469231731687303715884105728e0");
+    try expectIntegral(u128, std.math.maxInt(u128), "340282366920938463463374607431768211455.0");
+    try expectIntegral(i64, 9007199254740993, "9007199254740993.0");
+    try expectIntegral(i64, 9007199254740993, "9.007199254740993e15");
+}
+
+test "integral_numbers refuses a value that has a fraction, or does not fit, by its digits and not its binary64 value" {
+    try expectIntegralError(i64, error.UnexpectedType, "1.5");
+    try expectIntegralError(i64, error.UnexpectedType, "1.0000000000000001");
+    try expectIntegralError(i64, error.UnexpectedType, "1e-1");
+    try expectIntegralError(i64, error.UnexpectedType, "100e-3");
+    try expectIntegralError(i64, error.UnexpectedType, "1e-999999999999");
+    try expectIntegralError(i64, error.UnexpectedType, "9007199254740993.5");
+    // A nonzero digit far out after the point is a fraction even where a double would round it away.
+    try expectIntegralError(i64, error.UnexpectedType, "1.000000000000000000000000000000000000000000000000000001");
+    try expectIntegralError(u8, error.IntegerOverflow, "256.0");
+    try expectIntegralError(u8, error.IntegerOverflow, "-1.0");
+    try expectIntegralError(u8, error.IntegerOverflow, "2.56e2");
+    try expectIntegralError(i8, error.IntegerOverflow, "128.0");
+    try expectIntegralError(i8, error.IntegerOverflow, "-129.0");
+    try expectIntegralError(i64, error.IntegerOverflow, "1e999999999999");
+    try expectIntegralError(i64, error.IntegerOverflow, "1e99999999999999999999999999");
+    try expectIntegralError(i64, error.UnexpectedType, "1e-99999999999999999999999999");
+    try expectIntegral(i64, 0, "0e99999999999999999999999999");
+    try expectIntegralError(i64, error.IntegerOverflow, "1e40");
+    try expectIntegralError(i128, error.IntegerOverflow, "170141183460469231731687303715884105728.0");
+    try expectIntegralError(u128, error.IntegerOverflow, "340282366920938463463374607431768211456.0");
+    try expectIntegralError(i128, error.IntegerOverflow, "1" ++ comptime longName(60, '0') ++ ".0");
+    // Something that is not an integer type, a string, a bad number.
+    try expectIntegralError(i64, error.InvalidNumber, "\"1.0\"");
+    try expectIntegralError(i64, error.InvalidNumber, "1.");
+}
+
+test "integral_numbers is off by default, and a float field and the typed layer's bounds are unchanged" {
+    try expectJsonError(i64, error.UnexpectedType, "1.0");
+    try expectJsonError(i64, error.UnexpectedType, "1e2");
+    const Fields = struct {
+        count: u16,
+        steps: []const i32,
+        ratio: f64,
+        maybe: ?u8 = null,
+        pub const serde = .{ .fields = .{ .count = .{ .max = 100 }, .maybe = .{ .optional = .absent } } };
+    };
+    const got = try zerde.json.parseSliceWith(Fields, allocator, "{\"count\": 1e2, \"steps\": [1.0, -2e0, 3.0e1], \"ratio\": 1e2, \"maybe\": 2.0e0}", .{}, integral);
+    defer zerde.free(allocator, got);
+    try std.testing.expectEqual(@as(u16, 100), got.count);
+    try std.testing.expectEqualSlices(i32, &.{ 1, -2, 30 }, got.steps);
+    try std.testing.expectEqual(@as(f64, 100), got.ratio);
+    try std.testing.expectEqual(@as(?u8, 2), got.maybe);
+    // The field's own bound applies to the value read, and a missing exact value is not made up.
+    try std.testing.expectError(error.ValueOutOfRange, zerde.json.parseSliceWith(Fields, allocator, "{\"count\": 1.01e2, \"steps\": [], \"ratio\": 0}", .{}, integral));
+    try std.testing.expectError(error.UnexpectedType, zerde.json.parseSliceWith(Fields, allocator, "{\"count\": 1.5, \"steps\": [], \"ratio\": 0}", .{}, integral));
+    try std.testing.expectError(error.UnexpectedType, zerde.json.parseSliceWith(Fields, allocator, "{\"count\": 1.0, \"steps\": [], \"ratio\": 0}", .{}, .{}));
+    // Through a decode into the wire layout, as the config of a request.
+    var region: Region = .{};
+    const input = "{\"count\":1e1,\"steps\":[2.0],\"ratio\":1}";
+    @memcpy(region.bytes[0..input.len], input);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[1024..]);
+    const w = try wire.decode(zerde.json, Fields, &arena, region.base(), region.bytes[0..input.len], .{}, .{ .integral_numbers = true, .max_items = 16, .max_string_len = 16 });
+    try std.testing.expectEqual(@as(u16, 10), w.count);
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;

@@ -44,6 +44,11 @@ pub const ReadConfig = struct {
     /// such as one this library wrote and a store authenticated, where checking again costs more than
     /// the rest of the read. Input that has not been checked once must not be read this way.
     trusted_text: bool = false,
+    /// An integer field also takes a number written with a fraction or an exponent (`1.0`, `1e2`, `12300e-2`) when its exact
+    /// decimal value is an integer in the field's range, decided on the digits of the text and never on a binary64 value, so
+    /// `1.0000000000000001` is refused and `100000000000000000000.0` is exact. `1.5` and `1e-1` are `error.UnexpectedType`
+    /// as they are by default, and out of range is `error.IntegerOverflow`. Off by default: a float is not an integer.
+    integral_numbers: bool = false,
 };
 pub const WriteConfig = struct {
     bytes: BytesEncoding = .string,
@@ -461,7 +466,14 @@ pub fn JsonDeserializer(comptime Config: type) type {
             try self.count();
             self.parser.skipWhitespace();
             const parsed = try self.parser.parseNumberSlice();
-            if (parsed.is_float) return error.UnexpectedType;
+            if (parsed.is_float) {
+                if (!readLimitFlag(self.cfg, "integral_numbers", false)) return error.UnexpectedType;
+                return switch (@typeInfo(T)) {
+                    .comptime_int => try integralFromText(i128, parsed.slice),
+                    .int => try integralFromText(T, parsed.slice),
+                    else => error.UnsupportedType,
+                };
+            }
 
             return switch (@typeInfo(T)) {
                 .comptime_int => std.fmt.parseInt(i128, parsed.slice, 10) catch return error.InvalidNumber,
@@ -1428,6 +1440,80 @@ pub fn parseSliceAliasedWith(
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
+}
+
+/// The integer a JSON number's text has as its exact decimal value, for `ReadConfig.integral_numbers`: the digits times a
+/// power of ten, with trailing zeros of the digits moved into the exponent, so that no value is ever rounded. A value with
+/// a fraction left (a negative power of ten after that) is `error.UnexpectedType`, one that does not fit `T`
+/// `error.IntegerOverflow`. `text` is a number `parseNumberSlice` accepted.
+fn integralFromText(comptime T: type, text: []const u8) !T {
+    const max_digits = 40;
+    var significant: [max_digits]u8 = undefined;
+    var stored: usize = 0;
+    // Significant digits so far, whether or not they fit in `significant`, and zeros after the last of them.
+    var count: usize = 0;
+    var pending_zeros: usize = 0;
+    var fraction_digits: i64 = 0;
+    var at: usize = 0;
+    const negative = text[0] == '-';
+    if (negative) at = 1;
+    var in_fraction = false;
+    while (at < text.len and text[at] != 'e' and text[at] != 'E') : (at += 1) {
+        const c = text[at];
+        if (c == '.') {
+            in_fraction = true;
+            continue;
+        }
+        if (in_fraction) fraction_digits += 1;
+        if (c == '0') {
+            if (count != 0) pending_zeros += 1;
+            continue;
+        }
+        // A digit that is not zero: the zeros before it are significant.
+        for (0..pending_zeros) |_| {
+            if (stored < max_digits) {
+                significant[stored] = '0';
+                stored += 1;
+            }
+        }
+        count += pending_zeros;
+        pending_zeros = 0;
+        if (stored < max_digits) {
+            significant[stored] = c;
+            stored += 1;
+        }
+        count += 1;
+    }
+    if (count == 0) return 0;
+    // The exponent saturates far beyond any integer's digits, so a long one costs nothing.
+    var exponent: i64 = 0;
+    if (at < text.len) {
+        at += 1;
+        var exponent_negative = false;
+        if (text[at] == '+' or text[at] == '-') {
+            exponent_negative = text[at] == '-';
+            at += 1;
+        }
+        while (at < text.len) : (at += 1) exponent = @min(exponent * 10 + (text[at] - '0'), 1_000_000);
+        if (exponent_negative) exponent = -exponent;
+    }
+    const scale = exponent - fraction_digits + @as(i64, @intCast(pending_zeros));
+    if (scale < 0) return error.UnexpectedType;
+    if (@as(i64, @intCast(count)) + scale > max_digits - 1) return error.IntegerOverflow;
+    var digits: [max_digits + 1]u8 = undefined;
+    var length: usize = 0;
+    if (negative) {
+        digits[0] = '-';
+        length = 1;
+    }
+    @memcpy(digits[length..][0..stored], significant[0..stored]);
+    length += stored;
+    @memset(digits[length..][0..@intCast(scale)], '0');
+    length += @intCast(scale);
+    return std.fmt.parseInt(T, digits[0..length], 10) catch |err| switch (err) {
+        error.Overflow => error.IntegerOverflow,
+        error.InvalidCharacter => error.InvalidNumber,
+    };
 }
 
 /// Writes bytes as a JSON string in `encoding`. The raw-string encoding is exact only for UTF-8, so
