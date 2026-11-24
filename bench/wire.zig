@@ -192,6 +192,33 @@ fn measureStreams(io: std.Io, out: *std.Io.Writer, allocator: std.mem.Allocator,
         });
     }
 
+    const stream_sizes = comptime wire.streamRegionSizes(Commit, .{}, read_cbor);
+    const stream_region = try allocator.alignedAlloc(u8, .@"16", stream_sizes.output);
+    defer allocator.free(stream_region);
+    inline for (.{ 4096, 65536 }) |chunk_len| {
+        var used: usize = 0;
+        start = std.Io.Clock.Timestamp.now(io, .awake);
+        for (0..iterations) |_| {
+            var decoder: wire.StreamResumable(Commit, .{}, read_cbor) = undefined;
+            decoder.init(stream_region, @intFromPtr(stream_region.ptr));
+            var at: usize = 0;
+            while (at < stored.len) {
+                const end = @min(at + chunk_len, stored.len);
+                _ = try decoder.feed(stored[at..end]);
+                at = end;
+            }
+            used = (try decoder.finish()).used;
+        }
+        const elapsed: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+        try out.print("  cbor  stream chunks {d:>6} B  strings left in the stream, region {d:>8} B (bound {d:>8} B)      {d:>9.0} ns ({d:.2}x)\n", .{
+            chunk_len,
+            used,
+            stream_sizes.output,
+            @as(f64, @floatFromInt(elapsed)) / iterations,
+            @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(decode_whole)),
+        });
+    }
+
     const json_cfg = .{ .bytes = zerde.json.BytesEncoding.base64 };
     var rendered_len: usize = 0;
     start = std.Io.Clock.Timestamp.now(io, .awake);

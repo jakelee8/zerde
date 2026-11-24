@@ -22,6 +22,7 @@ pub fn SortedMap(comptime V: type) type {
             key: []const u8,
             value: V,
             pub const serde = .{ .deny_unknown_fields = true };
+            pub const zerde_sorted_entry = {};
         };
         pub const Value = V;
         pub const zerde_sorted_map = {};

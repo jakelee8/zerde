@@ -816,6 +816,11 @@ pub const TypedSink = struct {
         return .{ .bytes = bytes };
     }
 
+    /// A string left in the stream, which is where its bytes are: only a layout of offsets (`wire.WireSink`) can say it.
+    pub fn span(_: TypedSink, comptime T: type, _: u64, _: usize) !T {
+        @compileError("a Zig value cannot hold a string that is left in the stream: " ++ @typeName(T));
+    }
+
     pub fn list(_: TypedSink, comptime T: type, items: []@typeInfo(T).pointer.child) !T {
         return items;
     }
@@ -917,6 +922,8 @@ pub const ReadLeaf = struct {
     len: usize = 0,
     at: usize = 0,
     buf: []u8 = &.{},
+    /// A string left in the stream (positions mode, `typed_resume.textInto`): where its bytes begin in the stream.
+    start: u64 = 0,
     /// A text that is dropped, not kept (a key longer than every name), is still checked as UTF-8, a piece at a time.
     utf8: bulk.Utf8Stream = .{},
 };
@@ -967,7 +974,7 @@ pub fn deserializeValue(
         .pointer => |info| try deserializePointer(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}, rc),
         .@"struct" => |info| {
             if (T == ByteString) {
-                dest.* = try s.bytesOf(T, try readByteSlice(allocator, deserializer, .{}, rc));
+                try readByteString(s, T, dest, allocator, deserializer, .{}, rc);
             } else if (comptime isRaw(T)) {
                 dest.* = try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, .{}, rc));
             } else {
@@ -1358,7 +1365,7 @@ fn deserializePointer(
         .slice => {
             if (info.child == u8) {
                 if (comptime @TypeOf(rc) != NoRead) {
-                    dest.* = try s.text(T, try resume_read.text(3, allocator, deserializer, bounds, rc));
+                    try resume_read.textInto(s, T, dest, 3, allocator, deserializer, bounds, rc);
                     return;
                 }
                 const token = if (comptime hasMax(bounds) and @hasDecl(DeserializerType, "readStringMax"))
@@ -1463,10 +1470,15 @@ fn readByteToken(allocator: Allocator, deserializer: anytype) anyerror!StringTok
     return try deserializer.readString(allocator);
 }
 
+/// A `ByteString` into `dest`: as the format reads a byte string, or for a resumable read as it arrives (`typed_resume.textInto`).
+fn readByteString(s: anytype, comptime T: type, dest: *@TypeOf(s).Of(T), allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror!void {
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.textInto(s, T, dest, 2, allocator, deserializer, bounds, rc);
+    dest.* = try s.bytesOf(T, try readByteSlice(allocator, deserializer, bounds));
+}
+
 /// Reads a variable-length byte string into memory the caller owns, or into the input when the
 /// parse aliases it.
-fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror![]const u8 {
-    if (comptime @TypeOf(rc) != NoRead) return resume_read.text(2, allocator, deserializer, bounds, rc);
+fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
     const DeserializerType = @TypeOf(deserializer.*);
     const token = if (comptime hasMax(bounds) and @hasDecl(DeserializerType, "readByteTokenMax"))
         try deserializer.readByteTokenMax(allocator, bounds.max_len)
@@ -1946,7 +1958,7 @@ fn deserializeBounded(
         .@"struct" => {
             if (comptime bounds.validate != null and !isRaw(T)) @compileError("validate applies to a Raw field: " ++ @typeName(T));
             if (T == ByteString) {
-                dest.* = try s.bytesOf(T, try readByteSlice(allocator, deserializer, bounds, rc));
+                try readByteString(s, T, dest, allocator, deserializer, bounds, rc);
             } else if (comptime isRaw(T)) {
                 dest.* = try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, bounds, rc));
             } else if (comptime isSortedMap(T)) {

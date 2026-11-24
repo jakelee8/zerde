@@ -30,8 +30,11 @@ const ReadLevel = typed.ReadLevel;
 /// The state of a resumable read, in the size the config asks for: `frames` open containers, optionals and pointers (`resumable.zig`
 /// works out how many a type needs), `key_cap` bytes for the longest name a key or an enum is compared with, and a `Raw` scan of
 /// at most `depth` open containers.
-pub fn State(comptime frames: usize, comptime key_cap: usize, comptime depth: usize) type {
+pub fn State(comptime frames: usize, comptime key_cap: usize, comptime depth: usize, comptime strings_in_stream: bool) type {
     return struct {
+        /// Whether a string and a byte string are left in the stream (`textInto`) and not copied.
+        pub const positions = strings_in_stream;
+
         levels: [frames]ReadLevel = @splat(.{}),
         depth: usize = 0,
         leaf: typed.ReadLeaf = .{},
@@ -59,6 +62,46 @@ fn fill(deserializer: anytype, leaf: *typed.ReadLeaf) !void {
         if (n == 0) return error.NeedMore;
         leaf.at += n;
     }
+}
+
+/// A text string (`major` 3) or a byte string (2) into `dest`. Copied, as `text` does, it is the sink's text or bytes; in positions mode
+/// (`State.positions`) it is not copied: the bytes are taken from the chunks as they come, checked (text as UTF-8, a piece at a time)
+/// and dropped, and `dest` is where they are in the stream (`Sink.span`), which the caller's own buffer of the stream holds.
+pub fn textInto(
+    s: anytype,
+    comptime T: type,
+    dest: *@TypeOf(s).Of(T),
+    comptime major: u8,
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime bounds: meta.Bounds,
+    rc: anytype,
+) anyerror!void {
+    if (comptime !@TypeOf(rc.*).positions) {
+        const bytes = try text(major, allocator, deserializer, bounds, rc);
+        dest.* = if (comptime major == 2) try s.bytesOf(T, bytes) else try s.text(T, bytes);
+        return;
+    }
+    const leaf = &rc.leaf;
+    if (!leaf.started) {
+        leaf.len = try deserializer.beginString(major, bounds.max_len);
+        leaf.start = deserializer.streamPosition();
+        leaf.at = 0;
+        leaf.started = true;
+    }
+    while (leaf.at < leaf.len) {
+        const piece = deserializer.takeView(leaf.len - leaf.at);
+        if (piece.len == 0) return error.NeedMore;
+        if (major == 3 and !deserializer.trustedText() and !leaf.utf8.feed(piece)) return error.InvalidUtf8;
+        leaf.at += piece.len;
+    }
+    const start = leaf.start;
+    const len = leaf.len;
+    const unfinished = major == 3 and !deserializer.trustedText() and !leaf.utf8.done();
+    leaf.* = .{};
+    if (unfinished) return error.InvalidUtf8;
+    try typed.checkLength(bounds, len);
+    dest.* = try s.span(T, start, len);
 }
 
 /// A text string (`major` 3) or a byte string (2), copied as it arrives into one allocation of exactly its length,
@@ -103,7 +146,8 @@ pub fn raw(comptime T: type, allocator: Allocator, deserializer: anytype, compti
     if (comptime T.zerde_raw_format != .cbor) @compileError("a resumable read reads CBOR, not a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
     const leaf = &rc.leaf;
     if (!leaf.started) {
-        rc.scan = .{ .allocator = allocator, .cap = @min(bounds.max_len, deserializer.maxStringLen()) };
+        // No item is longer than what the stream may still hold, so neither is its buffer, whatever it grows through.
+        rc.scan = .{ .allocator = allocator, .cap = @min(bounds.max_len, deserializer.maxStringLen(), deserializer.inputLeft()) };
         leaf.started = true;
     }
     try deserializer.scanItem(&rc.scan);

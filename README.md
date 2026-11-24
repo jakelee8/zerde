@@ -549,6 +549,16 @@ for `decodeInto`, with the strings and `Raw` items charged, since they are copie
 region of exactly that size holds any input the config allows, and `scratch` is empty. Every string needs a bound (`max_len` or
 `max_string_len`), and a `SortedMap`'s keys need `max_string_len`.
 
+`wire.StreamResumable(T, serde_cfg, cbor_cfg)` leaves the text and the byte strings in the stream, for a frame the caller keeps whole
+(in JavaScript, the frame itself) and a decode that must not copy its payload in: the span of a text or a byte string is
+`{ offset = its first byte's position in the stream from the stream's first byte, len }` (`error.OffsetOutOfRange` past 4 GiB), a text is
+checked as UTF-8 a piece at a time as it passes and a byte string is only counted, and `len` is held to `max_len` from the head. What
+is still copied into `output` is what must be compared or checked whole: the arrays, a `Raw` and a `SortedMap`'s keys. Its span is an
+offset from `base` into `output`, so which of the two a span names follows from its field's type. `wire.streamRegionSizes` (and
+`maxStreamArenaSize`) is the bound: the arrays, the `Raw` items and the keys, and no string, so a type of text and byte strings alone
+is bounded by its arrays however long its strings are. A `Raw` buffer never grows past what `max_input_bytes` still allows, so the
+bound holds when that limit is the smaller one. `bench-wire` measures both decodes.
+
 ### Sorted maps
 
 `zerde.SortedMap(V)` is a map whose keys are data (labels, history, limits): a slice of `Entry { key, value }` sorted by

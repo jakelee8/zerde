@@ -442,6 +442,14 @@ pub const WireSink = struct {
         return spanOf(self.base, bytes);
     }
 
+    /// A text or a byte string left in the stream (`StreamResumable`): its span is where it is in the stream, not in memory.
+    pub fn span(_: WireSink, comptime _: type, start: u64, len: usize) !Span {
+        if (len == 0) return .{ .offset = 0, .len = 0 };
+        const end = std.math.add(u64, start, len) catch return error.OffsetOutOfRange;
+        if (end > std.math.maxInt(u32)) return error.OffsetOutOfRange;
+        return .{ .offset = @intCast(start), .len = @intCast(len) };
+    }
+
     /// The span of a list counts elements, not bytes.
     pub fn list(self: WireSink, comptime T: type, items: []Wire(@typeInfo(T).pointer.child)) !Span {
         const bytes = try spanOf(self.base, std.mem.sliceAsBytes(items));
@@ -624,6 +632,8 @@ const Limits = struct {
     strict: bool,
     /// A resumable read (`Resumable`): every string and `Raw` is copied into the output, since the chunk it came in is gone.
     copy: bool = false,
+    /// With `copy`, a text and a byte string are left in the stream (`StreamResumable`): they cost nothing, but for a sorted map's keys.
+    in_stream: bool = false,
 };
 
 fn optionalOf(comptime cfg: anytype, comptime name: []const u8) ?u64 {
@@ -794,7 +804,7 @@ fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const
 /// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
 /// members (they would cost without limit: set `deny_unknown_fields`), or when it collects extras.
 pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
-    const sizes = comptime computeSizes(Format, T, serde_cfg, format_cfg, false);
+    const sizes = comptime computeSizes(Format, T, serde_cfg, format_cfg, false, false);
     return sizes.output + sizes.scratch;
 }
 
@@ -805,7 +815,7 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 pub const Sizes = struct { output: usize, scratch: usize };
 
 pub fn regionSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) Sizes {
-    return comptime computeSizes(Format, T, serde_cfg, format_cfg, false);
+    return comptime computeSizes(Format, T, serde_cfg, format_cfg, false, false);
 }
 
 /// `regionSizes` for a resumable decode (`Resumable`) of strict CBOR: every string, byte string and `Raw` is copied into `output`
@@ -814,7 +824,7 @@ pub fn regionSizes(comptime Format: type, comptime T: type, comptime serde_cfg: 
 /// `scratch` is empty, since the reader's state is in the `Resumable`. Every string must have a bound (`max_len`, or
 /// `max_string_len`), a `Raw` as well, and a `SortedMap`'s keys the config's `max_string_len`. `cbor_cfg` must say `mode = .strict`.
 pub fn resumableRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
-    return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true);
+    return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true, false);
 }
 
 /// The bytes of `resumableRegionSizes`, together.
@@ -823,12 +833,39 @@ pub fn maxResumableArenaSize(comptime T: type, comptime serde_cfg: anytype, comp
     return sizes.output + sizes.scratch;
 }
 
+/// `resumableRegionSizes` for `StreamResumable`: a text and a byte string are left in the stream, so they cost nothing; the arrays, the
+/// `Raw` items and a sorted map's keys are charged as `resumableRegionSizes` charges them. A type with none of the latter is bounded
+/// by its arrays alone, however long its strings are.
+pub fn streamRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
+    return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true, true);
+}
+
+/// The bytes of `streamRegionSizes`, together.
+pub fn maxStreamArenaSize(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) usize {
+    const sizes = comptime streamRegionSizes(T, serde_cfg, cbor_cfg);
+    return sizes.output + sizes.scratch;
+}
+
 /// A resumable decode (see `resumable.Reading`) into `Wire(T)` in a caller region: strict CBOR fed in chunks, the arrays and every
 /// string copied into `output`, which is `resumableRegionSizes(...).output` bytes for any input the config allows. Spans are offsets
 /// from `base` as in `decodeInto`, and point into `output` only, since no chunk is kept. It points into itself, so it is set
 /// up in place (`init`) and must not be moved. A decode that fails is not undone: `output` is the caller's to reuse.
 pub fn Resumable(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) type {
-    const Reading = resumable.Reading(WireSink, T, serde_cfg, cbor_cfg);
+    return ResumableIn(T, serde_cfg, cbor_cfg, false);
+}
+
+/// `Resumable` that leaves a text and a byte string in the stream: the stream is what the caller keeps whole (in JavaScript, the frame),
+/// and the decode keeps none of it. The span of a text or a byte string is `{ offset = its first byte's position in the stream from
+/// the stream's first byte, len }` (`error.OffsetOutOfRange` past 4 GiB), text checked as UTF-8 a piece at a time as it passes; the span of
+/// an array, a `Raw` (copied, and checked once whole) or a sorted map's key (copied, to compare it with the next) is an offset
+/// from `base` into `output`, which is `streamRegionSizes(...).output` bytes. Which of the two a span is follows from its field's type.
+pub fn StreamResumable(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) type {
+    return ResumableIn(T, serde_cfg, cbor_cfg, true);
+}
+
+fn ResumableIn(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype, comptime in_stream: bool) type {
+    const Reading = resumable.Reading(WireSink, T, serde_cfg, cbor_cfg, in_stream);
+
     return struct {
         arena: std.heap.FixedBufferAllocator,
         regions: [1][]const u8,
@@ -859,12 +896,13 @@ pub fn Resumable(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cf
     };
 }
 
-fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype, comptime copy: bool) Sizes {
+fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype, comptime copy: bool, comptime in_stream: bool) Sizes {
     @setEvalBranchQuota(1_000_000);
     const limits = comptime blk: {
         var found = limitsOf(Format, format_cfg);
         if (copy and !found.strict) @compileError("a resumable read reads strict CBOR: set mode = .strict");
         found.copy = copy;
+        found.in_stream = in_stream;
         break :blk found;
     };
     const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0);
@@ -905,13 +943,13 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
         .text => blk: {
             // A strict read has only definite strings, which it never rewrites: they are spans of the input.
-            if (limits.strict and !limits.copy) break :blk .{};
+            if (limits.strict and (!limits.copy or limits.in_stream)) break :blk .{};
             // A string with an escape or in chunks is measured first and written once, exactly sized.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a string");
             break :blk .{ .text = .{ .fixed = n } };
         },
         .byte_string => blk: {
-            if (limits.strict and !limits.copy) break :blk .{};
+            if (limits.strict and (!limits.copy or limits.in_stream)) break :blk .{};
             // The bytes only: base64 is decoded from the input, or from the unescaped text a chunk at a time.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a byte string");
             break :blk .{ .text = .{ .fixed = n } };
@@ -963,7 +1001,13 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             var total: Cost = .{};
             for (reflect.fields(T, cfg)) |field| {
                 if (field.extras) @compileError("a struct with extras has no arena bound: " ++ @typeName(T));
-                total = total.plus(typedOwned(field.type, field.bounds, cfg, limits, depth + 1));
+                // A sorted map's key is kept even where strings are left in the stream: the next key is compared with it.
+                const field_limits: Limits = comptime kept: {
+                    var adjusted = limits;
+                    if (@hasDecl(T, "zerde_sorted_entry") and std.mem.eql(u8, field.name, "key")) adjusted.in_stream = false;
+                    break :kept adjusted;
+                };
+                total = total.plus(typedOwned(field.type, field.bounds, cfg, field_limits, depth + 1));
             }
             break :blk total;
         },

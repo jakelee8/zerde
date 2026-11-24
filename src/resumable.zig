@@ -191,10 +191,10 @@ fn frameCount(comptime T: type, comptime cfg: anytype, comptime depth: usize) us
 /// as they do to a whole input. A struct it reaches must `deny_unknown_fields` and have no extras (`typed_resume.zig`),
 /// and a type with a decode hook is a compile error. The allocator must be an arena or a fixed buffer: nothing a read
 /// allocated is freed on an error.
-pub fn Reading(comptime Sink: type, comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) type {
+pub fn Reading(comptime Sink: type, comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype, comptime positions: bool) type {
     const ReaderType = chunk.Reader(@TypeOf(cbor_cfg));
     const depth = depthOf(cbor_cfg);
-    const StateType = typed_resume.State(frameCount(T, serde_cfg, depth), longestKey(T, serde_cfg, 0), depth);
+    const StateType = typed_resume.State(frameCount(T, serde_cfg, depth), longestKey(T, serde_cfg, 0), depth, positions);
     return struct {
         reader: ReaderType,
         state: StateType = .{},
@@ -249,7 +249,7 @@ pub fn Reading(comptime Sink: type, comptime T: type, comptime serde_cfg: anytyp
 
 /// `Reading` into the Zig value of `T`.
 pub fn Decoder(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) type {
-    return Reading(typed.TypedSink, T, serde_cfg, cbor_cfg);
+    return Reading(typed.TypedSink, T, serde_cfg, cbor_cfg, false);
 }
 
 /// Whether the stored item can be rendered as JSON, which the first window decides, so that nothing is written of one that cannot: every

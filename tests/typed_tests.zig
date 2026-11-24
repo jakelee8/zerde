@@ -7833,3 +7833,222 @@ test "the first window of a render refuses what cannot be rendered, with the err
     var small: [zerde.resumable.Render(.{}).min_window - 1]u8 = undefined;
     try std.testing.expectError(error.WindowTooSmall, render.fill(&.{0x05}, &small));
 }
+
+const StreamItem = struct {
+    label: []const u8,
+    data: zerde.ByteString,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .label = .{ .max_len = 16 }, .data = .{ .max_len = 6000 } } };
+};
+
+const StreamMsg = struct {
+    id: u32,
+    name: []const u8,
+    blob: zerde.ByteString,
+    items: []const StreamItem,
+    raw: zerde.cbor.Raw,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+        .name = .{ .max_len = 3000 },
+        .blob = .{ .max_len = 6000 },
+        .items = .{ .max_len = 4 },
+        .raw = .{ .max_len = 40 },
+    } };
+};
+
+const stream_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 6000, .max_items = 100, .max_input_bytes = 20000 };
+
+/// The decode of `input` that is cut at `cuts` in a region of exactly `streamRegionSizes`: every text and byte string is a span of
+/// `input` itself (its position in the stream), and the arrays, the `Raw` and the sorted map's keys are spans of the region.
+fn expectStreamSpans(input: []const u8, expected: StreamMsg, cuts: []const usize) !void {
+    const sizes = comptime wire.streamRegionSizes(StreamMsg, .{}, stream_read);
+    var region: Region = .{};
+    var decoder: wire.StreamResumable(StreamMsg, .{}, stream_read) = undefined;
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    var from: usize = 0;
+    for (cuts) |cut| {
+        _ = try decoder.feed(input[from..cut]);
+        from = cut;
+    }
+    _ = try decoder.feed(input[from..]);
+    const decoded = try decoder.finish();
+    try std.testing.expect(decoded.used <= sizes.output);
+    const stream: wire.Memory = .{ .base = @intFromPtr(input.ptr), .regions = &.{input} };
+    const memory = region.memory();
+    const value = decoded.value;
+    try std.testing.expectEqual(expected.id, value.id);
+    try std.testing.expectEqualSlices(u8, expected.name, try stream.bytesOf(value.name));
+    try std.testing.expectEqualSlices(u8, expected.blob.bytes, try stream.bytesOf(value.blob));
+    const items = try memory.listOf(wire.Wire(StreamItem), value.items);
+    try std.testing.expectEqual(expected.items.len, items.len);
+    for (expected.items, items) |want, got| {
+        try std.testing.expectEqualSlices(u8, want.label, try stream.bytesOf(got.label));
+        try std.testing.expectEqualSlices(u8, want.data.bytes, try stream.bytesOf(got.data));
+    }
+    try std.testing.expectEqualSlices(u8, expected.raw.bytes, try memory.bytesOf(value.raw));
+}
+
+test "a resumable decode that leaves strings in the stream gives their positions, at every cut, in a region that holds none of them" {
+    // Text that is not ASCII, so a cut falls inside a character; a byte string longer than the whole region.
+    var name: [200]u8 = undefined;
+    for (0..100) |at| {
+        name[at * 2] = 0xc3;
+        name[at * 2 + 1] = 0xa9;
+    }
+    var blob: [5000]u8 = undefined;
+    for (&blob, 0..) |*byte, at| byte.* = @truncate(at *% 7);
+    const items = [_]StreamItem{
+        .{ .label = "", .data = .{ .bytes = "" } },
+        .{ .label = "sécond", .data = .{ .bytes = &blob } },
+        .{ .label = "third", .data = .{ .bytes = "xyz" } },
+    };
+    const raw = [_]u8{ 0x83, 0x01, 0x02, 0x03 };
+    const expected: StreamMsg = .{ .id = 70000, .name = &name, .blob = .{ .bytes = &blob }, .items = &items, .raw = .{ .bytes = &raw } };
+    const input = try deterministicBytes(StreamMsg, .{}, expected);
+    defer allocator.free(input);
+
+    // The region is a fraction of the input, and holds no string: the arrays, the keys and the Raw only.
+    const sizes = comptime wire.streamRegionSizes(StreamMsg, .{}, stream_read);
+    try std.testing.expect(sizes.output < 1200);
+    try std.testing.expect(sizes.output * 4 < input.len);
+    try std.testing.expect(wire.resumableRegionSizes(StreamMsg, .{}, stream_read).output > blob.len + name.len);
+    try std.testing.expectEqual(sizes.output, wire.maxStreamArenaSize(StreamMsg, .{}, stream_read));
+
+    try expectStreamSpans(input, expected, &.{});
+    for (0..input.len + 1) |cut| try expectStreamSpans(input, expected, &.{cut});
+    var step: usize = 1;
+    while (step < 70) : (step = step * 3 + 1) {
+        var cuts: std.ArrayList(usize) = .empty;
+        defer cuts.deinit(allocator);
+        var at: usize = step;
+        while (at < input.len) : (at += step) try cuts.append(allocator, at);
+        try expectStreamSpans(input, expected, cuts.items);
+    }
+}
+
+test "a resumable decode that leaves strings in the stream refuses what the whole read refuses, and a position past 4 GiB" {
+    const input_ok = try deterministicBytes(StreamMsg, .{}, .{ .id = 1, .name = "ok", .blob = .{ .bytes = "b" }, .items = &.{}, .raw = .{ .bytes = &.{0x01} } });
+    defer allocator.free(input_ok);
+    const sizes = comptime wire.streamRegionSizes(StreamMsg, .{}, stream_read);
+    var region: Region = .{};
+    // Invalid UTF-8 in the name, cut at every offset: refused once the character is whole.
+    const bad = try allocator.dupe(u8, input_ok);
+    defer allocator.free(bad);
+    const name_at = std.mem.indexOf(u8, bad, "ok").?;
+    // A character the text ends in the middle of is refused too, at the end of the text.
+    for ([_][2]u8{ .{ 0xc3, 0x28 }, .{ 'o', 0xc3 } }) |pair| {
+        bad[name_at] = pair[0];
+        bad[name_at + 1] = pair[1];
+        for (0..bad.len + 1) |cut| {
+            var decoder: wire.StreamResumable(StreamMsg, .{}, stream_read) = undefined;
+            decoder.init(region.bytes[0..sizes.output], region.base());
+            const first = decoder.feed(bad[0..cut]);
+            if (first) |_| {
+                try std.testing.expectError(error.InvalidUtf8, decoder.feed(bad[cut..]));
+            } else |err| try std.testing.expectEqual(error.InvalidUtf8, err);
+        }
+    }
+    // A text over its bound is refused from its head, before any of it is read.
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(allocator);
+    try long.appendSlice(allocator, &.{ 0xa6, 0x62, 'i', 'd', 0x01, 0x63, 'r', 'a', 'w', 0x01, 0x64, 'b', 'l', 'o', 'b', 0x40, 0x64, 'n', 'a', 'm', 'e', 0x79, 0x0b, 0xb9 });
+    var decoder: wire.StreamResumable(StreamMsg, .{}, stream_read) = undefined;
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    try std.testing.expectError(error.LengthOutOfBounds, decoder.feed(long.items));
+    // The span of a string whose position does not fit 32 bits.
+    var sink: wire.WireSink = undefined;
+    try std.testing.expectError(error.OffsetOutOfRange, sink.span([]const u8, 0xffff_fff0, 0x20));
+    try std.testing.expectEqual(wire.Span{ .offset = 0xffff_fff0, .len = 0x0f }, try sink.span([]const u8, 0xffff_fff0, 0x0f));
+    try std.testing.expectEqual(wire.Span{ .offset = 0, .len = 0 }, try sink.span([]const u8, 123, 0));
+}
+
+const StreamKeyed = struct {
+    name: []const u8,
+    labels: zerde.SortedMap(zerde.ByteString),
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .name = .{ .max_len = 40 }, .labels = .{ .max_len = 3, .elem = .{ .max_len = 40 } } } };
+};
+
+test "a resumable decode that leaves strings in the stream keeps a sorted map's keys, and they are compared, at every cut" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 50, .max_input_bytes = 1000 };
+    const Entry = zerde.SortedMap(zerde.ByteString).Entry;
+    const entries = [_]Entry{ .{ .key = "a", .value = .{ .bytes = "one" } }, .{ .key = "bb", .value = .{ .bytes = "two" } }, .{ .key = "ccc", .value = .{ .bytes = "" } } };
+    const expected: StreamKeyed = .{ .name = "named", .labels = .{ .entries = &entries } };
+    const input = try deterministicBytes(StreamKeyed, .{}, expected);
+    defer allocator.free(input);
+    const sizes = comptime wire.streamRegionSizes(StreamKeyed, .{}, read);
+    // Three keys of up to 64 bytes are charged, and the value strings and the name are not.
+    try std.testing.expect(sizes.output >= 3 * 64 + 256);
+    try std.testing.expect(wire.resumableRegionSizes(StreamKeyed, .{}, read).output >= sizes.output + 40 + 3 * 40);
+    const stream: wire.Memory = .{ .base = @intFromPtr(input.ptr), .regions = &.{input} };
+    var region: Region = .{};
+    for (0..input.len + 1) |cut| {
+        var decoder: wire.StreamResumable(StreamKeyed, .{}, read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        _ = try decoder.feed(input[0..cut]);
+        _ = try decoder.feed(input[cut..]);
+        const decoded = try decoder.finish();
+        try std.testing.expectEqualSlices(u8, "named", try stream.bytesOf(decoded.value.name));
+        const got = try region.memory().listOf(wire.Wire(Entry), decoded.value.labels.entries);
+        try std.testing.expectEqual(@as(usize, 3), got.len);
+        for (entries, got) |want, have| {
+            try std.testing.expectEqualSlices(u8, want.key, try region.memory().bytesOf(have.key));
+            try std.testing.expectEqualSlices(u8, want.value.bytes, try stream.bytesOf(have.value));
+        }
+    }
+}
+
+test "a resumable decode holds a Raw that fills the input in a region of exactly its bound, fed a byte at a time" {
+    const BigRaw = struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 20000 } } };
+    };
+    // The Raw's own bound and the string bound are far above what the input allows, which is what clamps the charge.
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 20000, .max_input_bytes = 6000 };
+    const sizes = comptime wire.resumableRegionSizes(BigRaw, .{}, read);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x63, 'r', 'a', 'w', 0x59, 0x17, 0x60 });
+    try input.appendNTimes(allocator, 0xff, 5984);
+    try std.testing.expect(input.items.len <= 6000);
+    var region: Region = .{};
+    var decoder: wire.Resumable(BigRaw, .{}, read) = undefined;
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    for (input.items) |byte| _ = try decoder.feed(&.{byte});
+    const decoded = try decoder.finish();
+    try std.testing.expectEqualSlices(u8, input.items[5..], try region.memory().bytesOf(decoded.value.raw));
+    try std.testing.expect(decoded.used <= sizes.output);
+    // The bytes it grows through are never more than the stream may still hold, wherever the item starts.
+    try std.testing.expect(sizes.output <= 6000 + 256);
+}
+
+test "a fixed array read from an array of unstated length takes exactly its length, and frees what it read when it does not" {
+    // JSON states no length: too few items is refused at the end, too many at the first one past it.
+    try expectJsonError([3]u16, error.LengthMismatch, "[]");
+    try expectJsonError([3]u16, error.LengthMismatch, "[1,2]");
+    try expectJsonError([3]u16, error.LengthMismatch, "[1,2,3,4]");
+    try std.testing.expectEqual([3]u16{ 1, 2, 3 }, try zerde.json.parseSlice([3]u16, allocator, "[1,2,3]"));
+    // Owning elements read before the short end are freed (the testing allocator reports a leak).
+    try expectJsonError([3][]const u8, error.LengthMismatch, "[\"a\",\"b\"]");
+}
+
+test "a resumable decode that leaves strings in the stream holds a text to its least length too, at every cut" {
+    const Short = struct {
+        name: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .name = .{ .min_len = 2, .max_len = 10 } } };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_input_bytes = 100 };
+    const sizes = comptime wire.streamRegionSizes(Short, .{}, read);
+    var region: Region = .{};
+    const too_short = [_]u8{ 0xa1, 0x64, 'n', 'a', 'm', 'e', 0x61, 'x' };
+    const enough = [_]u8{ 0xa1, 0x64, 'n', 'a', 'm', 'e', 0x62, 'x', 'y' };
+    for (0..too_short.len + 1) |cut| {
+        var decoder: wire.StreamResumable(Short, .{}, read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        const first = decoder.feed(too_short[0..cut]);
+        if (first) |_| {
+            try std.testing.expectError(error.LengthOutOfBounds, decoder.feed(too_short[cut..]));
+        } else |err| try std.testing.expectEqual(error.LengthOutOfBounds, err);
+    }
+    var decoder: wire.StreamResumable(Short, .{}, read) = undefined;
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    _ = try decoder.feed(&enough);
+    try std.testing.expectEqual(wire.Span{ .offset = 7, .len = 2 }, (try decoder.finish()).value.name);
+}

@@ -127,6 +127,11 @@ pub fn Reader(comptime Config: type) type {
             return optionOf(self.cfg, "max_input_bytes", (cbor.ReadConfig{}).max_input_bytes);
         }
 
+        /// The bytes the stream may still hold: what `max_input_bytes` allows past the bytes taken.
+        pub fn inputLeft(self: *const Self) usize {
+            return self.maxInputBytes() - @as(usize, @intCast(@min(self.position, self.maxInputBytes())));
+        }
+
         pub fn trustedText(self: *const Self) bool {
             return optionOf(self.cfg, "trusted_text", false);
         }
@@ -270,7 +275,7 @@ pub fn Reader(comptime Config: type) type {
         /// `max_items` has left: refused before anything is allocated for them, as the whole-input reader refuses a
         /// length that claims more items than the input has bytes (its input here is what `max_input_bytes` allows).
         fn claim(self: *Self, count: u64, per: usize) !usize {
-            const left = self.maxInputBytes() - @as(usize, @intCast(@min(self.position, self.maxInputBytes())));
+            const left = self.inputLeft();
             if (count > left / per) return error.UnexpectedEndOfInput;
             if (count * per > self.maxItems() - self.items) return error.TooManyItems;
             return @intCast(count);
@@ -322,6 +327,11 @@ pub fn Reader(comptime Config: type) type {
             self.index += n;
             self.position += n;
             return n;
+        }
+
+        /// Where the next byte is in the whole stream, from its first byte: the start of a string just after its head.
+        pub fn streamPosition(self: *const Self) u64 {
+            return self.position;
         }
 
         /// Takes up to `n` bytes of the string in progress without copying them: a view of the chunk, valid until the next call.
