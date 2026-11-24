@@ -514,6 +514,13 @@ pub fn CborDeserializer(comptime Config: type) type {
 
         pub const supports_unions = true;
         pub const supports_integer_keys = true;
+        /// The encoded form of a key, which a type that declares its fields in order is checked against (`typed.assertDeclaredOrder`).
+        pub const keyEncoder = encodeKey;
+
+        /// Whether the keys of a map are guaranteed to ascend, so each repeats or follows the one before (a strict read).
+        pub fn keysAscend(self: *Self) bool {
+            return self.strict;
+        }
 
         fn initBorrowed(allocator: Allocator, input: []const u8, cfg: Config) Self {
             return .{

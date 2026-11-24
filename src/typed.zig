@@ -491,6 +491,7 @@ fn serializeValue(
                 return;
             }
             if (info.is_tuple) @compileError("tuple structs are not supported: " ++ @typeName(T));
+            if (comptime meta.effectiveDeclaredInOrder(T, cfg) and @hasDecl(Format, "encodeKey")) assertDeclaredOrder(T, cfg, Format.encodeKey);
 
             // The extras field is not a member: its entries are members of this struct's map.
             const extras_name = comptime meta.extrasField(T);
@@ -638,6 +639,39 @@ fn serializeItems(
     try reserveRoom(rc, atomic_room);
     try serializer.endArray(Child, items.len);
     level.* = .{};
+}
+
+/// The first field of `T` that is not after the one before it in the order of the encoded keys `encode` gives (`null` when
+/// all are), with that one: a repeated key is not after it either.
+pub fn declaredOrderFault(comptime T: type, comptime cfg: anytype, comptime encode: anytype) ?struct { field: []const u8, previous: []const u8 } {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        const info = @typeInfo(T).@"struct";
+        var previous: ?[]const u8 = null;
+        var previous_name: []const u8 = "";
+        for (info.field_names) |name| {
+            const key = encode(meta.effectiveFieldKey(T, name, cfg));
+            if (previous) |before| {
+                if (!std.mem.lessThan(u8, before, key)) return .{ .field = name, .previous = previous_name };
+            }
+            previous = key;
+            previous_name = name;
+        }
+        return null;
+    }
+}
+
+/// A struct that declares `declared_in_order` has its fields in the ascending order of their encoded keys, `encode` being the
+/// format's `encodeKey`: a compile error names the first field that is not after the one before it. A type with extras has
+/// members that are not fields, so it cannot be in order.
+pub fn assertDeclaredOrder(comptime T: type, comptime cfg: anytype, comptime encode: anytype) void {
+    comptime {
+        if (meta.extrasField(T) != null) @compileError("a type with extras cannot declare its fields in order: " ++ @typeName(T));
+        if (declaredOrderFault(T, cfg, encode)) |fault| {
+            @compileError(@typeName(T) ++ " declares its fields in order, but `" ++ fault.field ++ "` is not after `" ++ fault.previous ++
+                "` in the order of their encoded keys");
+        }
+    }
 }
 
 /// The bytes of an extras field, which is `Raw` or `?Raw`; none for a null.
@@ -1311,6 +1345,12 @@ fn deserializeStruct(
         @compileError("format " ++ @typeName(DeserializerType) ++ " does not support integer keys: " ++ @typeName(T));
     }
 
+    if (comptime meta.effectiveDeclaredInOrder(T, cfg) and @hasDecl(DeserializerType, "keyEncoder")) {
+        assertDeclaredOrder(T, cfg, DeserializerType.keyEncoder);
+        if (comptime !@hasDecl(DeserializerType, "nextObjectFieldIndex")) @compileError("a merge walk needs the field index of a key");
+        if (deserializer.keysAscend()) return mergeStruct(s, T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+    }
+
     try deserializer.beginObject();
 
     var result: @TypeOf(s).Of(T) = undefined;
@@ -1378,6 +1418,64 @@ fn deserializeStruct(
 
     if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, &result, &seen);
     try fillMissingFields(s, T, info, cfg, allocator, &result, &seen);
+    try s.check(T, allocator, &result);
+    return result;
+}
+
+/// A struct whose fields are declared in key order, read from a deserializer that guarantees its keys ascend (`keysAscend`):
+/// one walk over the fields and the input together. A key names field `f`, so every field before it that was not named is
+/// absent, and is resolved at once; there are no seen flags and no pass at the end for the fields after the last key.
+fn mergeStruct(
+    s: anytype,
+    comptime T: type,
+    comptime info: std.builtin.Type.Struct,
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track_diagnostics: bool,
+) anyerror!@TypeOf(s).Of(T) {
+    const DeserializerType = @TypeOf(deserializer.*);
+    const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
+    if (comptime structHasIntegerKeys(T, info, cfg) and !@hasDecl(DeserializerType, "supports_integer_keys")) {
+        @compileError("format " ++ @typeName(DeserializerType) ++ " does not support integer keys: " ++ @typeName(T));
+    }
+    try deserializer.beginObject();
+    var result: @TypeOf(s).Of(T) = undefined;
+    // The fields before `cursor` have a value: read, or resolved as absent.
+    var cursor: usize = 0;
+    errdefer inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
+        if (i < cursor) s.free(field_type, allocator, @field(result, field_name), borrowed_strings);
+    };
+    while (true) {
+        switch (try deserializer.nextObjectFieldIndex(T, cfg)) {
+            .end => break,
+            .unknown => {
+                if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
+                try deserializer.skipValue(allocator);
+            },
+            .field_index => |field_index| {
+                inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
+                    if (field_index == i) {
+                        inline for (0..i) |absent| {
+                            if (absent >= cursor) {
+                                try fillField(s, T, info, cfg, allocator, &result, absent);
+                                cursor = absent + 1;
+                            }
+                        }
+                        @field(result, field_name) = try deserializeStructField(s, T, field_name, field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+                        cursor = i + 1;
+                    }
+                }
+            },
+        }
+    }
+    inline for (0..info.field_names.len) |i| {
+        if (i >= cursor) {
+            try fillField(s, T, info, cfg, allocator, &result, i);
+            cursor = i + 1;
+        }
+    }
     try s.check(T, allocator, &result);
     return result;
 }
@@ -1463,19 +1561,32 @@ fn fillMissingFields(
     result: *@TypeOf(s).Of(T),
     seen: *const [info.field_names.len]bool,
 ) anyerror!void {
-    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, field_type, field_attrs, i| {
-        if (!seen[i]) {
-            if (field_attrs.defaultValue(field_type)) |default_value| {
-                @field(result.*, field_name) = try s.fromDefault(field_type, allocator, default_value);
-            } else if (@typeInfo(field_type) == .optional) {
-                if (comptime !isNestedOptional(field_type) and meta.effectiveOptionalPolicy(T, field_name, cfg) == .nullable) {
-                    return error.MissingField;
-                }
-                @field(result.*, field_name) = try s.none(field_type);
-            } else {
-                return error.MissingField;
-            }
+    inline for (0..info.field_names.len) |i| {
+        if (!seen[i]) try fillField(s, T, info, cfg, allocator, result, i);
+    }
+}
+
+/// The value of field `i` when the input did not name it.
+fn fillField(
+    s: anytype,
+    comptime T: type,
+    comptime info: std.builtin.Type.Struct,
+    comptime cfg: anytype,
+    allocator: Allocator,
+    result: *@TypeOf(s).Of(T),
+    comptime i: usize,
+) anyerror!void {
+    const field_name = info.field_names[i];
+    const field_type = info.field_types[i];
+    if (info.field_attrs[i].defaultValue(field_type)) |default_value| {
+        @field(result.*, field_name) = try s.fromDefault(field_type, allocator, default_value);
+    } else if (@typeInfo(field_type) == .optional) {
+        if (comptime !isNestedOptional(field_type) and meta.effectiveOptionalPolicy(T, field_name, cfg) == .nullable) {
+            return error.MissingField;
         }
+        @field(result.*, field_name) = try s.none(field_type);
+    } else {
+        return error.MissingField;
     }
 }
 

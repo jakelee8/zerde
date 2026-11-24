@@ -60,7 +60,7 @@ MUTANTS = [
     ("typed.zig", ".nullable => false,\n        .absent => value == null,", ".nullable => value == null,\n        .absent => value == null,"),
     ("typed.zig", ".absent => value == null,\n    };\n}", ".absent => false,\n    };\n}"),
     ("typed.zig", "if (try deserializer.peekKind() == .null) return error.UnexpectedType;", "_ = 0;"),
-    ("typed.zig", "meta.effectiveOptionalPolicy(T, field_name, cfg) == .nullable) {\n                    return error.MissingField;", "meta.effectiveOptionalPolicy(T, field_name, cfg) == .nullable and false) {\n                    return error.MissingField;"),
+    ("typed.zig", "meta.effectiveOptionalPolicy(T, field_name, cfg) == .nullable) {\n            return error.MissingField;", "meta.effectiveOptionalPolicy(T, field_name, cfg) == .nullable and false) {\n            return error.MissingField;"),
     ("typed.zig", "if (comptime isNestedOptional(FieldType)) return value == null;", "if (comptime isNestedOptional(FieldType)) return false;"),
     ("typed.zig", ".integer => |expected| if (expected == actual) return i,", ".integer => |expected| if (expected == actual and false) return i,"),
     ("typed.zig", ".bytewise, .encoded_key => std.mem.lessThan(u8, a, b),", ".bytewise, .encoded_key => std.mem.lessThan(u8, b, a),"),
@@ -534,6 +534,14 @@ MUTANTS = [
     ("json.zig", "    if (@as(i64, @intCast(count)) + scale > max_digits - 1) return error.IntegerOverflow;\n", ""),
     ("json.zig", "        if (text[at] == '+' or text[at] == '-') {\n            exponent_negative = text[at] == '-';", "        if (text[at] == '+' or text[at] == '-') {\n            exponent_negative = false;"),
     ("json.zig", "    const scale = exponent - fraction_digits + @as(i64, @intCast(pending_zeros));", "    const scale = exponent - fraction_digits;"),
+    ("typed.zig", "        if (deserializer.keysAscend()) return mergeStruct(", "        if (false) return mergeStruct("),
+    ("typed.zig", "                            if (absent >= cursor) {", "                            if (true) {"),
+    ("typed.zig", "        if (i < cursor) s.free(field_type, allocator, @field(result, field_name), borrowed_strings);", "        if (false) s.free(field_type, allocator, @field(result, field_name), borrowed_strings);"),
+    ("typed.zig", "        if (i >= cursor) {\n            try fillField", "        if (false) {\n            try fillField"),
+    ("typed.zig", "                if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;\n                try deserializer.skipValue(allocator);\n            },\n            .field_index => |field_index| {\n                inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {\n                    if (field_index == i) {\n                        inline for (0..i)", "                try deserializer.skipValue(allocator);\n            },\n            .field_index => |field_index| {\n                inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {\n                    if (field_index == i) {\n                        inline for (0..i)"),
+    ("typed.zig", "if (!std.mem.lessThan(u8, before, key)) return .{ .field = name, .previous = previous_name };", "if (std.mem.lessThan(u8, key, before)) return .{ .field = name, .previous = previous_name };"),
+    ("cbor.zig", "        pub fn keysAscend(self: *Self) bool {\n            return self.strict;", "        pub fn keysAscend(self: *Self) bool {\n            return true;"),
+    ("meta.zig", "    if (comptime serdeHasField(T, \"declared_in_order\")) return @field(T.serde, \"declared_in_order\");\n", ""),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

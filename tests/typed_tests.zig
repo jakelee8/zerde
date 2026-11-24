@@ -4815,6 +4815,147 @@ test "integral_numbers is off by default, and a float field and the typed layer'
     try std.testing.expectEqual(@as(u16, 10), w.count);
 }
 
+// ---- fields declared in encoded-key order, and a strict read by merge walk ---------------------------------------
+
+fn FramePair(comptime in_order: bool) type {
+    return struct {
+        id: u16,
+        kind: []const u8,
+        flags: u8 = 7,
+        note: ?[]const u8 = null,
+        tail: u32,
+        pub const serde = if (in_order) .{
+            .declared_in_order = true,
+            .deny_unknown_fields = true,
+            .fields = .{ .id = .{ .key = 0 }, .kind = .{ .key = 1 }, .flags = .{ .key = 2 }, .note = .{ .key = 3, .optional = .absent }, .tail = .{ .key = 4 } },
+        } else .{
+            .deny_unknown_fields = true,
+            .fields = .{ .id = .{ .key = 0 }, .kind = .{ .key = 1 }, .flags = .{ .key = 2 }, .note = .{ .key = 3, .optional = .absent }, .tail = .{ .key = 4 } },
+        };
+    };
+}
+const Ordered = FramePair(true);
+const Unordered = FramePair(false);
+
+test "a type that declares its fields in order reads, strict, as the type that does not does, and writes the same bytes" {
+    const frames = [_][]const u8{
+        &.{ 0xa5, 0x00, 0x01, 0x01, 0x61, 'k', 0x02, 0x08, 0x03, 0x61, 'n', 0x04, 0x09 }, // every field
+        &.{ 0xa3, 0x00, 0x01, 0x01, 0x61, 'k', 0x04, 0x09 }, // the default and the optional are absent
+        &.{ 0xa4, 0x00, 0x01, 0x01, 0x61, 'k', 0x03, 0x60, 0x04, 0x09 }, // the optional is empty text
+        &.{ 0xa2, 0x01, 0x61, 'k', 0x04, 0x09 }, // the first is missing
+        &.{ 0xa2, 0x00, 0x01, 0x01, 0x61, 'k' }, // the last is missing
+        &.{ 0xa1, 0x00, 0x01 }, // everything after the first is
+        &.{0xa0},
+        &.{ 0xa2, 0x01, 0x61, 'k', 0x00, 0x01 }, // out of order
+        &.{ 0xa2, 0x00, 0x01, 0x00, 0x02 }, // repeated
+        &.{ 0xa4, 0x00, 0x01, 0x01, 0x61, 'k', 0x04, 0x09, 0x05, 0x00 }, // a key the type does not declare
+        &.{ 0xa4, 0x00, 0x01, 0x01, 0x61, 'k', 0x03, 0x61, 'n', 0x04, 0x0a },
+        &.{ 0xa3, 0x00, 0x01, 0x20, 0x00, 0x04, 0x09 }, // -1 is not a field and sorts after 0
+        &.{ 0xa2, 0x00, 0x01, 0x01, 0xf6 }, // a null for the text
+    };
+    for (frames) |frame| {
+        const twin = zerde.cbor.parseSliceWith(Unordered, allocator, frame, .{}, strict);
+        const merged = zerde.cbor.parseSliceWith(Ordered, allocator, frame, .{}, strict);
+        if (twin) |left| {
+            const right = try merged;
+            try std.testing.expectEqual(left.id, right.id);
+            try std.testing.expectEqualStrings(left.kind, right.kind);
+            try std.testing.expectEqual(left.flags, right.flags);
+            try std.testing.expectEqualDeep(left.note, right.note);
+            try std.testing.expectEqual(left.tail, right.tail);
+            zerde.free(allocator, left);
+            zerde.free(allocator, right);
+        } else |_| {
+            // Both refuse it. The error can differ when an input has two faults: the merge walk reports an absent required field
+            // when the key after it arrives, the other at the end of the map (the cases below pin each one alone).
+            if (merged) |value| {
+                zerde.free(allocator, value);
+                return error.TestUnexpectedResult;
+            } else |_| {}
+        }
+    }
+    // The errors, named: a missing field (the unsorted frame lacks `id` when `kind` arrives), an unsorted key, a repeated one, an undeclared one.
+    try std.testing.expectError(error.MissingField, zerde.cbor.parseSliceWith(Ordered, allocator, frames[3], .{}, strict));
+    try std.testing.expectError(error.MissingField, zerde.cbor.parseSliceWith(Ordered, allocator, frames[4], .{}, strict));
+    try std.testing.expectError(error.MissingField, zerde.cbor.parseSliceWith(Ordered, allocator, frames[7], .{}, strict));
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.cbor.parseSliceWith(Ordered, allocator, &.{ 0xa4, 0x00, 0x01, 0x01, 0x61, 'k', 0x04, 0x09, 0x03, 0x61, 'n' }, .{}, strict));
+    try std.testing.expectError(error.DuplicateField, zerde.cbor.parseSliceWith(Ordered, allocator, frames[8], .{}, strict));
+    try std.testing.expectError(error.UnknownField, zerde.cbor.parseSliceWith(Ordered, allocator, frames[9], .{}, strict));
+    // A lenient read does not rely on order: the same type takes keys in any order, through the walk it has always had.
+    const lenient = try zerde.cbor.parseSlice(Ordered, allocator, &.{ 0xa3, 0x04, 0x09, 0x01, 0x61, 'k', 0x00, 0x01 });
+    defer zerde.free(allocator, lenient);
+    try std.testing.expectEqual(@as(u32, 9), lenient.tail);
+    try std.testing.expectError(error.DuplicateField, zerde.cbor.parseSlice(Ordered, allocator, &.{ 0xa2, 0x00, 0x01, 0x00, 0x02 }));
+    // The write is the same bytes: the declaration is the canonical order.
+    const value: Unordered = .{ .id = 1, .kind = "k", .flags = 8, .note = "n", .tail = 9 };
+    var left: std.Io.Writer.Allocating = .init(allocator);
+    defer left.deinit();
+    try zerde.serializeWith(zerde.cbor, &left.writer, value, .{}, .{ .deterministic = true });
+    var right: std.Io.Writer.Allocating = .init(allocator);
+    defer right.deinit();
+    try zerde.serializeWith(zerde.cbor, &right.writer, Ordered{ .id = 1, .kind = "k", .flags = 8, .note = "n", .tail = 9 }, .{}, .{ .deterministic = true });
+    try std.testing.expectEqualSlices(u8, left.written(), right.written());
+    try std.testing.expectEqualSlices(u8, frames[0], right.written());
+}
+
+test "a merge walk releases what it read when a later field fails, in a list and in a wire decode" {
+    const Many = struct {
+        items: []const Ordered,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // The second item lacks `tail`; the first was read and the list was allocated.
+    const input = [_]u8{ 0xa1, 0x65, 'i', 't', 'e', 'm', 's', 0x82, 0xa2, 0x00, 0x01, 0x04, 0x02, 0xa1, 0x00, 0x01 };
+    try std.testing.expectError(error.MissingField, zerde.cbor.parseSliceWith(Many, allocator, &input, .{}, strict));
+    try std.testing.expectError(error.MissingField, zerde.cbor.parseSliceWith(Many, allocator, &input, .{}, .{ .mode = zerde.cbor.Mode.strict }));
+    // Through the wire sink, whose arena is put back.
+    var region: Region = .{};
+    @memcpy(region.bytes[0..input.len], &input);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[1024..]);
+    try std.testing.expectError(error.MissingField, wire.decode(zerde.cbor, Many, &arena, region.base(), region.bytes[0..input.len], .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 64, .max_string_len = 64 }));
+    try std.testing.expectEqual(@as(usize, 0), arena.end_index);
+    const ok = [_]u8{ 0xa1, 0x65, 'i', 't', 'e', 'm', 's', 0x81, 0xa3, 0x00, 0x01, 0x01, 0x60, 0x04, 0x02 };
+    @memcpy(region.bytes[0..ok.len], &ok);
+    const decoded = try wire.decode(zerde.cbor, Many, &arena, region.base(), region.bytes[0..ok.len], .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 64, .max_string_len = 64 });
+    try std.testing.expectEqual(@as(u32, 1), decoded.items.len);
+}
+
+test "the declared order is checked against the encoded keys, text and integer, and names the first field out of order" {
+    const enc = zerde.cbor.encodeKey;
+    const AscendingKeys = struct { a: u8, b: u8, cc: u8, dd: u8 };
+    const Bad = struct { b: u8, a: u8 };
+    const Long = struct { aa: u8, b: u8 };
+    const Same = struct {
+        x: u8,
+        y: u8,
+        pub const serde = .{ .fields = .{ .x = .{ .key = 3 }, .y = .{ .key = 3 } } };
+    };
+    const Ints = struct {
+        zero: u8,
+        one: u8,
+        minus: u8,
+        pub const serde = .{ .fields = .{ .zero = .{ .key = 0 }, .one = .{ .key = 1 }, .minus = .{ .key = -1 } } };
+    };
+    const TextThenNumber = struct {
+        text: u8,
+        number: u8,
+        pub const serde = .{ .fields = .{ .number = .{ .key = 1 } } };
+    };
+    try std.testing.expect(comptime zerde.typed.declaredOrderFault(AscendingKeys, .{}, enc) == null);
+    try std.testing.expect(comptime zerde.typed.declaredOrderFault(Ints, .{}, enc) == null);
+    const bad = comptime zerde.typed.declaredOrderFault(Bad, .{}, enc).?;
+    try std.testing.expectEqualStrings("a", bad.field);
+    try std.testing.expectEqualStrings("b", bad.previous);
+    // Shorter keys sort first, so `b` before `aa`, not after.
+    try std.testing.expectEqualStrings("b", (comptime zerde.typed.declaredOrderFault(Long, .{}, enc).?).field);
+    // A key twice is not after itself.
+    try std.testing.expectEqualStrings("y", (comptime zerde.typed.declaredOrderFault(Same, .{}, enc).?).field);
+    // An integer key sorts before a text key: a text key first, then a number, is out of order.
+    try std.testing.expectEqualStrings("number", (comptime zerde.typed.declaredOrderFault(TextThenNumber, .{}, enc).?).field);
+    // A call site's key override changes the order the check sees.
+    const renamed = .{ .fields = .{ .b = .{ .key = 9 } } };
+    try std.testing.expectEqualStrings("b", (comptime zerde.typed.declaredOrderFault(AscendingKeys, renamed, enc).?).field);
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;

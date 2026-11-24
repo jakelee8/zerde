@@ -169,6 +169,13 @@ Supported typed-layer options today:
 - `omit_null_fields`
 - `deny_unknown_fields`
 - `field_order`: `.declaration`, `.length_first`, `.bytewise` or `.encoded_key`; unset, the format chooses
+- `declared_in_order`: the struct declares its fields in the order of their CBOR encoded keys (shorter text keys first,
+  integer keys before text, ascending), so the declaration is the canonical order. Any CBOR use of the type with a field
+  out of that order is a compile error naming the first one (`typed.declaredOrderFault` is the check, for a test), a type
+  with extras cannot declare it, and a strict CBOR read of the type is one merge walk over the fields and the keys: an
+  absent field is resolved when the key after it arrives (or at the end), with no seen flags and no pass at the end for
+  the fields after the last key. A lenient read and every write are as for any type. The error for an input with two faults
+  can differ from the type without it (a missing field is reported when the next key arrives, not at the end)
 - per-field `rename`
 - per-field `key`: an integer map key, for formats that allow one (CBOR)
 - per-field `optional`: `.lenient` (the default), `.nullable` or `.absent`; see [Optional fields](#optional-fields)

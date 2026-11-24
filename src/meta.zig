@@ -103,6 +103,9 @@ pub const SerdeConfig = struct {
     deny_unknown_fields: bool = false,
     /// Field order on write. Null lets the format choose (`FieldOrderPolicy.default`).
     field_order: ?FieldOrder = null,
+    /// The fields are declared in the encoded-key order of a format that has one (CBOR): a compile error names the first that
+    /// is not, and a strict read of the type is a merge walk over the fields in declaration order.
+    declared_in_order: bool = false,
 };
 
 pub const JsonConfig = SerdeConfig;
@@ -158,6 +161,13 @@ pub fn effectiveOmitNullFields(comptime T: type, comptime cfg: anytype) bool {
 pub fn effectiveDenyUnknownFields(comptime T: type, comptime cfg: anytype) bool {
     if (comptime cfgHasField(cfg, "deny_unknown_fields")) return @field(cfg, "deny_unknown_fields");
     if (comptime serdeHasField(T, "deny_unknown_fields")) return @field(T.serde, "deny_unknown_fields");
+    return false;
+}
+
+/// Whether the type declares its fields in the encoded-key order of the format it is used with (`SerdeConfig.declared_in_order`).
+pub fn effectiveDeclaredInOrder(comptime T: type, comptime cfg: anytype) bool {
+    if (comptime cfgHasField(cfg, "declared_in_order")) return @field(cfg, "declared_in_order");
+    if (comptime serdeHasField(T, "declared_in_order")) return @field(T.serde, "declared_in_order");
     return false;
 }
 
