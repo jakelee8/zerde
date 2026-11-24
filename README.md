@@ -467,6 +467,19 @@ maps that hold it; `error.OutOfMemory` when short). It differs from `canonicaliz
 an array or a map is `error.UnexpectedType`, as in the pull reader, because ordering it would need its own
 canonical form kept, which has no bound. Repeated keys (any spelling, and 0.0 with -0.0) are `error.DuplicateField`.
 
+### Resumable writes
+
+`zerde.resumable.Writer(Format, T, serde_cfg, format_cfg)` writes a `T` as JSON or CBOR in fixed windows. `init()`
+makes the cursor (a few words per open container, about 1 KB; the caller owns it) and `fill(value, window)` writes
+the next piece into `window` and returns `.{ .len, .done }`, so a stream can be fed a value of any size from one
+window of, say, 64 KiB, a window at a time as the consumer has room. Nothing is buffered, sorted or written twice: a
+window ends at a token or inside a long string, byte string or `Raw`, which goes on from its byte, and the next call
+goes down the same path of containers by the indexes the cursor keeps. It is the typed walk of `serializeWith`, so the
+bytes are the same and every rule of the schema holds. A window must hold one token, `Writer.min_window` (a number
+or head and the longest field name escaped: `error.WindowTooSmall` below it). Not supported (compile errors): extras,
+encode hooks and `bin`'s sequence path. The value must be the same in every call. `zig build bench-wire` measures
+the windows against the whole write on real text (`bench/WIRE.md`).
+
 ### Fixed-layout wire types
 
 `zerde.wire` generates, from a schema type, the same value laid out the way C lays out a struct, for code that

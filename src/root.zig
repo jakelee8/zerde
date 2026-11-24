@@ -38,6 +38,8 @@ pub const DiagnosticPathSegment = diagnostic_impl.PathSegment;
 pub const reflect = @import("reflect.zig");
 /// Fixed-layout wire types generated from schema types; see `wire.zig`.
 pub const wire = @import("wire.zig");
+/// A typed value written in fixed windows, resumably; see `resumable.zig`.
+pub const resumable = @import("resumable.zig");
 /// Word-at-a-time scans over strings, used by the JSON and CBOR backends.
 pub const bulk = @import("bulk.zig");
 pub const bin = bin_impl;

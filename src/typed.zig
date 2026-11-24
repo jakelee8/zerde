@@ -127,7 +127,33 @@ pub fn free(allocator: Allocator, value: anytype) void {
 pub fn serialize(comptime Format: type, writer: *std.Io.Writer, value: anytype, comptime serde_cfg: anytype, comptime format_cfg: anytype) !void {
     var serializer = Format.serializer(writer, format_cfg);
     defer if (@hasDecl(@TypeOf(serializer), "deinit")) serializer.deinit();
-    try serializeValue(&serializer, value, serde_cfg, Format, comptime fieldOrderPolicy(Format, format_cfg));
+    try serializeValue(&serializer, value, serde_cfg, Format, comptime fieldOrderPolicy(Format, format_cfg), NoResume{});
+}
+
+/// One step of a resumable write: `value` into the window `state.window` is the writer of, with `serializer` (which
+/// is kept between steps, since the JSON one holds where it is). `error.WindowFull` says the window is full at a
+/// token and the step is to be repeated with a fresh window, the same `value` and `state`; success says the value
+/// is written.
+pub fn serializeResumable(
+    serializer: anytype,
+    value: anytype,
+    comptime serde_cfg: anytype,
+    comptime Format: type,
+    comptime format_cfg: anytype,
+    state: *ResumeState,
+) !void {
+    try serializeValue(serializer, value, serde_cfg, Format, comptime fieldOrderPolicy(Format, format_cfg), state);
+}
+
+/// Copies what of `bytes[at.*..]` fits in the spare room of the fixed writer `w`, and says `error.WindowFull`
+/// when that is not all of it.
+pub fn copyPart(w: *std.Io.Writer, bytes: []const u8, at: *usize) error{WindowFull}!void {
+    const room = w.buffer.len - w.end;
+    const count = @min(room, bytes.len - at.*);
+    @memcpy(w.buffer[w.end..][0..count], bytes[at.*..][0..count]);
+    w.end += count;
+    at.* += count;
+    if (at.* < bytes.len) return error.WindowFull;
 }
 
 /// The format's field order for this write. A format declares `fieldOrderPolicy` when its config
@@ -205,16 +231,115 @@ pub fn deserializeWithDiagnostics(
     return deserializeValue(TypedSink{}, T, allocator, deserializer, cfg, diagnostics, true);
 }
 
+/// Where a resumable write is. A write into a window that fills up stops at a token and keeps, for each open
+/// container, how far it got, so the next call descends the same path and goes on: nothing is written twice and
+/// nothing is sorted or buffered. The state is a few words per open container and lives in the caller's value.
+pub const Level = struct {
+    /// The container's opening token is written.
+    entered: bool = false,
+    /// A struct field's `beginStructField` result: whether its value follows.
+    flag: bool = false,
+    /// Where in the current item it is: 0 not started, 1 its value is being written.
+    phase: u8 = 0,
+    /// The items or fields that are complete.
+    index: u32 = 0,
+};
+
+/// How far a long string, byte string or `Raw` is: bytes of the source written, and whether its head is.
+pub const TextState = struct { at: usize = 0, started: bool = false };
+
+/// The most containers a resumable write holds open at once.
+pub const resume_max_depth = 128;
+
+/// The most bytes any token of a resumable write takes, that a window must have room for (a number, a head, a
+/// bracket); a name adds its own, which `keyRoom` counts.
+pub const atomic_room = 64;
+
+/// The room a float can take as text: JSON writes the digits of a double in full (a value near 1e308 is 309 of them, and one
+/// near 1e-308 as many after the point), so a window must have room for that.
+pub fn floatRoom(comptime T: type) usize {
+    return switch (@typeInfo(T)) {
+        .float => |info| if (info.bits <= 32) atomic_room else if (info.bits == 64) 340 else 5000,
+        else => atomic_room,
+    };
+}
+
+/// Marks a write that is not resumable: every resume step compiles to nothing.
+pub const NoResume = struct {};
+
+/// The state of a resumable write; see `Level`. `window` is the writer the serializer writes into for this call.
+pub const ResumeState = struct {
+    levels: [resume_max_depth]Level = @splat(.{}),
+    depth: usize = 0,
+    window: ?*std.Io.Writer = null,
+    leaf: TextState = .{},
+
+    fn enter(self: *ResumeState) error{ResumeTooDeep}!*Level {
+        if (self.depth == self.levels.len) return error.ResumeTooDeep;
+        self.depth += 1;
+        return &self.levels[self.depth - 1];
+    }
+
+    fn leave(self: *ResumeState) void {
+        self.depth -= 1;
+    }
+
+    /// Stops at a token when the window has less than `n` bytes left.
+    pub fn reserve(self: *const ResumeState, n: usize) error{WindowFull}!void {
+        const w = self.window.?;
+        if (w.buffer.len - w.end < n) return error.WindowFull;
+    }
+};
+
+fn reserveRoom(rc: anytype, comptime n: usize) !void {
+    if (comptime @TypeOf(rc) != NoResume) try rc.reserve(n);
+}
+
+/// The room a struct field's or union variant's key can take on the wire: the escaped name, or a number.
+fn keyRoom(comptime key: meta.FieldKey) usize {
+    return atomic_room + switch (key) {
+        .text => |name| 6 * name.len,
+        .integer => 0,
+    };
+}
+
+/// Writes a string, byte string or `Raw`: whole, or for a resumable write as far as the window goes, which is
+/// `error.WindowFull` with `rc.leaf` saying where to go on.
+fn emitText(serializer: anytype, rc: anytype, comptime kind: enum { string, bytes, raw }, bytes: []const u8) !void {
+    const SerializerType = @TypeOf(serializer.*);
+    if (comptime @TypeOf(rc) == NoResume) {
+        switch (kind) {
+            .string => try serializer.emitString(bytes),
+            .bytes => try emitByteString(serializer, bytes),
+            .raw => try serializer.emitRaw(bytes),
+        }
+        return;
+    }
+    const part = switch (kind) {
+        .string => "emitStringPart",
+        .bytes => if (@hasDecl(SerializerType, "emitBytesPart")) "emitBytesPart" else "emitStringPart",
+        .raw => "emitRawPart",
+    };
+    if (comptime !@hasDecl(SerializerType, part)) @compileError("format " ++ @typeName(SerializerType) ++ " has no resumable " ++ part);
+    try @field(SerializerType, part)(serializer, bytes, &rc.leaf);
+    rc.leaf = .{};
+}
+
+/// `serialize` into a window that may fill: with `rc` a `*ResumeState` it returns `error.WindowFull` at a token,
+/// and a call with the same value and state goes on from there.
 fn serializeValue(
     serializer: anytype,
     value: anytype,
     comptime cfg: anytype,
     comptime Format: type,
     comptime order_policy: meta.FieldOrderPolicy,
-) !void {
+    rc: anytype,
+) anyerror!void {
     const T = @TypeOf(value);
     const SerializerType = @TypeOf(serializer.*);
+    const resumable = comptime @TypeOf(rc) != NoResume;
     if (comptime hasHook(T, "zerdeEncode")) {
+        if (comptime resumable) @compileError("a resumable write cannot call the encode hook of " ++ @typeName(T));
         if (!@hasDecl(SerializerType, "encoder")) {
             @compileError("format " ++ @typeName(SerializerType) ++ " cannot call the encode hook of " ++ @typeName(T));
         }
@@ -224,29 +349,41 @@ fn serializeValue(
         return;
     }
     switch (@typeInfo(T)) {
-        .bool => try serializer.emitBool(value),
-        .int, .comptime_int => try serializer.emitInteger(value),
-        .float, .comptime_float => try serializer.emitFloat(value),
+        .bool => {
+            try reserveRoom(rc, atomic_room);
+            try serializer.emitBool(value);
+        },
+        .int, .comptime_int => {
+            try reserveRoom(rc, atomic_room);
+            try serializer.emitInteger(value);
+        },
+        .float, .comptime_float => {
+            try reserveRoom(rc, floatRoom(T));
+            try serializer.emitFloat(value);
+        },
         .optional => |info| {
             if (@typeInfo(info.child) == .optional) {
                 @compileError("a nested optional is only supported as a struct field, where an absent field and null differ: " ++ @typeName(T));
             }
             if (@hasDecl(SerializerType, "beginOptional")) {
+                try reserveRoom(rc, atomic_room);
                 if (value) |child| {
                     try serializer.beginOptional(true);
-                    try serializeValue(serializer, child, cfg, Format, order_policy);
+                    try serializeValue(serializer, child, cfg, Format, order_policy, rc);
                 } else {
                     try serializer.beginOptional(false);
                 }
             } else {
                 if (value) |child| {
-                    try serializeValue(serializer, child, cfg, Format, order_policy);
+                    try serializeValue(serializer, child, cfg, Format, order_policy, rc);
                 } else {
+                    try reserveRoom(rc, atomic_room);
                     try serializer.emitNull();
                 }
             }
         },
         .@"enum" => {
+            try reserveRoom(rc, atomic_room + 6 * longestEnumName(@typeInfo(T).@"enum"));
             if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) {
                 try serializer.emitInteger(@backingInt(value));
             } else if (@hasDecl(SerializerType, "emitEnum")) {
@@ -271,77 +408,80 @@ fn serializeValue(
                         @compileError("format " ++ @typeName(SerializerType) ++ " does not support integer keys: " ++ @typeName(T));
                     }
                     if (Payload == void) {
+                        try reserveRoom(rc, keyRoom(key));
                         switch (comptime key) {
                             .text => |name| try serializer.emitString(name),
                             .integer => |number| try serializer.emitInteger(number),
                         }
                     } else {
-                        if (@hasDecl(SerializerType, "beginStructSized")) {
-                            try serializer.beginStructSized(T, 1);
-                        } else {
-                            try serializer.beginStruct(T);
+                        var local: Level = .{};
+                        const level: *Level = if (comptime resumable) try rc.enter() else &local;
+                        defer if (comptime resumable) rc.leave();
+                        if (level.phase == 0) {
+                            try reserveRoom(rc, keyRoom(key));
+                            if (@hasDecl(SerializerType, "beginStructSized")) {
+                                try serializer.beginStructSized(T, 1);
+                            } else {
+                                try serializer.beginStruct(T);
+                            }
+                            switch (comptime key) {
+                                .text => |name| _ = try serializer.beginStructField(T, name, Payload),
+                                .integer => |number| _ = try serializer.beginStructFieldInteger(T, number, Payload),
+                            }
+                            level.phase = 1;
                         }
-                        switch (comptime key) {
-                            .text => |name| _ = try serializer.beginStructField(T, name, Payload),
-                            .integer => |number| _ = try serializer.beginStructFieldInteger(T, number, Payload),
+                        if (level.phase == 1) {
+                            try serializeValue(serializer, payload, cfg, Format, order_policy, rc);
+                            level.phase = 2;
                         }
-                        try serializeValue(serializer, payload, cfg, Format, order_policy);
+                        try reserveRoom(rc, atomic_room);
                         try serializer.endStructField(T, @tagName(tag), Payload);
                         try serializer.endStruct(T);
+                        level.* = .{};
                     }
                 },
             }
         },
         .array => |info| {
             if (info.child == u8) {
-                try emitByteString(serializer, value[0..]);
+                try emitText(serializer, rc, .bytes, value[0..]);
                 return;
             }
 
             if (@hasDecl(SerializerType, "serializeSequence")) {
+                if (resumable) @compileError("a resumable write cannot use the sequence fast path of " ++ @typeName(SerializerType));
                 if (try serializer.serializeSequence(T, value, cfg)) return;
             }
 
-            try serializer.beginArray(info.child, value.len);
-            for (value, 0..) |item, index| {
-                try serializer.beginArrayItem(info.child, index);
-                try serializeValue(serializer, item, cfg, Format, order_policy);
-                try serializer.endArrayItem(info.child, index);
-            }
-            try serializer.endArray(info.child, value.len);
+            try serializeItems(serializer, info.child, value[0..], cfg, Format, order_policy, rc);
         },
         .pointer => |info| switch (info.size) {
             .slice => {
                 if (info.child == u8) {
-                    try serializer.emitString(value);
+                    try emitText(serializer, rc, .string, value);
                     return;
                 }
 
                 if (@hasDecl(SerializerType, "serializeSequence")) {
+                    if (resumable) @compileError("a resumable write cannot use the sequence fast path of " ++ @typeName(SerializerType));
                     if (try serializer.serializeSequence(T, value, cfg)) return;
                 }
 
-                try serializer.beginArray(info.child, value.len);
-                for (value, 0..) |item, index| {
-                    try serializer.beginArrayItem(info.child, index);
-                    try serializeValue(serializer, item, cfg, Format, order_policy);
-                    try serializer.endArrayItem(info.child, index);
-                }
-                try serializer.endArray(info.child, value.len);
+                try serializeItems(serializer, info.child, value, cfg, Format, order_policy, rc);
             },
-            .one => try serializeValue(serializer, value.*, cfg, Format, order_policy),
+            .one => try serializeValue(serializer, value.*, cfg, Format, order_policy, rc),
             else => @compileError("zerde cannot serialize pointer type " ++ @typeName(T)),
         },
         .@"struct" => |info| {
             if (T == ByteString) {
-                try emitByteString(serializer, value.bytes);
+                try emitText(serializer, rc, .bytes, value.bytes);
                 return;
             }
             if (comptime isRaw(T)) {
                 if (!@hasDecl(SerializerType, "emitRaw") or SerializerType.raw_format != T.zerde_raw_format) {
                     @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
                 }
-                try serializer.emitRaw(value.bytes);
+                try emitText(serializer, rc, .raw, value.bytes);
                 return;
             }
             if (info.is_tuple) @compileError("tuple structs are not supported: " ++ @typeName(T));
@@ -351,32 +491,43 @@ fn serializeValue(
             if (comptime extras_name != null and !@hasDecl(SerializerType, "beginExtras")) {
                 @compileError("format " ++ @typeName(SerializerType) ++ " cannot write extras: " ++ @typeName(T));
             }
+            if (comptime resumable and extras_name != null) @compileError("a resumable write cannot write extras: " ++ @typeName(T));
             const extras_bytes: []const u8 = if (comptime extras_name) |name| extrasBytes(@field(value, name)) else &.{};
+
+            var local: Level = .{};
+            const level: *Level = if (comptime resumable) try rc.enter() else &local;
+            defer if (comptime resumable) rc.leave();
 
             // TOML uses two passes so scalars appear before nested tables; JSON stays at one pass.
             const pass_count = comptime SerializerType.structPassCount(T);
-            if (@hasDecl(SerializerType, "beginStructSized")) {
-                var field_count: usize = if (comptime extras_name != null) try serializer.extrasCount(extras_bytes) else 0;
-                inline for (0..pass_count) |pass| {
-                    inline for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attrs| {
-                        if (field_attrs.@"comptime") {
-                            @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field_name);
-                        }
+            if (!level.entered) {
+                try reserveRoom(rc, atomic_room);
+                if (@hasDecl(SerializerType, "beginStructSized")) {
+                    var field_count: usize = if (comptime extras_name != null) try serializer.extrasCount(extras_bytes) else 0;
+                    inline for (0..pass_count) |pass| {
+                        inline for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attrs| {
+                            if (field_attrs.@"comptime") {
+                                @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field_name);
+                            }
 
-                        if (comptime meta.isExtrasField(T, field_name)) continue;
-                        if (SerializerType.includeStructField(T, field_type, pass)) {
-                            if (!omitField(T, field_name, field_type, cfg, @field(value, field_name))) field_count += 1;
+                            if (comptime meta.isExtrasField(T, field_name)) continue;
+                            if (SerializerType.includeStructField(T, field_type, pass)) {
+                                if (!omitField(T, field_name, field_type, cfg, @field(value, field_name))) field_count += 1;
+                            }
                         }
                     }
+                    try serializer.beginStructSized(T, field_count);
+                } else {
+                    try serializer.beginStruct(T);
                 }
-                try serializer.beginStructSized(T, field_count);
-            } else {
-                try serializer.beginStruct(T);
+                level.entered = true;
             }
             const field_order = comptime structFieldOrder(T, Format, info, cfg, order_policy);
             var extras = if (comptime extras_name != null) try serializer.beginExtras(extras_bytes) else {};
             // In key order the extras are merged among the declared members; otherwise they follow them.
             const merge_extras = comptime extras_name != null and meta.effectiveFieldOrder(T, cfg, order_policy) == .encoded_key;
+            // The fields written so far, counted over the unrolled loops, which is where a resumed write skips to.
+            var written: u32 = 0;
             inline for (0..pass_count) |pass| {
                 inline for (field_order) |field_index| {
                     const field_name = info.field_names[field_index];
@@ -390,41 +541,97 @@ fn serializeValue(
                         const field_value = @field(value, field_name);
                         // Omission is decided by the typed layer so formats do not duplicate that policy.
                         if (!omitField(T, field_name, field_type, cfg, field_value)) {
-                            if (comptime merge_extras) {
-                                try serializer.emitExtrasBefore(&extras, comptime Format.encodeKey(meta.effectiveFieldKey(T, field_name, cfg)));
-                            }
-                            const emit_value = switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
-                                .text => |emitted_name| if (@hasDecl(SerializerType, "beginStructFieldValue"))
-                                    try serializer.beginStructFieldValue(T, emitted_name, field_type, field_value)
-                                else
-                                    try serializer.beginStructField(T, emitted_name, field_type),
-                                .integer => |emitted_key| if (@hasDecl(SerializerType, "supports_integer_keys"))
-                                    try serializer.beginStructFieldInteger(T, emitted_key, field_type)
-                                else
-                                    @compileError("format " ++ @typeName(SerializerType) ++ " does not support integer keys: " ++ @typeName(T) ++ "." ++ field_name),
-                            };
-                            if (emit_value) {
-                                // A present nested optional field is written as its inner optional: null is
-                                // a value there, and the outer null was omitted above.
-                                if (comptime isNestedOptional(field_type)) {
-                                    try serializeValue(serializer, field_value.?, cfg, Format, order_policy);
-                                } else {
-                                    try serializeValue(serializer, field_value, cfg, Format, order_policy);
+                            const mine = written;
+                            written += 1;
+                            if (!resumable or mine >= level.index) {
+                                if (level.phase == 0) {
+                                    if (comptime merge_extras) {
+                                        try serializer.emitExtrasBefore(&extras, comptime Format.encodeKey(meta.effectiveFieldKey(T, field_name, cfg)));
+                                    }
+                                    try reserveRoom(rc, keyRoom(comptime meta.effectiveFieldKey(T, field_name, cfg)));
+                                    level.flag = switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
+                                        .text => |emitted_name| if (@hasDecl(SerializerType, "beginStructFieldValue"))
+                                            try serializer.beginStructFieldValue(T, emitted_name, field_type, field_value)
+                                        else
+                                            try serializer.beginStructField(T, emitted_name, field_type),
+                                        .integer => |emitted_key| if (@hasDecl(SerializerType, "supports_integer_keys"))
+                                            try serializer.beginStructFieldInteger(T, emitted_key, field_type)
+                                        else
+                                            @compileError("format " ++ @typeName(SerializerType) ++ " does not support integer keys: " ++ @typeName(T) ++ "." ++ field_name),
+                                    };
+                                    level.phase = 1;
                                 }
-                            }
-                            switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
-                                .text => |emitted_name| try serializer.endStructField(T, emitted_name, field_type),
-                                .integer => try serializer.endStructField(T, field_name, field_type),
+                                if (level.phase == 1) {
+                                    if (level.flag) {
+                                        // A present nested optional field is written as its inner optional: null is
+                                        // a value there, and the outer null was omitted above.
+                                        if (comptime isNestedOptional(field_type)) {
+                                            try serializeValue(serializer, field_value.?, cfg, Format, order_policy, rc);
+                                        } else {
+                                            try serializeValue(serializer, field_value, cfg, Format, order_policy, rc);
+                                        }
+                                    }
+                                    level.phase = 2;
+                                }
+                                try reserveRoom(rc, atomic_room);
+                                switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {
+                                    .text => |emitted_name| try serializer.endStructField(T, emitted_name, field_type),
+                                    .integer => try serializer.endStructField(T, field_name, field_type),
+                                }
+                                level.phase = 0;
+                                level.index = mine + 1;
                             }
                         }
                     }
                 }
             }
+            try reserveRoom(rc, atomic_room);
             if (comptime extras_name != null) try serializer.finishExtras(&extras, comptime declaredKeys(T, info, cfg));
             try serializer.endStruct(T);
+            level.* = .{};
         },
         else => @compileError("zerde cannot serialize " ++ @typeName(T)),
     }
+}
+
+/// The items of an array or slice, as an array of `Child`, going on from the item a resumable write stopped in.
+fn serializeItems(
+    serializer: anytype,
+    comptime Child: type,
+    items: []const Child,
+    comptime cfg: anytype,
+    comptime Format: type,
+    comptime order_policy: meta.FieldOrderPolicy,
+    rc: anytype,
+) anyerror!void {
+    const resumable = comptime @TypeOf(rc) != NoResume;
+    var local: Level = .{};
+    const level: *Level = if (comptime resumable) try rc.enter() else &local;
+    defer if (comptime resumable) rc.leave();
+    if (!level.entered) {
+        try reserveRoom(rc, atomic_room);
+        try serializer.beginArray(Child, items.len);
+        level.entered = true;
+    }
+    var index: usize = level.index;
+    while (index < items.len) : (index += 1) {
+        if (level.phase == 0) {
+            try reserveRoom(rc, atomic_room);
+            try serializer.beginArrayItem(Child, index);
+            level.phase = 1;
+        }
+        if (level.phase == 1) {
+            try serializeValue(serializer, items[index], cfg, Format, order_policy, rc);
+            level.phase = 2;
+        }
+        try reserveRoom(rc, atomic_room);
+        try serializer.endArrayItem(Child, index);
+        level.phase = 0;
+        level.index = @intCast(index + 1);
+    }
+    try reserveRoom(rc, atomic_room);
+    try serializer.endArray(Child, items.len);
+    level.* = .{};
 }
 
 /// The bytes of an extras field, which is `Raw` or `?Raw`; none for a null.

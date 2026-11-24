@@ -4295,6 +4295,220 @@ test "what a lenient CBOR read keeps goes to the scratch region, which is free a
     try std.testing.expectEqual(@as(usize, 0), wire.regionSizes(zerde.cbor, RawBox, .{}, strict).scratch);
 }
 
+// ---- a typed value written in windows, resumably ---------------------------------------------------------------
+
+/// Every window of the resumable write of `value`, joined; each is checked to be no longer than the window and to
+/// make progress.
+fn writeInWindows(comptime Format: type, comptime T: type, value: T, comptime serde_cfg: anytype, comptime format_cfg: anytype, window_len: usize) ![]u8 {
+    var resumed = zerde.resumable.Writer(Format, T, serde_cfg, format_cfg).init();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const window = try allocator.alloc(u8, window_len);
+    defer allocator.free(window);
+    while (true) {
+        const filled = try resumed.fill(value, window);
+        try std.testing.expect(filled.len <= window_len);
+        try out.appendSlice(allocator, window[0..filled.len]);
+        if (filled.done) break;
+        try std.testing.expect(filled.len > 0);
+    }
+    // After the last window there is nothing more.
+    try std.testing.expectEqual(@as(usize, 0), (try resumed.fill(value, window)).len);
+    return out.toOwnedSlice(allocator);
+}
+
+/// The resumable write equals `serializeWith` for windows of every size from the smallest to a few hundred bytes, and one
+/// that holds all of it.
+fn expectWindows(comptime Format: type, comptime T: type, value: T, comptime serde_cfg: anytype, comptime format_cfg: anytype) !void {
+    var whole: std.Io.Writer.Allocating = .init(allocator);
+    defer whole.deinit();
+    try zerde.serializeWith(Format, &whole.writer, value, serde_cfg, format_cfg);
+    const min = zerde.resumable.Writer(Format, T, serde_cfg, format_cfg).min_window;
+    var size: usize = min;
+    while (size < min + 300) : (size += 1) {
+        const got = try writeInWindows(Format, T, value, serde_cfg, format_cfg, size);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(u8, whole.written(), got);
+    }
+    const all = try writeInWindows(Format, T, value, serde_cfg, format_cfg, whole.written().len + min);
+    defer allocator.free(all);
+    try std.testing.expectEqualSlices(u8, whole.written(), all);
+}
+
+test "a typed value written in windows is the bytes of the whole write, in JSON and CBOR, for any window" {
+    const msg = sampleMsg();
+    try expectWindows(zerde.json, WireMsg, msg, .{}, .{});
+    try expectWindows(zerde.cbor, WireMsg, msg, .{}, .{});
+    try expectWindows(zerde.cbor, WireMsg, msg, .{}, .{ .deterministic = true });
+    // Many unions in a row: a window ends after a payload is complete and before the union's closing tokens.
+    const Many = struct { v: []const WireEffect };
+    var effects: [24]WireEffect = undefined;
+    for (&effects, 0..) |*effect, index| effect.* = if (index % 3 == 0) .noop else if (index % 3 == 1) .{ .delete = .{ .bytes = "gone" } } else .{ .put = .{ .key = .{ .bytes = "k" }, .kind = "x", .revision = index, .meta = "m", .note = null, .level = .low, .ratio = 1, .flag = true } };
+    try expectWindows(zerde.json, Many, .{ .v = &effects }, .{}, .{});
+    try expectWindows(zerde.cbor, Many, .{ .v = &effects }, .{}, .{ .deterministic = true });
+    // A union whose payload ends exactly where the window leaves less room than its closing tokens need: padding moves the
+    // end of the payload through every position of a window.
+    const Tail = struct { ok: bool };
+    const Choice = union(enum) { put: Tail, gone: zerde.ByteString };
+    const Padded = struct { pad: []const u8, choice: Choice };
+    const padding = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
+    inline for (.{ zerde.json, zerde.cbor }) |Format| {
+        const min = zerde.resumable.Writer(Format, Padded, .{}, .{}).min_window;
+        for (0..padding.len) |pad| {
+            inline for (.{ 0, 1, 2 }) |extra| {
+                const value: Padded = .{ .pad = padding[0..pad], .choice = if (pad % 2 == 0) .{ .put = .{ .ok = true } } else .{ .gone = .{ .bytes = padding[pad..] } } };
+                const got = try writeInWindows(Format, Padded, value, .{}, .{}, min + extra);
+                defer allocator.free(got);
+                var whole: std.Io.Writer.Allocating = .init(allocator);
+                defer whole.deinit();
+                try zerde.serializeWith(Format, &whole.writer, value, .{}, .{});
+                try std.testing.expectEqualSlices(u8, whole.written(), got);
+            }
+        }
+    }
+    // Integer keys, an enum as an integer, optional policies, a union of every payload kind.
+    try expectWindows(zerde.cbor, WireMsg, .{ .id = .{ 9, 8, 7, 6 }, .effects = &.{}, .grid = &.{}, .pair = .{ 0, 65535 } }, .{}, .{ .deterministic = true });
+}
+
+const Resumed = struct {
+    text: []const u8,
+    blob: zerde.ByteString,
+    tail: ?[]const u8 = null,
+    raw: zerde.json.Raw,
+    numbers: []const i64,
+    pub const serde = .{ .fields = .{ .tail = .{ .optional = .absent } } };
+};
+const ResumedCbor = struct {
+    text: []const u8,
+    blob: zerde.ByteString,
+    raw: zerde.cbor.Raw,
+    nested: []const []const WireEffect,
+};
+
+test "a long string, byte string and Raw are written in pieces that never split an escape or a code point apart from the window" {
+    // 6,000 bytes of text with every kind of escape and multi-byte characters, in runs.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    const parts = [_][]const u8{ "plain text ", "quote \" and slash \\ ", "tab\t newline\n bell\x07 ", "caf\xc3\xa9 ", "\xe2\x82\xac euro ", "\xf0\x9f\x98\x80 face " };
+    var at: usize = 0;
+    while (text.items.len < 6000) : (at += 1) try text.appendSlice(allocator, parts[at % parts.len]);
+    var blob: [1001]u8 = undefined;
+    for (&blob, 0..) |*byte, index| byte.* = @intCast((index * 7 + 3) % 256);
+    const numbers = [_]i64{ 1, -2, 300, std.math.maxInt(i64), std.math.minInt(i64) };
+    const raw_json = "{ \"a\" : [1, 2, 3], \"b\": \"x\\ny\" }";
+    const value: Resumed = .{ .text = text.items, .blob = .{ .bytes = &blob }, .tail = "t\"", .raw = .{ .bytes = raw_json }, .numbers = &numbers };
+    // Text as bytes needs UTF-8 for JSON; base64 and base64url for the rest.
+    var utf8_blob: [10]u8 = "0123456789".*;
+    const as_text: Resumed = .{ .text = text.items, .blob = .{ .bytes = &utf8_blob }, .raw = .{ .bytes = raw_json }, .numbers = &numbers };
+    try expectWindows(zerde.json, Resumed, as_text, .{}, .{});
+    inline for (.{ zerde.json.BytesEncoding.base64, zerde.json.BytesEncoding.base64url }) |encoding| {
+        try expectWindows(zerde.json, Resumed, value, .{}, .{ .bytes = encoding });
+        // Blobs of every length mod 3, from empty.
+        inline for (.{ 0, 1, 2, 3, 4, 5 }) |length| {
+            var short = value;
+            short.blob = .{ .bytes = blob[0..length] };
+            try expectWindows(zerde.json, Resumed, short, .{}, .{ .bytes = encoding });
+        }
+    }
+    const cbor_value: ResumedCbor = .{
+        .text = text.items,
+        .blob = .{ .bytes = &blob },
+        .raw = .{ .bytes = &.{ 0xa2, 0x61, 'a', 0x83, 1, 2, 3, 0x61, 'b', 0x61, 'x' } },
+        .nested = &.{ &.{ .noop, .{ .delete = .{ .bytes = "gone" } } }, &.{}, &.{.noop} },
+    };
+    try expectWindows(zerde.cbor, ResumedCbor, cbor_value, .{}, .{});
+    try expectWindows(zerde.cbor, ResumedCbor, cbor_value, .{}, .{ .deterministic = true });
+    // Text of every length around the 1, 2 and 4 byte heads of CBOR, in a window that holds only a head and a little.
+    inline for (.{ 0, 23, 24, 255, 256, 3000 }) |length| {
+        var sized = cbor_value;
+        sized.text = text.items[0..length];
+        try expectWindows(zerde.cbor, ResumedCbor, sized, .{}, .{});
+    }
+}
+
+test "a resumable write refuses what the whole write refuses, before the byte it concerns, and needs a window of one token" {
+    const bad: Resumed = .{ .text = "a\xff", .blob = .{ .bytes = "x" }, .raw = .{ .bytes = "1" }, .numbers = &.{} };
+    const Json = zerde.resumable.Writer(zerde.json, Resumed, .{}, .{});
+    var window: [256]u8 = undefined;
+    var resumed = Json.init();
+    try std.testing.expectError(error.InvalidUtf8, resumed.fill(bad, &window));
+    const bad_raw: Resumed = .{ .text = "a", .blob = .{ .bytes = "x" }, .raw = .{ .bytes = "{" }, .numbers = &.{} };
+    var again = Json.init();
+    try std.testing.expectError(error.UnexpectedToken, again.fill(bad_raw, &window));
+    // A window smaller than one token is an error and not an endless loop.
+    var small: [Json.min_window - 1]u8 = undefined;
+    var tiny = Json.init();
+    try std.testing.expectError(error.WindowTooSmall, tiny.fill(.{ .text = "a", .blob = .{ .bytes = "x" }, .raw = .{ .bytes = "1" }, .numbers = &.{} }, &small));
+    // The minimum window is the largest token: a field name of the longest key, escaped.
+    try std.testing.expect(Json.min_window >= zerde.typed.atomic_room + 6 * "numbers".len);
+    const Longer = struct { a_name_that_is_a_good_deal_longer: u8 };
+    try std.testing.expect(zerde.resumable.Writer(zerde.json, Longer, .{}, .{}).min_window > Json.min_window);
+    // Bad CBOR text, and a Raw that is not deterministic in a deterministic write.
+    const BadCbor = struct { s: []const u8, r: zerde.cbor.Raw };
+    var cbor_window: [128]u8 = undefined;
+    var bad_text = zerde.resumable.Writer(zerde.cbor, BadCbor, .{}, .{}).init();
+    try std.testing.expectError(error.InvalidUtf8, bad_text.fill(.{ .s = "\xff", .r = .{ .bytes = &.{0x01} } }, &cbor_window));
+    var bad_raw_cbor = zerde.resumable.Writer(zerde.cbor, BadCbor, .{}, .{ .deterministic = true }).init();
+    try std.testing.expectError(error.NonDeterministicEncoding, bad_raw_cbor.fill(.{ .s = "a", .r = .{ .bytes = &.{ 0xbf, 0xff } } }, &cbor_window));
+}
+
+test "the pieces stop at the edge of a window exactly: a closing quote, a base64 tail, a CBOR head, a 40 digit number" {
+    // JSON text that fills the window to its last byte: the closing quote waits for the next window.
+    var small: [10]u8 = undefined;
+    var w = std.Io.Writer.fixed(&small);
+    var state: zerde.typed.TextState = .{};
+    try std.testing.expectError(error.WindowFull, zerde.json.writeEscapedPart(&w, "abcdefghi", &state, false));
+    try std.testing.expectEqual(@as(usize, 10), w.end);
+    var next: [4]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&next);
+    try zerde.json.writeEscapedPart(&w2, "abcdefghi", &state, false);
+    try std.testing.expectEqualStrings("\"", w2.buffered());
+    // A base64 tail of one byte needs four characters, and two are left: it waits.
+    var tiny: [3]u8 = undefined;
+    var wt = std.Io.Writer.fixed(&tiny);
+    var bstate: zerde.typed.TextState = .{};
+    try std.testing.expectError(error.WindowFull, zerde.json.writeBytesPart(&wt, .base64, "a", &bstate));
+    try std.testing.expectEqualStrings("\"", wt.buffered());
+    var rest: [8]u8 = undefined;
+    var wr = std.Io.Writer.fixed(&rest);
+    try zerde.json.writeBytesPart(&wr, .base64, "a", &bstate);
+    try std.testing.expectEqualStrings("YQ==\"", wr.buffered());
+    // A CBOR head of three bytes with two left writes nothing.
+    var two: [2]u8 = undefined;
+    var wc = std.Io.Writer.fixed(&two);
+    var cbor_serializer = zerde.cbor.serializer(&wc, .{});
+    var cstate: zerde.typed.TextState = .{};
+    const long: [300]u8 = @splat('x');
+    try std.testing.expectError(error.WindowFull, cbor_serializer.emitStringPart(&long, &cstate));
+    try std.testing.expectEqual(@as(usize, 0), wc.end);
+    try std.testing.expect(!cstate.started);
+    // The widest numbers, in every window: i128's minimum is 40 characters and the widest f64 is 24.
+    const Wide = struct { a: i128, b: f64, c: u128 };
+    try expectWindows(zerde.json, Wide, .{ .a = std.math.minInt(i128), .b = -1.7976931348623157e308, .c = std.math.maxInt(u128) }, .{}, .{});
+    try expectWindows(zerde.cbor, Wide, .{ .a = std.math.minInt(i64), .b = -1.7976931348623157e308, .c = std.math.maxInt(u64) }, .{}, .{});
+}
+
+test "a resumable write keeps 128 open containers, and refuses a deeper value instead of overrunning" {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    // Each level of nesting is two containers: the one-entry map of a union and its array.
+    var tree: RecTree = .{ .leaf = 1 };
+    var window: [4096]u8 = undefined;
+    for (0..70) |level| {
+        const children = try arena.allocator().alloc(RecTree, 1);
+        children[0] = tree;
+        tree = .{ .node = children };
+        const Cbor = zerde.resumable.Writer(zerde.cbor, RecTree, .{}, .{ .deterministic = true });
+        var resumed = Cbor.init();
+        if (level < 63) {
+            const filled = try resumed.fill(tree, &window);
+            try std.testing.expect(filled.done);
+        } else if (level >= 64) {
+            try std.testing.expectError(error.ResumeTooDeep, resumed.fill(tree, &window));
+        }
+    }
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;

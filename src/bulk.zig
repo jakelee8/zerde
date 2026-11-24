@@ -114,7 +114,7 @@ pub fn writeEscaped(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Err
 
 /// The escape of byte `c` (a `"`, a `\` or a control character) as the characters of a JSON string,
 /// written to the start of `out`; how many bytes it is.
-fn escapeInto(out: *[6]u8, c: u8) usize {
+pub fn escapeInto(out: *[6]u8, c: u8) usize {
     const hex = "0123456789abcdef";
     out[0] = '\\';
     switch (c) {

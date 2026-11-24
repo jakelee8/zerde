@@ -274,6 +274,28 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             try self.writer.writeAll(value);
         }
 
+        /// `emitString` in pieces, for a resumable write (see `typed.serializeResumable`): the head, which needs 9
+        /// bytes of room, then the text as far as the window goes. The text is checked as UTF-8 once, before the head.
+        pub fn emitStringPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
+            if (!state.started) {
+                if (!readOption(self.cfg, "trusted_text", false) and !bulk.validUtf8(value)) return error.InvalidUtf8;
+                try self.headPart(3, value.len, state);
+            }
+            try typed.copyPart(self.writer, value, &state.at);
+        }
+
+        /// `emitBytes` in pieces.
+        pub fn emitBytesPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
+            if (!state.started) try self.headPart(2, value.len, state);
+            try typed.copyPart(self.writer, value, &state.at);
+        }
+
+        fn headPart(self: *Self, major: u8, len: usize, state: *typed.TextState) !void {
+            if (self.writer.buffer.len - self.writer.end < 9) return error.WindowFull;
+            try writeMajorValue(self.writer, major, len);
+            state.started = true;
+        }
+
         /// How many entries an extras map holds, for the head of the map it joins.
         pub fn extrasCount(self: *Self, bytes: []const u8) !usize {
             _ = self;
@@ -332,6 +354,15 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         pub fn emitRaw(self: *Self, value: []const u8) !void {
             try verifyItem(value, deterministic);
             try self.writer.writeAll(value);
+        }
+
+        /// `emitRaw` in pieces, for a resumable write: the item is checked once, before the first byte.
+        pub fn emitRawPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
+            if (!state.started) {
+                try verifyItem(value, deterministic);
+                state.started = true;
+            }
+            try typed.copyPart(self.writer, value, &state.at);
         }
 
         pub fn emitEnum(self: *Self, comptime _: type, value: anytype) !void {

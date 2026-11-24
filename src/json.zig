@@ -217,6 +217,25 @@ pub fn JsonSerializer(comptime Config: type) type {
             try writeBytesText(self.writer, bytesEncoding(Config, self.cfg), value);
         }
 
+        /// `emitString` in pieces, for a resumable write (see `typed.serializeResumable`).
+        pub fn emitStringPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
+            try writeEscapedPart(self.writer, value, state, readLimitFlag(self.cfg, "trusted_text", false));
+        }
+
+        /// `emitBytes` in pieces.
+        pub fn emitBytesPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
+            try writeBytesPart(self.writer, bytesEncoding(Config, self.cfg), value, state);
+        }
+
+        /// `emitRaw` in pieces: the text is checked once, before the first byte.
+        pub fn emitRawPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
+            if (!state.started) {
+                try verifyText(value);
+                state.started = true;
+            }
+            try typed.copyPart(self.writer, value, &state.at);
+        }
+
         pub fn beginStruct(self: *Self, comptime T: type) !void {
             _ = T;
             try self.writer.writeByte('{');
@@ -1391,6 +1410,72 @@ fn writeBytesText(writer: *std.Io.Writer, encoding: BytesEncoding, value: []cons
             try writer.writeByte('"');
         },
     }
+}
+
+/// A string literal written in pieces into the fixed writer `w`: as much of `value` as fits goes in, and
+/// `error.WindowFull` says there is more, with `state` saying where to go on. A window needs 6 bytes to take
+/// a step (an escape is up to six bytes). The text is checked as UTF-8 once, before the first byte, unless trusted.
+pub fn writeEscapedPart(w: *std.Io.Writer, value: []const u8, state: *typed.TextState, trusted: bool) !void {
+    if (!state.started) {
+        if (!trusted and !bulk.validUtf8(value)) return error.InvalidUtf8;
+        if (w.buffer.len == w.end) return error.WindowFull;
+        w.buffer[w.end] = '"';
+        w.end += 1;
+        state.started = true;
+    }
+    while (state.at < value.len) {
+        const room = w.buffer.len - w.end;
+        if (room < 6) return error.WindowFull;
+        // Plain bytes copy as they are, and the scan stops where the window does, so a window costs its own size.
+        const scanned = @min(value.len, state.at + room);
+        const special = bulk.findStringSpecial(value[0..scanned], state.at);
+        if (special > state.at) {
+            @memcpy(w.buffer[w.end..][0 .. special - state.at], value[state.at..special]);
+            w.end += special - state.at;
+            state.at = special;
+            continue;
+        }
+        var escape: [6]u8 = undefined;
+        const length = bulk.escapeInto(&escape, value[state.at]);
+        @memcpy(w.buffer[w.end..][0..length], escape[0..length]);
+        w.end += length;
+        state.at += 1;
+    }
+    if (w.buffer.len == w.end) return error.WindowFull;
+    w.buffer[w.end] = '"';
+    w.end += 1;
+}
+
+/// Bytes as a JSON string in `encoding`, in pieces; see `writeEscapedPart`. Base64 goes in groups of three bytes.
+pub fn writeBytesPart(w: *std.Io.Writer, encoding: BytesEncoding, value: []const u8, state: *typed.TextState) !void {
+    const encoder = switch (encoding) {
+        .string => return writeEscapedPart(w, value, state, false),
+        .base64 => std.base64.standard.Encoder,
+        .base64url => std.base64.url_safe_no_pad.Encoder,
+    };
+    if (!state.started) {
+        if (w.buffer.len == w.end) return error.WindowFull;
+        w.buffer[w.end] = '"';
+        w.end += 1;
+        state.started = true;
+    }
+    while (state.at < value.len) {
+        const room = w.buffer.len - w.end;
+        const remaining = value.len - state.at;
+        const groups = @min(remaining / 3, room / 4);
+        if (groups != 0) {
+            const written = encoder.encode(w.buffer[w.end..], value[state.at..][0 .. groups * 3]);
+            w.end += written.len;
+            state.at += groups * 3;
+        } else if (remaining < 3 and room >= encoder.calcSize(remaining)) {
+            const written = encoder.encode(w.buffer[w.end..], value[state.at..]);
+            w.end += written.len;
+            state.at = value.len;
+        } else return error.WindowFull;
+    }
+    if (w.buffer.len == w.end) return error.WindowFull;
+    w.buffer[w.end] = '"';
+    w.end += 1;
 }
 
 fn readLimitFlag(cfg: anytype, comptime name: []const u8, default: bool) bool {

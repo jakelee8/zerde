@@ -77,7 +77,64 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
     try measure(io, out, allocator, zerde.json, "json", false, commit, .{ .bytes = zerde.json.BytesEncoding.base64 }, read_json);
     // The same JSON with every slash written as `\/`, as some producers do: the base64 and the text are all rewritten.
     try measure(io, out, allocator, zerde.json, "json escaped", true, commit, .{ .bytes = zerde.json.BytesEncoding.base64 }, read_json);
+    try measureWindows(io, out, allocator, zerde.cbor, "cbor", commit, .{ .deterministic = true });
+    try measureWindows(io, out, allocator, zerde.json, "json", commit, .{ .bytes = zerde.json.BytesEncoding.base64 });
     try out.flush();
+}
+
+/// The write of the commit whole into one growing buffer, and in windows of 4, 16 and 64 KiB with `zerde.resumable`
+/// into one window that is reused: the memory is the buffer against the window, the time what the windows cost.
+fn measureWindows(
+    io: std.Io,
+    out: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    comptime Format: type,
+    name: []const u8,
+    commit: Commit,
+    comptime write_cfg: anytype,
+) !void {
+    var whole_ns: u64 = 0;
+    var size: usize = 0;
+    {
+        var sink = try std.Io.Writer.Allocating.initCapacity(allocator, 1 << 20);
+        defer sink.deinit();
+        const start = std.Io.Clock.Timestamp.now(io, .awake);
+        for (0..iterations) |_| {
+            sink.clearRetainingCapacity();
+            try zerde.serializeWith(Format, &sink.writer, commit, .{}, write_cfg);
+        }
+        whole_ns = @intCast(start.untilNow(io).raw.nanoseconds);
+        size = sink.written().len;
+    }
+    try out.print("  {s:<5} write whole   output {d:>8} B in one buffer              {d:>9.0} ns\n", .{ name, size, @as(f64, @floatFromInt(whole_ns)) / iterations });
+    inline for (.{ 4096, 16384, 65536 }) |window_len| {
+        const window = try allocator.alloc(u8, window_len);
+        defer allocator.free(window);
+        var windows: usize = 0;
+        var total: usize = 0;
+        const start = std.Io.Clock.Timestamp.now(io, .awake);
+        for (0..iterations) |_| {
+            var resumed = zerde.resumable.Writer(Format, Commit, .{}, write_cfg).init();
+            windows = 0;
+            total = 0;
+            while (true) {
+                const filled = try resumed.fill(commit, window);
+                windows += 1;
+                total += filled.len;
+                if (filled.done) break;
+            }
+        }
+        const elapsed: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+        std.debug.assert(total == size);
+        try out.print("  {s:<5} window {d:>6} B  {d:>4} windows, state {d} B                  {d:>9.0} ns ({d:.2}x)\n", .{
+            name,
+            window_len,
+            windows,
+            @sizeOf(zerde.resumable.Writer(Format, Commit, .{}, write_cfg)),
+            @as(f64, @floatFromInt(elapsed)) / iterations,
+            @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(whole_ns)),
+        });
+    }
 }
 
 fn measure(

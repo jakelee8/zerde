@@ -152,7 +152,7 @@ MUTANTS = [
     ("typed.zig", "        if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, &result, &seen);\n        try fillMissingFields(s, T, info, cfg, allocator, &result, &seen);\n        try s.check(T, allocator, &result);\n        return result;", "        try fillMissingFields(s, T, info, cfg, allocator, &result, &seen);\n        try s.check(T, allocator, &result);\n        return result;"),
     ("typed.zig", "    if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, &result, &seen);\n    try fillMissingFields(s, T, info, cfg, allocator, &result, &seen);\n    try s.check(T, allocator, &result);\n    return result;\n}", "    try fillMissingFields(s, T, info, cfg, allocator, &result, &seen);\n    try s.check(T, allocator, &result);\n    return result;\n}"),
     ("typed.zig", "        if (comptime meta.isExtrasField(T, field_name)) continue;\n        switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {\n            .text => |expected|", "        switch (comptime meta.effectiveFieldKey(T, field_name, cfg)) {\n            .text => |expected|"),
-    ("typed.zig", "                        if (comptime meta.isExtrasField(T, field_name)) continue;\n                        if (SerializerType.includeStructField(T, field_type, pass)) {\n                            if (!omitField", "                        if (SerializerType.includeStructField(T, field_type, pass)) {\n                            if (!omitField"),
+    ("typed.zig", "                            if (comptime meta.isExtrasField(T, field_name)) continue;\n                            if (SerializerType.includeStructField(T, field_type, pass)) {\n                                if (!omitField", "                            if (SerializerType.includeStructField(T, field_type, pass)) {\n                                if (!omitField"),
     ("typed.zig", "                    if (comptime meta.isExtrasField(T, field_name)) continue;\n                    if (SerializerType.includeStructField(T, field_type, pass)) {\n                        const field_value", "                    if (SerializerType.includeStructField(T, field_type, pass)) {\n                        const field_value"),
     ("typed.zig", "                                try serializer.emitExtrasBefore(&extras, comptime Format.encodeKey(meta.effectiveFieldKey(T, field_name, cfg)));", "                                _ = &extras;"),
     ("typed.zig", "            if (comptime extras_name != null) try serializer.finishExtras(&extras, comptime declaredKeys(T, info, cfg));", "            _ = &extras;"),
@@ -468,6 +468,37 @@ MUTANTS = [
     ("cbor.zig", "                    try writePreferredFloat(&fixed, floatValue(header));\n                    try self.put(fixed.buffered());", "                    try writePreferredFloat(&fixed, floatValue(header));\n                    try self.put(&.{ 0xf9, 0, 0 });"),
     ("cbor.zig", "        if (self.chunked) self.left -= count;", "        if (self.chunked) self.left -= 0;"),
     ("cbor.zig", "    if (bytes.len > std.math.maxInt(u32)) return error.InputTooLarge;\n    const skip", "    const skip"),
+    ("typed.zig", "        if (self.depth == self.levels.len) return error.ResumeTooDeep;\n", ""),
+    ("typed.zig", "        if (w.buffer.len - w.end < n) return error.WindowFull;", "        if (w.buffer.len - w.end < n / 2) return error.WindowFull;"),
+    ("typed.zig", "    if (at.* < bytes.len) return error.WindowFull;\n}", "}"),
+    ("typed.zig", "        if (level.phase == 1) {\n            try serializeValue(serializer, items[index]", "        if (true) {\n            try serializeValue(serializer, items[index]"),
+    ("typed.zig", "                                if (level.phase == 1) {\n                                    if (level.flag) {", "                                if (true) {\n                                    if (level.flag) {"),
+    ("typed.zig", "                        if (level.phase == 1) {\n                            try serializeValue(serializer, payload,", "                        if (true) {\n                            try serializeValue(serializer, payload,"),
+    ("typed.zig", "                            if (!resumable or mine >= level.index) {", "                            if (true) {"),
+    ("typed.zig", "    var index: usize = level.index;\n    while (index < items.len)", "    var index: usize = 0;\n    while (index < items.len)"),
+    ("typed.zig", "    if (!level.entered) {\n        try reserveRoom(rc, atomic_room);\n        try serializer.beginArray(Child, items.len);", "    if (true) {\n        try reserveRoom(rc, atomic_room);\n        try serializer.beginArray(Child, items.len);"),
+    ("typed.zig", "            if (!level.entered) {\n                try reserveRoom(rc, atomic_room);\n                if (@hasDecl(SerializerType, \"beginStructSized\"))", "            if (true) {\n                try reserveRoom(rc, atomic_room);\n                if (@hasDecl(SerializerType, \"beginStructSized\"))"),
+    ("typed.zig", "                        if (level.phase == 0) {\n                            try reserveRoom(rc, keyRoom(key));", "                        if (true) {\n                            try reserveRoom(rc, keyRoom(key));"),
+    ("typed.zig", "                                if (level.phase == 0) {\n                                    if (comptime merge_extras)", "                                if (true) {\n                                    if (comptime merge_extras)"),
+    ("typed.zig", "        if (level.phase == 0) {\n            try reserveRoom(rc, atomic_room);\n            try serializer.beginArrayItem(Child, index);", "        if (true) {\n            try reserveRoom(rc, atomic_room);\n            try serializer.beginArrayItem(Child, index);"),
+    ("typed.zig", "    try serializer.endArray(Child, items.len);\n    level.* = .{};", "    try serializer.endArray(Child, items.len);"),
+    ("typed.zig", "            try serializer.endStruct(T);\n            level.* = .{};", "            try serializer.endStruct(T);"),
+    ("typed.zig", "                        try serializer.endStruct(T);\n                        level.* = .{};", "                        try serializer.endStruct(T);"),
+    ("typed.zig", "    try @field(SerializerType, part)(serializer, bytes, &rc.leaf);\n    rc.leaf = .{};", "    try @field(SerializerType, part)(serializer, bytes, &rc.leaf);"),
+    ("json.zig", "        if (room < 6) return error.WindowFull;", "        if (room < 5) return error.WindowFull;"),
+    ("json.zig", "        if (!trusted and !bulk.validUtf8(value)) return error.InvalidUtf8;\n        if (w.buffer.len == w.end) return error.WindowFull;", "        if (w.buffer.len == w.end) return error.WindowFull;"),
+    ("json.zig", "    if (w.buffer.len == w.end) return error.WindowFull;\n    w.buffer[w.end] = '\"';\n    w.end += 1;\n}\n\n/// Bytes as a JSON string", "    w.buffer[w.end] = '\"';\n    w.end += 1;\n}\n\n/// Bytes as a JSON string"),
+    ("json.zig", "        const groups = @min(remaining / 3, room / 4);", "        const groups = @min(remaining / 3, room / 3);"),
+    ("json.zig", "        } else if (remaining < 3 and room >= encoder.calcSize(remaining)) {", "        } else if (remaining < 3) {"),
+    ("json.zig", "            if (!state.started) {\n                try verifyText(value);\n                state.started = true;\n            }\n            try typed.copyPart(self.writer, value, &state.at);", "            if (!state.started) {\n                state.started = true;\n            }\n            try typed.copyPart(self.writer, value, &state.at);"),
+    ("cbor.zig", "            if (self.writer.buffer.len - self.writer.end < 9) return error.WindowFull;\n", ""),
+    ("cbor.zig", "            if (!state.started) {\n                if (!readOption(self.cfg, \"trusted_text\", false) and !bulk.validUtf8(value)) return error.InvalidUtf8;", "            if (!state.started) {\n                if (false) return error.InvalidUtf8;"),
+    ("cbor.zig", "            if (!state.started) {\n                try verifyItem(value, deterministic);\n                state.started = true;\n            }\n            try typed.copyPart", "            if (!state.started) {\n                state.started = true;\n            }\n            try typed.copyPart"),
+    ("resumable.zig", "            if (window.len < min_window) return error.WindowTooSmall;\n", ""),
+    ("resumable.zig", "            if (self.finished) return .{ .len = 0, .done = true };\n", ""),
+    ("resumable.zig", "            self.finished = true;\n", ""),
+    ("resumable.zig", "                error.WindowFull => return .{ .len = writer.end, .done = false },", "                error.WindowFull => return .{ .len = writer.end, .done = true },"),
+    ("typed.zig", ".float => |info| if (info.bits <= 32) atomic_room else if (info.bits == 64) 340 else 5000,", ".float => |info| if (info.bits <= 32) atomic_room else if (info.bits == 64) 64 else 5000,"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
@@ -481,7 +512,7 @@ def run(index):
     if old not in text:
         return f"{index} {name}: PATTERN NOT FOUND"
     open(path, "w").write(text.replace(old, new, 1))
-    cmd = ["zig", "build", "test"]
+    cmd = ["nice", "-n", "19", "zig", "build", "test", "-j2"]
     if os.environ.get("MUTANT_LOCK"):
         cmd = ["flock", os.environ["MUTANT_LOCK"]] + cmd
     # A mutant can loop forever. A run that does not end in two minutes is a kill, and its whole
