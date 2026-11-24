@@ -322,6 +322,8 @@ pub fn JsonDeserializer(comptime Config: type) type {
         can_borrow_strings: bool,
         /// A word the caller keeps with the deserializer, for decode hooks to read (`PullReader.userData`).
         user_data: usize = 0,
+        /// Where the key of the last member `nextObjectFieldIndex` called unknown starts.
+        last_key: usize = 0,
         stack: [128]Container = undefined,
         stack_len: usize = 0,
         max_depth: usize = 128,
@@ -553,7 +555,8 @@ pub fn JsonDeserializer(comptime Config: type) type {
             try self.push(.{ .kind = .object, .first = true });
         }
 
-        pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {
+        /// Moves to the next key of the map being read: false at its end, with the map closed.
+        fn startObjectKey(self: *Self) !bool {
             const frame = self.current();
             if (frame.kind != .object) return error.InvalidJsonState;
 
@@ -562,7 +565,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
                 if (self.parser.peek() == '}') {
                     _ = self.parser.consume();
                     _ = self.pop();
-                    return null;
+                    return false;
                 }
                 frame.first = false;
             } else {
@@ -571,7 +574,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
                     ',' => self.parser.skipWhitespace(),
                     '}' => {
                         _ = self.pop();
-                        return null;
+                        return false;
                     },
                     else => return error.UnexpectedToken,
                 }
@@ -579,12 +582,63 @@ pub fn JsonDeserializer(comptime Config: type) type {
 
             if (self.parser.peek() != '"') return error.UnexpectedToken;
             try self.count();
-            const key = try self.parser.parseStringToken(allocator);
-            errdefer key.deinit(allocator);
+            return true;
+        }
 
+        fn endObjectKey(self: *Self) !void {
             self.parser.skipWhitespace();
             if (self.parser.consume() != ':') return error.UnexpectedToken;
+        }
+
+        pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {
+            if (!try self.startObjectKey()) return null;
+            const key = try self.parser.parseStringToken(allocator);
+            errdefer key.deinit(allocator);
+            try self.endObjectKey();
             return key;
+        }
+
+        /// The next key of a union's map (see `readStringShort`), or null at its end.
+        pub fn nextObjectKeyShort(self: *Self, comptime cap: usize, buffer: *[cap]u8) !?typed.ObjectKeyShort {
+            if (!try self.startObjectKey()) return null;
+            const key = try self.parser.parseStringShort(cap, buffer);
+            try self.endObjectKey();
+            return switch (key) {
+                .text => |bytes| .{ .text = bytes },
+                .long => .long,
+            };
+        }
+
+        /// A string compared with names a type declares, read without allocating (see `typed.ShortText`).
+        pub fn readStringShort(self: *Self, comptime cap: usize, buffer: *[cap]u8) !typed.ShortText {
+            try self.count();
+            self.parser.skipWhitespace();
+            return self.parser.parseStringShort(cap, buffer);
+        }
+
+        /// The next key of a struct's map, matched to one of `T`'s fields where it is read, so a key is not
+        /// allocated; one that names no field is `.unknown` and `unknownKey` reads it again.
+        pub fn nextObjectFieldIndex(self: *Self, comptime T: type, comptime cfg: anytype) !typed.ObjectFieldLookup {
+            if (!try self.startObjectKey()) return .end;
+            self.parser.skipWhitespace();
+            const start = self.parser.index;
+            const cap = comptime typed.longestFieldName(T, cfg);
+            var buffer: [cap]u8 = undefined;
+            const key = try self.parser.parseStringShort(cap, &buffer);
+            try self.endObjectKey();
+            switch (key) {
+                .text => |bytes| if (typed.matchStructFieldIndex(T, cfg, bytes)) |index| return .{ .field_index = index },
+                .long => {},
+            }
+            self.last_key = start;
+            return .unknown;
+        }
+
+        /// The key of the member `nextObjectFieldIndex` called `.unknown`, decoded into the allocator's memory.
+        pub fn unknownKey(self: *Self, allocator: Allocator) !StringToken {
+            var parser = self.parser;
+            parser.index = self.last_key;
+            return parser.parseStringToken(allocator);
         }
 
         /// A reader of the next value of this read, for a wire type's decode hook.
@@ -1623,20 +1677,28 @@ const Parser = struct {
     }
 
     fn appendEscape(self: *Parser, allocator: Allocator, builder: *std.ArrayList(u8)) Error!void {
-        const escape = self.consume() orelse return error.UnexpectedEndOfInput;
-        switch (escape) {
-            '"', '\\', '/' => try builder.append(allocator, escape),
-            'b' => try builder.append(allocator, '\x08'),
-            'f' => try builder.append(allocator, '\x0c'),
-            'n' => try builder.append(allocator, '\n'),
-            'r' => try builder.append(allocator, '\r'),
-            't' => try builder.append(allocator, '\t'),
-            'u' => try self.appendUnicodeEscape(allocator, builder),
-            else => return error.InvalidStringEscape,
-        }
+        var bytes: [4]u8 = undefined;
+        const length = try self.escapeBytes(&bytes);
+        try builder.appendSlice(allocator, bytes[0..length]);
     }
 
-    fn appendUnicodeEscape(self: *Parser, allocator: Allocator, builder: *std.ArrayList(u8)) Error!void {
+    /// The UTF-8 bytes of the escape after a backslash (up to four), which is consumed.
+    fn escapeBytes(self: *Parser, out: *[4]u8) Error!usize {
+        const escape = self.consume() orelse return error.UnexpectedEndOfInput;
+        switch (escape) {
+            '"', '\\', '/' => out[0] = escape,
+            'b' => out[0] = '\x08',
+            'f' => out[0] = '\x0c',
+            'n' => out[0] = '\n',
+            'r' => out[0] = '\r',
+            't' => out[0] = '\t',
+            'u' => return self.unicodeEscapeBytes(out),
+            else => return error.InvalidStringEscape,
+        }
+        return 1;
+    }
+
+    fn unicodeEscapeBytes(self: *Parser, out: *[4]u8) Error!usize {
         const first = try self.parseHex4();
         var codepoint: u21 = first;
 
@@ -1651,9 +1713,52 @@ const Parser = struct {
             return error.InvalidUnicodeSurrogate;
         }
 
-        var utf8: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(codepoint, &utf8) catch unreachable;
-        try builder.appendSlice(allocator, utf8[0..len]);
+        return std.unicode.utf8Encode(codepoint, out) catch unreachable;
+    }
+
+    /// A string, decoded into `buffer` if it is at most `cap` bytes, or read to its end and checked and
+    /// called `.long`; a string with no escape is the input's own bytes. Nothing is allocated.
+    fn parseStringShort(self: *Parser, comptime cap: usize, buffer: *[cap]u8) Error!typed.ShortText {
+        if (self.consume() != '"') return error.UnexpectedToken;
+        var run_start = self.index;
+        var length: usize = 0;
+        var total: usize = 0;
+        var long = false;
+        var escaped = false;
+        while (true) {
+            self.index = bulk.findStringSpecial(self.input, self.index);
+            const c = self.consume() orelse return error.UnexpectedEndOfInput;
+            switch (c) {
+                '"', '\\' => {
+                    const run = try self.validUtf8(self.input[run_start .. self.index - 1]);
+                    total += run.len;
+                    if (c == '"' and !escaped) {
+                        if (total > self.max_string_len) return error.StringTooLong;
+                        return .{ .text = run };
+                    }
+                    escaped = true;
+                    if (!long and length + run.len <= cap) {
+                        @memcpy(buffer[length..][0..run.len], run);
+                        length += run.len;
+                    } else long = true;
+                    if (c == '"') {
+                        if (total > self.max_string_len) return error.StringTooLong;
+                        return if (long) .long else .{ .text = buffer[0..length] };
+                    }
+                    var bytes: [4]u8 = undefined;
+                    const count = try self.escapeBytes(&bytes);
+                    total += count;
+                    if (total > self.max_string_len) return error.StringTooLong;
+                    if (!long and length + count <= cap) {
+                        @memcpy(buffer[length..][0..count], bytes[0..count]);
+                        length += count;
+                    } else long = true;
+                    run_start = self.index;
+                },
+                0...31 => return error.InvalidStringCharacter,
+                else => {},
+            }
+        }
     }
 
     fn parseHex4(self: *Parser) Error!u16 {

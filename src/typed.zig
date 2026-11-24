@@ -570,6 +570,18 @@ fn deserializeUnion(
 
     switch (try deserializer.peekKind()) {
         .string => {
+            if (comptime @hasDecl(DeserializerType, "readStringShort")) {
+                const cap = comptime longestVariantName(T, info, cfg);
+                var buffer: [cap]u8 = undefined;
+                const name = switch (try deserializer.readStringShort(cap, &buffer)) {
+                    .text => |bytes| bytes,
+                    .long => return error.InvalidEnumTag,
+                };
+                inline for (info.field_names, info.field_types) |variant, FieldType| {
+                    if (FieldType == void and variantHasText(T, variant, cfg, name)) return @unionInit(T, variant, {});
+                }
+                return error.InvalidEnumTag;
+            }
             const token = try deserializer.readString(allocator);
             defer token.deinit(allocator);
             inline for (info.field_names, info.field_types) |name, FieldType| {
@@ -590,14 +602,19 @@ fn deserializeUnion(
         },
         .object => {
             try deserializer.beginObject();
-            const key = (try nextUnionKey(deserializer, allocator, integer_keys)) orelse return error.LengthMismatch;
-            defer if (key == .text) key.text.deinit(allocator);
+            // The key is compared with the variants' names where it is read, and not kept: it is not allocated,
+            // so nothing is left behind it once the payload allocates.
+            const cap = comptime longestVariantName(T, info, cfg);
+            var buffer: [cap]u8 = undefined;
+            const key = (try nextUnionKey(deserializer, allocator, cap, &buffer)) orelse return error.LengthMismatch;
+            defer key.deinit(allocator);
 
             const result: T = blk: {
                 inline for (info.field_names, info.field_types) |name, FieldType| {
-                    const matches = switch (key) {
-                        .text => |token| variantHasText(T, name, cfg, token.bytes),
+                    const matches = switch (key.value) {
+                        .text => |bytes| variantHasText(T, name, cfg, bytes),
                         .integer => |number| variantHasInteger(T, name, cfg, number),
+                        .long => false,
                     };
                     if (FieldType != void and matches) {
                         const payload = try deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name, meta.effectiveBounds(T, name, cfg));
@@ -609,8 +626,9 @@ fn deserializeUnion(
             errdefer freeTypedPartial(T, allocator, result, borrowed_strings);
 
             // A union is one entry: a second one is not another variant.
-            if (try nextUnionKey(deserializer, allocator, integer_keys)) |extra| {
-                if (extra == .text) extra.text.deinit(allocator);
+            var extra_buffer: [cap]u8 = undefined;
+            if (try nextUnionKey(deserializer, allocator, cap, &extra_buffer)) |extra| {
+                extra.deinit(allocator);
                 return error.LengthMismatch;
             }
             return result;
@@ -619,16 +637,77 @@ fn deserializeUnion(
     }
 }
 
-/// A map key that is text or an integer, for formats that allow both (`supports_integer_keys`).
-pub const ObjectKey = union(enum) {
-    text: StringToken,
-    integer: i128,
+/// A string that is only compared with names the type declares: the bytes if they fit the `cap` the caller
+/// gave, which lie in the input or in the caller's buffer and are valid until the next read, or `.long` when
+/// they are longer than every name, so it is none of them. A format that has `readStringShort` reads a name
+/// without allocating, the escaped and chunked kinds included.
+pub const ShortText = union(enum) {
+    text: []const u8,
+    long,
 };
 
-fn nextUnionKey(deserializer: anytype, allocator: Allocator, comptime integer_keys: bool) anyerror!?ObjectKey {
-    if (integer_keys) return try deserializer.nextObjectKey(allocator);
+/// A map key, as `ShortText`, or an integer (`supports_integer_keys`).
+pub const ObjectKeyShort = union(enum) {
+    text: []const u8,
+    integer: i128,
+    long,
+};
+
+/// The length in bytes of the longest text key of a union's variants, or of an enum's names, which a key
+/// is compared with.
+fn longestVariantName(comptime T: type, comptime info: std.builtin.Type.Union, comptime cfg: anytype) usize {
+    comptime {
+        var longest: usize = 0;
+        for (info.field_names) |name| {
+            switch (meta.effectiveFieldKey(T, name, cfg)) {
+                .text => |text| longest = @max(longest, text.len),
+                .integer => {},
+            }
+        }
+        return longest;
+    }
+}
+
+fn longestEnumName(comptime info: std.builtin.Type.Enum) usize {
+    comptime {
+        var longest: usize = 0;
+        for (info.field_names) |name| longest = @max(longest, name.len);
+        return longest;
+    }
+}
+
+/// The length in bytes of the longest text key of a struct's fields.
+pub fn longestFieldName(comptime T: type, comptime cfg: anytype) usize {
+    comptime {
+        var longest: usize = 0;
+        for (@typeInfo(T).@"struct".field_names) |name| {
+            switch (meta.effectiveFieldKey(T, name, cfg)) {
+                .text => |text| longest = @max(longest, text.len),
+                .integer => {},
+            }
+        }
+        return longest;
+    }
+}
+
+/// The next key of a union's map: read into `buffer` or the input without allocating by a format with
+/// `nextObjectKeyShort`, and as a token of the allocator's by any other.
+const UnionKey = struct {
+    value: ObjectKeyShort,
+    token: ?StringToken = null,
+
+    fn deinit(self: UnionKey, allocator: Allocator) void {
+        if (self.token) |token| token.deinit(allocator);
+    }
+};
+
+fn nextUnionKey(deserializer: anytype, allocator: Allocator, comptime cap: usize, buffer: *[cap]u8) anyerror!?UnionKey {
+    if (comptime @hasDecl(@TypeOf(deserializer.*), "nextObjectKeyShort")) {
+        const key = (try deserializer.nextObjectKeyShort(cap, buffer)) orelse return null;
+        return .{ .value = key };
+    }
     const token = (try deserializer.nextObjectField(allocator)) orelse return null;
-    return .{ .text = token };
+    return .{ .value = .{ .text = token.bytes }, .token = token };
 }
 
 fn unionHasIntegerKeys(comptime T: type, comptime info: std.builtin.Type.Union, comptime cfg: anytype) bool {
@@ -687,6 +766,14 @@ fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype
         .string => blk: {
             // An enum written as its number reads only a number.
             if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) return error.UnexpectedType;
+            if (comptime @hasDecl(DeserializerType, "readStringShort")) {
+                const cap = comptime longestEnumName(@typeInfo(T).@"enum");
+                var buffer: [cap]u8 = undefined;
+                break :blk switch (try deserializer.readStringShort(cap, &buffer)) {
+                    .text => |bytes| std.meta.stringToEnum(T, bytes) orelse error.InvalidEnumTag,
+                    .long => error.InvalidEnumTag,
+                };
+            }
             const token = try deserializer.readString(allocator);
             defer token.deinit(allocator);
             break :blk std.meta.stringToEnum(T, token.bytes) orelse error.InvalidEnumTag;

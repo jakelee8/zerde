@@ -660,24 +660,63 @@ pub fn CborDeserializer(comptime Config: type) type {
             return token;
         }
 
-        /// The next key of a map whose keys are text or integers, which is what a union with integer
-        /// variant keys holds. A key of another type is `error.UnexpectedType`.
-        pub fn nextObjectKey(self: *Self, allocator: Allocator) !?typed.ObjectKey {
+        /// A text string read into `buffer` or the input, without allocating, for comparing with names a type
+        /// declares: a string longer than `cap` is `.long`, still read to its end and checked, since no name
+        /// is as long. A definite string is the input's own bytes; chunks are joined in `buffer`.
+        pub fn readStringShort(self: *Self, comptime cap: usize, buffer: *[cap]u8) !typed.ShortText {
+            const header = try self.readHeader();
+            if (header.major != 3) return error.UnexpectedType;
+            return self.shortAfter(header, cap, buffer);
+        }
+
+        fn shortAfter(self: *Self, header: Header, comptime cap: usize, buffer: *[cap]u8) !typed.ShortText {
+            if (!header.indefinite) {
+                if (header.value > self.max_string_len) return error.StringTooLong;
+                const raw = try self.takeBytes(header.value);
+                if (!self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
+                return .{ .text = raw };
+            }
+            var length: usize = 0;
+            var total: usize = 0;
+            var long = false;
+            while (true) {
+                if (self.index >= self.input.len) return error.UnexpectedEndOfInput;
+                if (self.input[self.index] == 0xff) {
+                    self.index += 1;
+                    break;
+                }
+                const chunk = try parseHeader(self.input, &self.index);
+                if (chunk.major != 3 or chunk.indefinite) return error.InvalidStringChunk;
+                if (chunk.value > self.max_string_len - total) return error.StringTooLong;
+                const raw = try self.takeBytes(chunk.value);
+                if (!self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
+                total += raw.len;
+                if (!long and length + raw.len <= cap) {
+                    @memcpy(buffer[length..][0..raw.len], raw);
+                    length += raw.len;
+                } else long = true;
+            }
+            return if (long) .long else .{ .text = buffer[0..length] };
+        }
+
+        /// The next key of a union's map (see `readStringShort`), or null at its end. A union has one entry, so
+        /// the key is not recorded for the repeated-key check, which is what keeps nothing behind it.
+        pub fn nextObjectKeyShort(self: *Self, comptime cap: usize, buffer: *[cap]u8) !?typed.ObjectKeyShort {
             if (try self.beginObjectEntry()) return null;
 
             const start = self.index;
             const header = try self.readHeader();
             switch (header.major) {
                 3 => {
-                    const token = try self.finishString(allocator, header);
-                    errdefer token.deinit(allocator);
+                    const key = try self.shortAfter(header, cap, buffer);
                     try self.orderFrameKey(start);
-                    try self.recordText(token);
-                    return .{ .text = token };
+                    return switch (key) {
+                        .text => |bytes| .{ .text = bytes },
+                        .long => .long,
+                    };
                 },
                 0, 1 => {
                     try self.orderFrameKey(start);
-                    try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
                     return .{ .integer = if (header.major == 0) header.value else -@as(i128, header.value) - 1 };
                 },
                 else => return error.UnexpectedType,
@@ -717,9 +756,18 @@ pub fn CborDeserializer(comptime Config: type) type {
                         try self.recordText(.{ .bytes = raw, .allocated = false });
                         return .unknown;
                     }
+                    // Chunks are joined in a buffer as long as the longest field name, and not allocated: only a key the
+                    // type does not declare is, to record it for the repeated-key check.
+                    const cap = comptime typed.longestFieldName(T, cfg);
+                    var buffer: [cap]u8 = undefined;
+                    const resume_at = self.index;
+                    switch (try self.shortAfter(header, cap, &buffer)) {
+                        .text => |bytes| if (typed.matchStructFieldIndex(T, cfg, bytes)) |index| return .{ .field_index = index },
+                        .long => {},
+                    }
+                    self.index = resume_at;
                     const token = try self.finishString(self.allocator, header);
                     defer token.deinit(self.allocator);
-                    if (typed.matchStructFieldIndex(T, cfg, token.bytes)) |index| return .{ .field_index = index };
                     try self.recordText(token);
                     return .unknown;
                 },

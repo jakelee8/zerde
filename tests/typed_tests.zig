@@ -4816,7 +4816,7 @@ fn nestedUnionInput(comptime depth: usize, out: *std.ArrayList(u8)) !void {
     try out.appendSlice(allocator, &.{ 0xa1, 0x64, 'l', 'e', 'a', 'f', 0x01 });
 }
 
-test "the keys a CBOR read keeps for open union maps are in the bound, nested eight deep, in both modes" {
+test "a union's key is not allocated: eight nested unions fit the bound of a schema without any, in both modes" {
     const Root = struct {
         u: NestedUnion(8),
         pub const serde = .{ .deny_unknown_fields = true };
@@ -4830,38 +4830,19 @@ test "the keys a CBOR read keeps for open union maps are in the bound, nested ei
         try nestedUnionInput(8, &input);
         const used = try decodeWithin(zerde.cbor, Root, bound, input.items, cfg);
         try std.testing.expect(used <= bound);
-        // 9 maps are open at the deepest point (8 nexts and the leaf), each with a 24-byte record.
-        try std.testing.expect(bound >= 256 + 9 * 24);
     }
-    // JSON keeps no such records, and says so in its bound: the same schema is smaller.
-    try std.testing.expect(wire.maxArenaSize(zerde.json, Root, .{}, .{}) < wire.maxArenaSize(zerde.cbor, Root, .{}, .{}));
-    // By hand: nine open maps. The records (24 bytes) grow through 6 and 15 slots (151 and 367 bytes with alignment),
-    // and are copied to 9 slots (223); the key text, at most 9 * 4 bytes, takes a first buffer of 129 and its exact copy 36.
-    try std.testing.expectEqual(@as(usize, 151 + 367 + 223 + 129 + 36 + 256), wire.maxArenaSize(zerde.cbor, Root, .{}, .{}));
+    // The bound has no term for the keys, in either format.
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Root, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.json, Root, .{}, .{}));
 }
 
-test "figures for the keys of open union maps: a path, not a sum; the depth; a field's limit and the config's" {
-    const Root = struct {
-        u: NestedUnion(8),
-        pub const serde = .{ .deny_unknown_fields = true };
-    };
-    // max_depth 4 stops the walk at four unions open: records 151 + 103, key text 129 + 16.
-    try std.testing.expectEqual(@as(usize, 151 + 103 + 129 + 16 + 256), wire.maxArenaSize(zerde.cbor, Root, .{}, .{ .max_depth = 4 }));
-    // Two fields of two nested unions each: two open at a time, not four (records 151 + 55, key text 129 + 8).
-    const Pair = struct {
-        a: NestedUnion(1),
-        b: NestedUnion(1),
-        pub const serde = .{ .deny_unknown_fields = true };
-    };
-    try std.testing.expectEqual(@as(usize, 151 + 55 + 129 + 8 + 256), wire.maxArenaSize(zerde.cbor, Pair, .{}, .{}));
+test "figures: a field's own limit against the config's" {
     // The field's max_len and the config's max_string_len: the smaller is the bound (50, and 25 + 128 to build it).
     const Both = struct {
         s: []const u8,
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 100 } } };
     };
     try std.testing.expectEqual(@as(usize, 50 + 153 + 256), wire.maxArenaSize(zerde.json, Both, .{}, .{ .max_string_len = 50 }));
-    // JSON keeps no records for union keys.
-    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.json, Pair, .{}, .{}));
 }
 
 const RecTree = union(enum) {
@@ -4890,4 +4871,198 @@ test "a union that recurses through a list is charged down to max_depth and no f
     for (0..9) |_| try deep.appendSlice(allocator, &.{ 0xa1, 0x64, 'n', 'o', 'd', 'e', 0x81 });
     try deep.appendSlice(allocator, &.{ 0xa1, 0x64, 'l', 'e', 'a', 'f', 0x01 });
     try std.testing.expectError(error.CborNestingTooDeep, decodeWithin(zerde.cbor, Holder3, bound, deep.items, cfg));
+}
+
+// ---- keys are compared where they are read, and never allocated -------------------------------------------------
+
+fn longName(comptime length: usize, comptime fill: u8) []const u8 {
+    const bytes: [length]u8 = @splat(fill);
+    return &bytes;
+}
+
+const Named60 = union(enum) {
+    sixty: []const u32,
+    other: u8,
+    pub const serde = .{ .fields = .{ .sixty = .{ .rename = longName(60, 'a'), .max_len = 300 }, .other = .{ .rename = longName(200, 'b') } } };
+};
+
+const Holder60 = struct {
+    u: Named60,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+
+test "a union key of 60 or 200 characters, escaped or chunked, leaves nothing behind it: 300 elements fit the bound" {
+    const cfg = .{ .max_items = 400, .max_string_len = 256 };
+    const bound = comptime wire.maxArenaSize(zerde.json, Holder60, .{}, cfg);
+    // JSON: every character of the key an escape (\u0061), then a payload of 300 numbers.
+    var json_input: std.ArrayList(u8) = .empty;
+    defer json_input.deinit(allocator);
+    try json_input.appendSlice(allocator, "{\"u\":{\"");
+    for (0..60) |_| try json_input.appendSlice(allocator, "\\u0061");
+    try json_input.appendSlice(allocator, "\":[");
+    for (0..300) |index| {
+        if (index != 0) try json_input.append(allocator, ',');
+        try json_input.append(allocator, '7');
+    }
+    try json_input.appendSlice(allocator, "]}}");
+    const json_used = try decodeWithin(zerde.json, Holder60, bound, json_input.items, cfg);
+    try std.testing.expect(json_used <= bound);
+    // The 200-character name, with a payload of one byte.
+    var long_input: std.ArrayList(u8) = .empty;
+    defer long_input.deinit(allocator);
+    try long_input.appendSlice(allocator, "{\"u\":{\"");
+    for (0..200) |_| try long_input.appendSlice(allocator, "\\u0062");
+    try long_input.appendSlice(allocator, "\":7}}");
+    _ = try decodeWithin(zerde.json, Holder60, bound, long_input.items, cfg);
+    // A key longer than every name is no variant, and is not allocated either.
+    var too_long: std.ArrayList(u8) = .empty;
+    defer too_long.deinit(allocator);
+    try too_long.appendSlice(allocator, "{\"u\":{\"");
+    for (0..250) |_| try too_long.appendSlice(allocator, "\\u0062");
+    try too_long.appendSlice(allocator, "\":7}}");
+    try std.testing.expectError(error.InvalidEnumTag, decodeWithin(zerde.json, Holder60, bound, too_long.items, cfg));
+
+    // CBOR: the key in chunks of one byte, and in two chunks, then the payload.
+    var cbor_input: std.ArrayList(u8) = .empty;
+    defer cbor_input.deinit(allocator);
+    try cbor_input.appendSlice(allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x7f });
+    for (0..60) |_| try cbor_input.appendSlice(allocator, &.{ 0x61, 'a' });
+    try cbor_input.appendSlice(allocator, &.{ 0xff, 0x99, 0x01, 0x2c });
+    for (0..300) |_| try cbor_input.append(allocator, 0x07);
+    const cbor_bound = comptime wire.maxArenaSize(zerde.cbor, Holder60, .{}, cfg);
+    const cbor_used = try decodeWithin(zerde.cbor, Holder60, cbor_bound, cbor_input.items, cfg);
+    try std.testing.expect(cbor_used <= cbor_bound);
+    var split: std.ArrayList(u8) = .empty;
+    defer split.deinit(allocator);
+    try split.appendSlice(allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x7f, 0x78, 0x78 });
+    for (0..120) |_| try split.append(allocator, 'b');
+    try split.appendSlice(allocator, &.{ 0x78, 0x50 });
+    for (0..80) |_| try split.append(allocator, 'b');
+    try split.appendSlice(allocator, &.{ 0xff, 0x07 });
+    _ = try decodeWithin(zerde.cbor, Holder60, cbor_bound, split.items, cfg);
+    // Too long for every name; invalid UTF-8 in a chunk is still refused.
+    var bad_chunk: std.ArrayList(u8) = .empty;
+    defer bad_chunk.deinit(allocator);
+    try bad_chunk.appendSlice(allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x7f, 0x61, 0xff, 0xff, 0x07 });
+    try std.testing.expectError(error.InvalidUtf8, decodeWithin(zerde.cbor, Holder60, cbor_bound, bad_chunk.items, cfg));
+    var no_end: std.ArrayList(u8) = .empty;
+    defer no_end.deinit(allocator);
+    try no_end.appendSlice(allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x7f, 0x61, 'a' });
+    try std.testing.expectError(error.UnexpectedEndOfInput, decodeWithin(zerde.cbor, Holder60, cbor_bound, no_end.items, cfg));
+}
+
+const WideNames = struct {
+    first: []const u32,
+    second: []const u8,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .first = .{ .rename = longName(80, 'f'), .max_len = 300 }, .second = .{ .rename = longName(70, 's'), .max_len = 20 } } };
+};
+
+test "a struct's field names, escaped or chunked, are matched without being allocated, before a 300-element payload" {
+    const cfg = .{ .max_items = 400, .max_string_len = 256 };
+    const bound = comptime wire.maxArenaSize(zerde.json, WideNames, .{}, cfg);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "{\"");
+    for (0..80) |_| try input.appendSlice(allocator, "\\u0066");
+    try input.appendSlice(allocator, "\":[");
+    for (0..300) |index| {
+        if (index != 0) try input.append(allocator, ',');
+        try input.append(allocator, '7');
+    }
+    try input.appendSlice(allocator, "],\"");
+    for (0..70) |_| try input.appendSlice(allocator, "\\u0073");
+    try input.appendSlice(allocator, "\":\"x\"}");
+    const used = try decodeWithin(zerde.json, WideNames, bound, input.items, cfg);
+    try std.testing.expect(used <= bound);
+    // CBOR chunked names, a field after the long list, and an unknown long name refused.
+    var cbor_input: std.ArrayList(u8) = .empty;
+    defer cbor_input.deinit(allocator);
+    try cbor_input.appendSlice(allocator, &.{ 0xa2, 0x7f });
+    for (0..80) |_| try cbor_input.appendSlice(allocator, &.{ 0x61, 'f' });
+    try cbor_input.appendSlice(allocator, &.{ 0xff, 0x99, 0x01, 0x2c });
+    for (0..300) |_| try cbor_input.append(allocator, 0x07);
+    try cbor_input.appendSlice(allocator, &.{0x7f});
+    for (0..70) |_| try cbor_input.appendSlice(allocator, &.{ 0x61, 's' });
+    try cbor_input.appendSlice(allocator, &.{ 0xff, 0x61, 'x' });
+    const cbor_bound = comptime wire.maxArenaSize(zerde.cbor, WideNames, .{}, cfg);
+    const cbor_used = try decodeWithin(zerde.cbor, WideNames, cbor_bound, cbor_input.items, cfg);
+    try std.testing.expect(cbor_used <= cbor_bound);
+    // The names are the same through the typed read, in any allocator.
+    const parsed = try zerde.cbor.parseSlice(WideNames, allocator, cbor_input.items);
+    defer zerde.free(allocator, parsed);
+    try std.testing.expectEqual(@as(usize, 300), parsed.first.len);
+    try std.testing.expectEqualStrings("x", parsed.second);
+    var unknown: std.ArrayList(u8) = .empty;
+    defer unknown.deinit(allocator);
+    try unknown.appendSlice(allocator, &.{ 0xa1, 0x7f });
+    for (0..90) |_| try unknown.appendSlice(allocator, &.{ 0x61, 'q' });
+    try unknown.appendSlice(allocator, &.{ 0xff, 0x00 });
+    try std.testing.expectError(error.UnknownField, zerde.cbor.parseSlice(WideNames, allocator, unknown.items));
+}
+
+test "an enum and a bare union variant, escaped or chunked, are matched without allocating" {
+    const Color = enum { red, green, blue_green_with_a_long_name };
+    const Holder4 = struct {
+        c: Color,
+        u: union(enum) { plain, with_data: u8 },
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const json = try zerde.json.parseSlice(Holder4, allocator, "{\"c\":\"blue_green_with_a_\\u006cong_name\",\"u\":\"pl\\u0061in\"}");
+    try std.testing.expectEqual(Color.blue_green_with_a_long_name, json.c);
+    try std.testing.expectEqual(std.meta.Tag(@TypeOf(json.u)).plain, std.meta.activeTag(json.u));
+    try std.testing.expectError(error.InvalidEnumTag, zerde.json.parseSlice(Holder4, allocator, "{\"c\":\"reddish_but_far_too_long_to_be_any_of_the_names\",\"u\":\"plain\"}"));
+    const cbor = try zerde.cbor.parseSlice(Holder4, allocator, &.{ 0xa2, 0x61, 'c', 0x7f, 0x63, 'r', 'e', 'd', 0xff, 0x61, 'u', 0x65, 'p', 'l', 'a', 'i', 'n' });
+    try std.testing.expectEqual(Color.red, cbor.c);
+    try std.testing.expectError(error.InvalidUtf8, zerde.cbor.parseSlice(Holder4, allocator, &.{ 0xa2, 0x61, 'c', 0x7f, 0x61, 0xff, 0xff, 0x61, 'u', 0x65, 'p', 'l', 'a', 'i', 'n' }));
+}
+
+const Tiny200 = struct {
+    u: union(enum) {
+        other: u8,
+        pub const serde = .{ .fields = .{ .other = .{ .rename = longName(200, 'b') } } };
+    },
+    wide: u8,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .wide = .{ .rename = longName(150, 'w') } } };
+};
+
+test "a key of 200 characters needs no arena of its own: the bound of a schema with no allocation holds" {
+    const bound = comptime wire.maxArenaSize(zerde.json, Tiny200, .{}, .{});
+    try std.testing.expectEqual(@as(usize, 256), bound);
+    var json_input: std.ArrayList(u8) = .empty;
+    defer json_input.deinit(allocator);
+    try json_input.appendSlice(allocator, "{\"u\":{\"");
+    for (0..200) |_| try json_input.appendSlice(allocator, "\\u0062");
+    try json_input.appendSlice(allocator, "\":7},\"");
+    for (0..150) |_| try json_input.appendSlice(allocator, "\\u0077");
+    try json_input.appendSlice(allocator, "\":1}");
+    _ = try decodeWithin(zerde.json, Tiny200, bound, json_input.items, .{});
+    var cbor_input: std.ArrayList(u8) = .empty;
+    defer cbor_input.deinit(allocator);
+    try cbor_input.appendSlice(allocator, &.{ 0xa2, 0x61, 'u', 0xa1, 0x7f });
+    for (0..200) |_| try cbor_input.appendSlice(allocator, &.{ 0x61, 'b' });
+    try cbor_input.appendSlice(allocator, &.{ 0xff, 0x07, 0x7f });
+    for (0..150) |_| try cbor_input.appendSlice(allocator, &.{ 0x61, 'w' });
+    try cbor_input.appendSlice(allocator, &.{ 0xff, 0x01 });
+    _ = try decodeWithin(zerde.cbor, Tiny200, comptime wire.maxArenaSize(zerde.cbor, Tiny200, .{}, .{}), cbor_input.items, .{});
+}
+
+test "a key read without allocating is as strictly checked as one that is allocated" {
+    const Short = union(enum) {
+        ab: u8,
+        abcd: u8,
+    };
+    const Holder5 = struct {
+        u: Short,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // A key that does not fit the buffer is no name, though its first chunk is one.
+    try std.testing.expectError(error.InvalidEnumTag, zerde.cbor.parseSlice(Holder5, allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x7f, 0x62, 'a', 'b', 0x65, 'c', 'd', 'e', 'f', 'g', 0xff, 0x07 }));
+    const exact = try zerde.cbor.parseSlice(Holder5, allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x7f, 0x62, 'a', 'b', 0x62, 'c', 'd', 0xff, 0x07 });
+    try std.testing.expectEqual(@as(u8, 7), exact.u.abcd);
+    // A chunk of another kind, text that is not UTF-8 in a definite key, and a key past max_string_len in escapes.
+    try std.testing.expectError(error.InvalidStringChunk, zerde.cbor.parseSlice(Holder5, allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x7f, 0x41, 'a', 0xff, 0x07 }));
+    try std.testing.expectError(error.InvalidUtf8, zerde.cbor.parseSlice(Holder5, allocator, &.{ 0xa1, 0x61, 'u', 0xa1, 0x61, 0xff, 0x07 }));
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceWith(Holder5, allocator, "{\"u\":{\"\\u0061\\u0062\\u0063\\u0064\":7}}", .{}, .{ .max_string_len = 3 }));
+    const ok = try zerde.json.parseSliceWith(Holder5, allocator, "{\"u\":{\"\\u0061\\u0062\\u0063\\u0064\":7}}", .{}, .{ .max_string_len = 4 });
+    try std.testing.expectEqual(@as(u8, 7), ok.u.abcd);
 }

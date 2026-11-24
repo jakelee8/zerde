@@ -499,8 +499,6 @@ const Limits = struct {
     max_depth: u64,
     /// A strict CBOR read: definite lengths only, so no list grows and no string is rewritten.
     strict: bool,
-    /// A CBOR read: it keeps a record of the key of each open map of a union, for its duplicate check.
-    cbor: bool,
 };
 
 fn optionalOf(comptime cfg: anytype, comptime name: []const u8) ?u64 {
@@ -516,7 +514,6 @@ fn limitsOf(comptime Format: type, comptime format_cfg: anytype) Limits {
         .max_input_bytes = optionalOf(format_cfg, "max_input_bytes"),
         .max_depth = if (meta.hasField(@TypeOf(format_cfg), "max_depth")) @min(@field(format_cfg, "max_depth"), 128) else 128,
         .strict = has_mode and @field(format_cfg, "mode") == cbor.Mode.strict,
-        .cbor = Format == cbor,
     };
 }
 
@@ -574,9 +571,6 @@ const Cost = struct {
     /// The most one string takes while it is built, over what it holds when done (the most of any, not a sum).
     transient: u64 = 0,
     scratch: u64 = 0,
-    /// The most maps of unions that are open at once along a path of the type, and the longest variant name.
-    open_unions: u64 = 0,
-    name_len: u64 = 0,
     list_size: u64 = 0,
     list_align: u64 = 0,
     list_wire: u64 = 0,
@@ -587,8 +581,6 @@ const Cost = struct {
             .text = a.text.plus(b.text),
             .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
-            .open_unions = @max(a.open_unions, b.open_unions),
-            .name_len = @max(a.name_len, b.name_len),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
             .list_wire = @max(a.list_wire, b.list_wire),
@@ -616,8 +608,6 @@ const Cost = struct {
             .text = a.text.most(b.text),
             .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
-            .open_unions = @max(a.open_unions, b.open_unions),
-            .name_len = @max(a.name_len, b.name_len),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
             .list_wire = @max(a.list_wire, b.list_wire),
@@ -688,9 +678,8 @@ fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const
 /// list grows through, per list; lists together are charged at most `max_items` items, which is less
 /// than the sum of their `max_len` when those are generous.
 ///
-/// A CBOR read also keeps a 24-byte record of the key of each map of a union that is open (a union
-/// nested in a union is one more), so the bound adds those for the most that are open along a path of
-/// the type, and no more than `max_depth`. A strict CBOR read (`mode = .strict`, which is refused for
+/// A key is never allocated: a union's variant and a struct's field are matched where the key is read,
+/// into a buffer as long as the longest name. A strict CBOR read (`mode = .strict`, which is refused for
 /// another format) is charged no rewritten text and exact lists. A pointer has no wire layout.
 ///
 /// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
@@ -723,14 +712,7 @@ fn computeBound(comptime Format: type, comptime T: type, comptime serde_cfg: any
         text = @min(text, 2 * input);
         transient = @min(transient, building(input));
     }
-    // A CBOR read keeps a record of the key of each open map of a union (24 bytes, and the key's text when it
-    // was rewritten), for as many as the type nests and the depth allows.
-    var scratch = cost.scratch;
-    if (limits.cbor and cost.open_unions > 0) {
-        const levels = cost.open_unions;
-        scratch += growth(levels, 24, 8) + growth(levels * cost.name_len, 1, 1);
-    }
-    const total = lists + text + transient + scratch + slack;
+    const total = lists + text + transient + cost.scratch + slack;
     if (total > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
     return @intCast(total);
 }
@@ -812,17 +794,9 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         },
         .@"union" => blk: {
             var most: Cost = .{};
-            var name_len: u64 = 0;
             for (reflect.variants(T, cfg)) |variant| {
                 if (variant.type != void) most = most.most(typedOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
-                name_len = @max(name_len, switch (variant.wire) {
-                    .text => |name| name.len,
-                    .integer => 0,
-                });
             }
-            // This union's map is open while its payload is read.
-            most.open_unions += 1;
-            most.name_len = @max(most.name_len, name_len);
             break :blk most;
         },
     };

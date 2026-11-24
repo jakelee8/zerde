@@ -427,6 +427,15 @@ that skips ASCII in vector chunks (native, or WebAssembly with SIMD) and the wor
 (`validUtf8Words`) elsewhere. `zig build bench-bulk -Doptimize=ReleaseFast` compares them; numbers are in
 [`bench/BULK.md`](bench/BULK.md).
 
+### Names are matched, not allocated
+
+A map key or string that is only compared with names a type declares (a union's variants, a struct's fields, an enum's
+names) is read without allocating, in CBOR and JSON: the format hands the typed layer the bytes (the input's own, or
+the chunks or unescaped characters joined in a stack buffer as long as the longest declared name), and a key longer than
+every name is `.long`, read to its end and checked, and no name. `readStringShort`, `nextObjectKeyShort` and, in JSON,
+`nextObjectFieldIndex` do it. A key that no field declares is allocated only for the repeated-key check of a read that
+accepts unknown members, and for `extras`.
+
 ### Raw items
 
 A field of type `cbor.Raw` or `json.Raw` (each a `struct { bytes: []const u8 }` that carries its format in its type) is one item of that format, checked
@@ -480,8 +489,7 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   input, which bounds every list without a `max_len` and all lists together, so nesting such lists does not multiply it),
   `max_string_len`, `max_depth`, `max_input_bytes`, which `decode` enforces (`error.InputTooLarge`), and `mode`: a strict
   CBOR read has only definite strings and lengths, so it rewrites no string and allocates each list once, at its exact size.
-  `mode` is a CBOR setting and a compile error for another `Format`. A CBOR read also keeps a record of the key of each open
-  union map, charged for the deepest nesting of unions along a path, up to `max_depth`. A pointer has no wire layout (use a
+  `mode` is a CBOR setting and a compile error for another `Format`. A key is never allocated (see below), so there is no term for the keys of unions or structs. A pointer has no wire layout (use a
   slice or an optional); a type that recurses through a list is charged down to `max_depth`.
   The bound is worked out in 64 bits and is a compile error only when it does not fit the target's `usize`. A bound set on a
   union variant (`serde.fields.<variant>`) applies to its payload, in the read and in the bound. Only what is
