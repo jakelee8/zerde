@@ -474,15 +474,16 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   in declaration order and a variant without payload having no member in the union.
 - `wire.decode(Format, T, arena, base, input, serde_cfg, format_cfg)` reads one `T` from `input` (CBOR or JSON) and returns
   its `Wire(T)`. The read is the typed read, aliased, with every rule of `T` and of the config (strict mode, limits, bounds,
-  validators, integer keys, optional policies): the message is read into `T`, then copied, so there is no second set of rules
+  validators, integer keys, optional policies): it is the typed walk with a sink that builds `Wire(T)` as it reads (a
+  struct's own `check` is called on the typed struct rebuilt for the call in arena space that is handed back at once), so there is no second set of rules
   to drift. `arena` is a `*std.heap.FixedBufferAllocator` and must be one: nothing is freed, and on an error it is put back as
   it was. Spans are offsets from `base`: 0 on wasm32, where an offset is a linear-memory address, or the address of a region
   that holds both the input and the arena on a native target. An offset or an end beyond `u32`, or an address before `base`, is
   `error.OffsetOutOfRange`.
 - Where the bytes are: a plain text or byte string and a `Raw` stay in `input` (it must stay put while the wire value is
   read); a JSON string with an escape, a chunked CBOR string, bytes JSON decodes from base64 and every array of structs,
-  unions, optionals, enums, bools or arrays are written into the arena (the latter twice: the typed array, then the wire
-  array). A list of integers and floats is not copied: its typed array already has the wire layout and the span points at it.
+  unions, optionals, enums, bools or arrays are written into the arena, once, as the wire array (there is no typed array
+  before it: the read builds the wire layout directly). A list of integers and floats is the same array of its own elements.
   So a span points into the input or the arena, and both must be in memory `base` reaches.
 - `wire.maxArenaSize(Format, T, serde_cfg, format_cfg)` is an upper bound, computed at comptime, of the bytes a decode takes
   from the arena. It uses the `max_len` and `.elem` of each field and, from `format_cfg`: `max_items` (items in the whole

@@ -10,6 +10,7 @@ const memory = @import("memory.zig");
 const msgpack = @import("msgpack.zig");
 const toml = @import("toml.zig");
 const wasm = @import("wasm.zig");
+const wire = @import("wire.zig");
 const yaml = @import("yaml.zig");
 const zon = @import("zon.zig");
 
@@ -57,6 +58,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, mode, "zon")) {
         try zon.run(io, allocator);
+        return;
+    }
+    if (std.mem.eql(u8, mode, "wire")) {
+        try wire.run(io, allocator);
         return;
     }
     if (std.mem.eql(u8, mode, "wasm")) {

@@ -58,6 +58,7 @@ zig build bench-toml -Doptimize=ReleaseFast
 zig build bench-cbor -Doptimize=ReleaseFast
 zig build bench-yaml -Doptimize=ReleaseFast
 zig build bench-wasm -Doptimize=ReleaseFast
+zig build bench-wire -Doptimize=ReleaseFast
 ```
 
 Benchmark workflow and benchmark-log conventions live in [bench/README.md](bench/README.md).

@@ -18,6 +18,7 @@ paths.
 - `bench/msgpack.zig`: MessagePack benchmark entrypoint
 - `bench/toml.zig`: TOML benchmark entrypoint
 - `bench/wasm.zig`: WASM helper benchmark entrypoint
+- `bench/wire.zig`: wire decode benchmark entrypoint (real source text)
 - `bench/yaml.zig`: YAML benchmark entrypoint
 - `bench/zon.zig`: ZON benchmark entrypoint
 - `bench/common.zig`: shared scenarios, payload builders, and benchmark loops
@@ -31,6 +32,7 @@ paths.
 - `bench/MEMORY.md`: running allocation benchmark history
 - `bench/TOML.md`: running TOML benchmark history
 - `bench/WASM.md`: running WASM benchmark history
+- `bench/WIRE.md`: running wire decode benchmark history
 - `bench/YAML.md`: running YAML benchmark history
 - `bench/ZON.md`: running ZON benchmark history
 
@@ -100,6 +102,12 @@ Run YAML only:
 
 ```sh
 zig build bench-yaml -Doptimize=ReleaseFast
+```
+
+Run the wire decode benchmark (real source text) only:
+
+```sh
+zig build bench-wire -Doptimize=ReleaseFast
 ```
 
 Run WASM helper benchmark only:

@@ -4,8 +4,9 @@
 //!
 //! `Wire(T)` is the layout of schema type `T`, the same struct, enum, union and optional types the
 //! typed layer reads and writes, with every serde rule (renames, integer keys, bounds, optional
-//! policies, validators) applied by the typed layer as it always is: a message is read into `T`
-//! first, then copied into `Wire(T)`, so this module has no second set of rules.
+//! policies, validators) applied by the typed layer as it always is: `decode` is the typed walk
+//! (`typed.deserializeInto`) with `WireSink` assembling `Wire(T)` as it reads, with no `T` between,
+//! so this module has no second set of rules.
 //!
 //!   - an integer and a float are themselves; a bool is a `u8` that must be 0 or 1; an enum is an integer;
 //!   - text, a `ByteString`, a `Raw` and a slice are a `Span`: `extern struct { offset: u32, len: u32 }`,
@@ -29,10 +30,8 @@
 //! The arena is a caller-provided fixed buffer (`std.heap.FixedBufferAllocator`): a decode takes
 //! one, restores it on an error, and never frees what it allocated, so it must not be a general
 //! allocator. `maxArenaSize` computes at comptime how large the buffer must be, and is a compile
-//! error when a field a decode reaches has no bound. The decode reads into the typed value first,
-//! then copies it into the wire layout; the copy is skipped for a list of scalars, whose typed
-//! array already has the wire layout, and for strings. What is still copied is every list of
-//! structs, unions, optionals, enums and arrays: once as the typed array, once as the wire array.
+//! error when a field a decode reaches has no bound. Each list is written once, at the size of its
+//! elements' wire layout, as it is read: there is no typed value or typed array first.
 //!
 //! A wire value that came from outside is not trusted: `fromWire` and `encode` take a `Memory`,
 //! the ranges a span may point into, and refuse a span outside them or misaligned for what it holds.
@@ -367,13 +366,90 @@ pub fn decode(
     const mark = arena.end_index;
     errdefer arena.end_index = mark;
     const allocator = arena.allocator();
+    const regions = [2][]const u8{ input, arena.buffer };
+    const sink: WireSink = .{ .base = base, .memory = .{ .base = base, .regions = &regions }, .arena = arena };
     var deserializer = try Format.sliceDeserializer(allocator, input, format_cfg);
     defer deserializer.deinit(allocator);
     deserializer.can_borrow_strings = true;
-    const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
+    const value = try typed.deserializeInto(sink, T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
-    return try toWire(T, allocator, base, value);
+    return value;
 }
+
+/// Builds the fixed layout as the typed walk reads, for `typed.deserializeInto`: what `typed.TypedSink`
+/// does for the Zig value. Arrays are written into the arena at their exact size, and a span names them.
+pub const WireSink = struct {
+    base: usize,
+    memory: Memory,
+    arena: *std.heap.FixedBufferAllocator,
+
+    pub fn Of(comptime T: type) type {
+        return Wire(T);
+    }
+
+    pub fn scalar(_: WireSink, comptime T: type, value: T) !Wire(T) {
+        return if (comptime reflect.kindOf(T) == .bool) @intFromBool(value) else value;
+    }
+
+    pub fn text(self: WireSink, comptime _: type, bytes: []const u8) !Span {
+        return spanOf(self.base, bytes);
+    }
+
+    pub fn bytesOf(self: WireSink, comptime _: type, bytes: []const u8) !Span {
+        return spanOf(self.base, bytes);
+    }
+
+    /// The span of a list counts elements, not bytes.
+    pub fn list(self: WireSink, comptime T: type, items: []Wire(@typeInfo(T).pointer.child)) !Span {
+        const bytes = try spanOf(self.base, std.mem.sliceAsBytes(items));
+        return .{ .offset = bytes.offset, .len = @intCast(items.len) };
+    }
+
+    pub fn some(_: WireSink, comptime T: type, value: Wire(@typeInfo(T).optional.child)) !Wire(T) {
+        var out: Wire(T) = std.mem.zeroes(Wire(T));
+        out.present = 1;
+        out.value = value;
+        return out;
+    }
+
+    pub fn none(_: WireSink, comptime T: type) !Wire(T) {
+        return std.mem.zeroes(Wire(T));
+    }
+
+    pub fn enumOf(_: WireSink, comptime T: type, value: T) !Wire(T) {
+        return @intCast(@backingInt(value));
+    }
+
+    pub fn unionOf(_: WireSink, comptime T: type, comptime name: []const u8, payload: anytype) !Wire(T) {
+        var out: Wire(T) = std.mem.zeroes(Wire(T));
+        out.tag = variantIndex(T, name);
+        @field(out.payload, name) = payload;
+        return out;
+    }
+
+    pub fn unionVoid(_: WireSink, comptime T: type, comptime name: []const u8) !Wire(T) {
+        var out: Wire(T) = std.mem.zeroes(Wire(T));
+        out.tag = variantIndex(T, name);
+        return out;
+    }
+
+    pub fn fromDefault(self: WireSink, comptime T: type, allocator: Allocator, value: T) !Wire(T) {
+        return toWire(T, allocator, self.base, value);
+    }
+
+    /// A struct's `check` takes the typed struct, so it is rebuilt from the wire struct for the call, in
+    /// arena space that is handed back at once. A type without a `check` costs nothing.
+    pub fn check(self: WireSink, comptime T: type, allocator: Allocator, result: *const Wire(T)) anyerror!void {
+        if (comptime !@hasDecl(T, "check")) return;
+        const mark = self.arena.end_index;
+        defer self.arena.end_index = mark;
+        const view = try fromWire(T, allocator, self.memory, result.*);
+        try view.check();
+    }
+
+    /// Nothing is released: a decode that fails puts the arena back as it was.
+    pub fn free(_: WireSink, comptime _: type, _: Allocator, _: anytype, _: bool) void {}
+};
 
 /// Writes a wire value in `Format`, as the typed value it came from would be written: the same
 /// field order, keys, optional policy and determinism. The typed value is rebuilt in `arena`
@@ -573,7 +649,6 @@ const Cost = struct {
     scratch: u64 = 0,
     list_size: u64 = 0,
     list_align: u64 = 0,
-    list_wire: u64 = 0,
 
     fn plus(a: Cost, b: Cost) Cost {
         return .{
@@ -583,16 +658,7 @@ const Cost = struct {
             .scratch = @max(a.scratch, b.scratch),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
-            .list_wire = @max(a.list_wire, b.list_wire),
         };
-    }
-
-    /// The costs of one read and of the copy of the same items into the wire layout: what is spent per
-    /// item of the budget is spent twice (once as typed, once as wire).
-    fn together(typed_cost: Cost, wire_cost: Cost) Cost {
-        var out = typed_cost.plus(wire_cost);
-        out.lists.pool = typed_cost.lists.pool + wire_cost.lists.pool;
-        return out;
     }
 
     fn times(a: Cost, n: u64) Cost {
@@ -610,7 +676,6 @@ const Cost = struct {
             .scratch = @max(a.scratch, b.scratch),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
-            .list_wire = @max(a.list_wire, b.list_wire),
         };
     }
 };
@@ -691,14 +756,14 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 fn computeBound(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
     @setEvalBranchQuota(1_000_000);
     const limits = comptime limitsOf(Format, format_cfg);
-    const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0).together(wireOwned(T, .{}, serde_cfg, limits, 0));
+    const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0);
     const slack = 256;
     const items = limits.max_items;
 
     // Arrays of lists: from the fields, and, where the items are bounded, from the budget alone.
     var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", items, "the items of the input"));
     if (items) |budget| if (cost.list_size != 0) {
-        const per_item = listPerItem(budget, cost.list_size, cost.list_align, limits.strict) + cost.list_wire + 16;
+        const per_item = listPerItem(budget, cost.list_size, cost.list_align, limits.strict);
         lists = @min(lists, per_item * budget);
     };
 
@@ -763,15 +828,15 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             const Elem = @typeInfo(T).pointer.child;
             const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
             const element = typedOwned(Elem, elem_bounds, cfg, limits, depth + 1);
-            var own: Cost = .{ .list_size = @sizeOf(Elem), .list_align = @alignOf(Elem), .list_wire = if (isScalarList(Elem)) 0 else @sizeOf(Wire(Elem)) };
+            var own: Cost = .{ .list_size = @sizeOf(Wire(Elem)), .list_align = @alignOf(Wire(Elem)) };
             if (ownBound(bounds)) |n| {
-                own.lists.fixed = listBytes(n, @sizeOf(Elem), @alignOf(Elem), limits.strict);
+                own.lists.fixed = listBytes(n, @sizeOf(Wire(Elem)), @alignOf(Wire(Elem)), limits.strict);
                 break :blk own.plus(element.times(n));
             }
             // From the shared budget: each item costs its share of the array and what its own
             // element costs, and one item's worth of what a list nested in it costs.
             const items = bound("max_items", limits.max_items, "the items of the input");
-            own.lists.pool = listPerItem(items, @sizeOf(Elem), @alignOf(Elem), limits.strict) + element.lists.fixed;
+            own.lists.pool = listPerItem(items, @sizeOf(Wire(Elem)), @alignOf(Wire(Elem)), limits.strict) + element.lists.fixed;
             own.text.pool = element.text.fixed;
             break :blk own.plus(.{
                 .lists = .{ .pool = element.lists.pool },
@@ -796,39 +861,6 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             var most: Cost = .{};
             for (reflect.variants(T, cfg)) |variant| {
                 if (variant.type != void) most = most.most(typedOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
-            }
-            break :blk most;
-        },
-    };
-}
-
-/// What the copy into the wire layout allocates for one value of `T`: the arrays of its lists.
-fn wireOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) Cost {
-    if (depth > limits.max_depth) return .{};
-    return switch (comptime reflect.kindOf(T)) {
-        .bool, .int, .float, .byte_array, .@"enum", .text, .byte_string, .raw, .hook, .none => .{},
-        .list => blk: {
-            const Elem = @typeInfo(T).pointer.child;
-            if (isScalarList(Elem)) break :blk .{};
-            const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
-            const element = wireOwned(Elem, elem_bounds, cfg, limits, depth + 1);
-            if (ownBound(bounds)) |n| {
-                break :blk (Cost{ .lists = .{ .fixed = n * @sizeOf(Wire(Elem)) + 16 } }).plus(element.times(n));
-            }
-            break :blk .{ .lists = .{ .pool = @max(@sizeOf(Wire(Elem)) + 16 + element.lists.fixed, element.lists.pool) } };
-        },
-        .array => wireOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),
-        .optional => wireOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
-        .pointer => @compileError("a pointer has no wire layout: " ++ @typeName(T)),
-        .@"struct" => blk: {
-            var total: Cost = .{};
-            for (reflect.fields(T, cfg)) |field| total = total.plus(wireOwned(field.type, field.bounds, cfg, limits, depth + 1));
-            break :blk total;
-        },
-        .@"union" => blk: {
-            var most: Cost = .{};
-            for (reflect.variants(T, cfg)) |variant| {
-                if (variant.type != void) most = most.most(wireOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
             }
             break :blk most;
         },

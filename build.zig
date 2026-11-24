@@ -488,6 +488,9 @@ pub fn build(b: *std.Build) void {
     const run_bench_yaml = b.addRunArtifact(bench_exe);
     run_bench_yaml.addArg("yaml");
 
+    const run_bench_wire = b.addRunArtifact(bench_exe);
+    run_bench_wire.addArg("wire");
+
     const run_bench_wasm = b.addRunArtifact(bench_exe);
     run_bench_wasm.addArg("wasm");
 
@@ -526,6 +529,9 @@ pub fn build(b: *std.Build) void {
 
     const bench_zon_step = b.step("bench-zon", "Run ZON benchmark against std.zon");
     bench_zon_step.dependOn(&run_bench_zon.step);
+
+    const bench_wire_step = b.step("bench-wire", "Run the wire decode benchmark on the repository's own source");
+    bench_wire_step.dependOn(&run_bench_wire.step);
 
     const bench_wasm_step = b.step("bench-wasm", "Run WASM helper benchmark against the direct binary path");
     bench_wasm_step.dependOn(&run_bench_wasm.step);

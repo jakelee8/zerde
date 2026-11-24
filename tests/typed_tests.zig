@@ -3883,6 +3883,78 @@ test "a list of scalars is not copied into the wire layout" {
     try std.testing.expectEqual(@as(usize, 1764), wire.maxArenaSize(zerde.json, Scalars, .{}, .{}));
 }
 
+// ---- the wire decode is the typed walk, with no typed value between ---------------------------------------
+
+const WireChecked = struct {
+    lo: u8,
+    label: []const u8,
+    hi: u8 = 9,
+    tail: ?u8,
+    opts: []const ?u8,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .label = .{ .max_len = 8 }, .opts = .{ .max_len = 4 } } };
+
+    pub fn check(self: WireChecked) error{Invalid}!void {
+        if (self.lo > self.hi) return error.Invalid;
+    }
+};
+
+fn decodeChecked(arena: *std.heap.FixedBufferAllocator, region: *Region, input: []const u8) !wire.Wire(WireChecked) {
+    @memcpy(region.bytes[0..input.len], input);
+    return wire.decode(zerde.json, WireChecked, arena, region.base(), region.bytes[0..input.len], .{}, .{});
+}
+
+test "wire.decode applies the typed layer's rules: defaults, optionals, a struct's check, unknown, repeated and missing fields" {
+    var region: Region = .{};
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[1024..]);
+    // A default fills `hi`, an absent optional is absent.
+    const ok = try decodeChecked(&arena, &region, "{\"lo\":1,\"label\":\"x\",\"opts\":[]}");
+    try std.testing.expectEqual(@as(u8, 1), ok.lo);
+    try std.testing.expectEqual(@as(u8, 9), ok.hi);
+    try std.testing.expectEqual(@as(u8, 0), ok.tail.present);
+    try std.testing.expectEqualStrings("x", try region.memory().bytesOf(ok.label));
+    const named = try decodeChecked(&arena, &region, "{\"tail\":4,\"lo\":2,\"label\":\"y\",\"hi\":3,\"opts\":[]}");
+    try std.testing.expectEqual(@as(u8, 1), named.tail.present);
+    try std.testing.expectEqual(@as(u8, 4), named.tail.value);
+    try std.testing.expectEqual(@as(u8, 3), named.hi);
+
+    // `check` is the type's own, called on the struct as the typed layer would have built it (its list of optionals
+    // is rebuilt for the call), and its error is returned; the arena it rebuilt the struct in is handed back at
+    // once, so the decode holds the wire list only, and a failed decode puts the arena back as it was.
+    arena.reset();
+    const before = arena.end_index;
+    try std.testing.expectError(error.Invalid, decodeChecked(&arena, &region, "{\"lo\":10,\"label\":\"x\",\"opts\":[1,null]}"));
+    try std.testing.expectEqual(before, arena.end_index);
+    _ = try decodeChecked(&arena, &region, "{\"lo\":1,\"label\":\"x\",\"opts\":[1,null]}");
+    try std.testing.expectEqual(before + 2 * @sizeOf(wire.Opt(u8)), arena.end_index);
+
+    try std.testing.expectError(error.UnknownField, decodeChecked(&arena, &region, "{\"lo\":1,\"label\":\"x\",\"opts\":[],\"z\":1}"));
+    try std.testing.expectError(error.DuplicateField, decodeChecked(&arena, &region, "{\"lo\":1,\"lo\":2,\"label\":\"x\",\"opts\":[]}"));
+    try std.testing.expectError(error.MissingField, decodeChecked(&arena, &region, "{\"lo\":1,\"opts\":[]}"));
+    try std.testing.expectError(error.LengthOutOfBounds, decodeChecked(&arena, &region, "{\"lo\":1,\"label\":\"123456789\",\"opts\":[]}"));
+    try std.testing.expectError(error.LengthOutOfBounds, decodeChecked(&arena, &region, "{\"lo\":1,\"label\":\"x\",\"opts\":[1,1,1,1,1]}"));
+}
+
+const WireList = struct {
+    effects: []const WireEffect,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .effects = .{ .max_len = 8 } } };
+};
+
+test "a strict decode of a list of unions allocates the wire array and nothing else" {
+    const input = [_]u8{ 0xa1, 0x67, 'e', 'f', 'f', 'e', 'c', 't', 's', 0x83, 0x64, 'n', 'o', 'o', 'p', 0x64, 'n', 'o', 'o', 'p', 0x64, 'n', 'o', 'o', 'p' };
+    var region: Region = .{};
+    @memcpy(region.bytes[0..input.len], &input);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[1024..]);
+    const cfg = .{ .mode = zerde.cbor.Mode.strict, .max_items = 16, .max_string_len = 64 };
+    const w = try wire.decode(zerde.cbor, WireList, &arena, region.base(), region.bytes[0..input.len], .{}, cfg);
+    try std.testing.expectEqual(@as(u32, 3), w.effects.len);
+    // The three elements, at their wire size: no typed array before them (a typed `WireEffect` is larger than its
+    // wire form, and the decode used to hold both).
+    try std.testing.expectEqual(3 * @sizeOf(wire.Wire(WireEffect)), arena.end_index);
+    const effects = try region.memory().listOf(wire.Wire(WireEffect), w.effects);
+    for (effects) |effect| try std.testing.expectEqual(@as(u8, 2), effect.tag);
+    try std.testing.expect(arena.end_index <= comptime wire.maxArenaSize(zerde.cbor, WireList, .{}, cfg));
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;
@@ -4086,7 +4158,13 @@ test "integer keys, a Raw and bounds in a wire type, and their keys in the descr
     try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'k', 0x01 }, meta_bytes);
     // The raw span is the very bytes of the input: no copy, and the arena holds nothing for it.
     try std.testing.expect(@intFromPtr(meta_bytes.ptr) >= region.base() and @intFromPtr(meta_bytes.ptr) < region.base() + len);
-    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, Frame, &arena, region.base(), &.{ 0xa3, 0x00, 0x01, 0x01, 0xa0, 0x02, 0x64, 'a', 'b', 'c', 'd' }, .{}, cfg));
+    // A span must be reachable from the base, so the refused input lies in a region too (the field that is too
+    // long is read after `meta`, whose span is made as it is read).
+    const refused = [_]u8{ 0xa3, 0x00, 0x01, 0x01, 0xa0, 0x02, 0x64, 'a', 'b', 'c', 'd' };
+    var bad: Region = .{};
+    @memcpy(bad.bytes[0..refused.len], &refused);
+    var bad_arena = std.heap.FixedBufferAllocator.init(bad.bytes[refused.len..]);
+    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, Frame, &bad_arena, bad.base(), bad.bytes[0..refused.len], .{}, cfg));
     try std.testing.expect(wire.maxArenaSize(zerde.cbor, Frame, .{}, cfg) > 0);
 }
 
@@ -4490,7 +4568,7 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     };
     // Worked by hand: a list of ten 8-byte rows grows through one capacity of 17 (17 * 8 + 3 bytes), is copied to
     // its exact size (83) and its wire array is 10 * 8 + 16; and the slack is 256.
-    try std.testing.expectEqual(@as(usize, 139 + 83 + 96 + 256), wire.maxArenaSize(zerde.json, Rows, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 139 + 83 + 256), wire.maxArenaSize(zerde.json, Rows, .{}, .{}));
     // A string of at most 100 bytes costs 100 and, while it is built, 50 + 128 more; with an input of 10 bytes
     // the strings hold at most 20, and one is built from at most 10 bytes: 5 + 128 more.
     try std.testing.expectEqual(@as(usize, 100 + 178 + 256), wire.maxArenaSize(zerde.json, Text, .{}, .{}));
@@ -4510,8 +4588,8 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     try std.testing.expectEqual(@as(usize, 24751), wire.maxArenaSize(zerde.cbor, Raws, .{}, .{ .max_depth = 4 }));
     // Lists with no bound of their own share the one budget of 100 items, whatever the nesting.
     // (4 + 128 more for the one string being built, and each item's wire array: 8 + 16 bytes).
-    try std.testing.expectEqual(@as(usize, 9756 + 132 + 24 * 100), wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
-    try std.testing.expect(wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756 + 132 + 24 * 100);
+    try std.testing.expectEqual(@as(usize, 8688), wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
+    try std.testing.expect(wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 8688);
     // Lists of lists with bounds of their own multiply: three lists of at most four rows each.
     const Nest = struct {
         rows: []const []const Row,
@@ -4531,14 +4609,14 @@ test "arena bound figures, from small schemas, for the parts of the model" {
         xs: []const u32,
         pub const serde = .{ .deny_unknown_fields = true };
     };
-    // By hand: the outer list 151 + 55 and its wire array 3 * 8 + 16; each of the three inner lists 139 + 35 and 4 * 8 + 16.
-    try std.testing.expectEqual(@as(usize, 206 + 40 + 3 * 174 + 3 * 48 + 256), wire.maxArenaSize(zerde.json, Nest, .{}, .{}));
+    // By hand: the outer list of 8-byte wire spans, 139 + 27; each of the three inner lists of 8-byte rows, 139 + 35.
+    try std.testing.expectEqual(@as(usize, 166 + 3 * 174 + 256), wire.maxArenaSize(zerde.json, Nest, .{}, .{}));
     // The budget alone, per item: a list of one element costs (142 for 33 u32s grown to and copied) over two items.
     try std.testing.expectEqual(@as(usize, 71 * 100 + 256), wire.maxArenaSize(zerde.json, Ints, .{}, .{ .max_items = 100 }));
-    // Charged per item: 87 for the array of 16-byte lists over two items, 8 + 16 for its wire array: 111 an item.
-    try std.testing.expectEqual(@as(usize, 111 * 100 + 256), wire.maxArenaSize(zerde.json, Drawn, .{}, .{ .max_items = 100 }));
-    // Strings in a list with a max_len and elem bounds: five of at most twenty bytes.
-    try std.testing.expectEqual(@as(usize, 650 + 138), wire.maxArenaSize(zerde.json, Times, .{}, .{}));
+    // Charged per item: the array of 8-byte wire lists, grown and copied, over the items of the budget: 75 an item.
+    try std.testing.expectEqual(@as(usize, 75 * 100 + 256), wire.maxArenaSize(zerde.json, Drawn, .{}, .{ .max_items = 100 }));
+    // Strings in a list with a max_len and elem bounds: five of at most twenty bytes (the list of 8-byte spans grows through 139 and is copied to 43; 182 in all).
+    try std.testing.expectEqual(@as(usize, 182 + 100 + 138 + 256), wire.maxArenaSize(zerde.json, Times, .{}, .{}));
 }
 
 test "a long string that is rewritten fits an arena of exactly the bound, while its buffer grows and after" {
@@ -4775,20 +4853,20 @@ test "figures for a strict read, and for a union variant that holds a bounded li
     // Nothing is rewritten and each list is allocated once, at its exact size: 10 * 8 + 3, the wire array 10 * 8 + 16.
     try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Text, .{}, strict_cfg));
     try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Blob3, .{}, strict_cfg));
-    try std.testing.expectEqual(@as(usize, 83 + 96 + 256), wire.maxArenaSize(zerde.cbor, Rows, .{}, strict_cfg));
+    try std.testing.expectEqual(@as(usize, 83 + 256), wire.maxArenaSize(zerde.cbor, Rows, .{}, strict_cfg));
     // A strict list that draws on the budget costs its size and alignment per item.
     const Drawn = struct {
         xs: []const []const u8,
         pub const serde = .{ .deny_unknown_fields = true };
     };
-    try std.testing.expectEqual(@as(usize, (16 + 8 + 8 + 16) * 10 + 256), wire.maxArenaSize(zerde.cbor, Drawn, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 10 }));
+    try std.testing.expectEqual(@as(usize, (8 + 4) * 10 + 256), wire.maxArenaSize(zerde.cbor, Drawn, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 10 }));
     // A variant with a list of its own bound: typed 139 + 35, wire 4 * 8 + 16, with no budget needed.
     const Pick = union(enum) {
         rows: []const Row,
         none,
         pub const serde = .{ .fields = .{ .rows = .{ .max_len = 4 } } };
     };
-    try std.testing.expectEqual(@as(usize, 139 + 35 + 48 + 256), wire.maxArenaSize(zerde.json, Pick, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 139 + 35 + 256), wire.maxArenaSize(zerde.json, Pick, .{}, .{}));
 }
 
 test "the bound is computed in 64 bits, so limits that overflow a 32-bit usize do not stop it" {
