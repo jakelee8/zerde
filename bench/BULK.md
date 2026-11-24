@@ -17,6 +17,25 @@ and a byte-wise loop.
 61 bytes) and `multibyte` (the euro sign repeated). Three operations: UTF-8 validation, escaping as the
 characters of a JSON string, and finding the next byte a JSON string cannot hold as it is.
 
+## 2026-11-24 - ad684a0
+
+Changes since previous run: the JSON value writer no longer measures a key, text or byte string (`escapedLen`, a second scan of
+the whole string) when `max_container_bytes` is unbounded, the default. The only row that writes through it is the render
+of a long ASCII text; the scans above are unchanged code. Measured on the same machine (a Linux x86_64 container, Zig 0.17.1,
+`zig build bench-bulk -Doptimize=ReleaseFast` under the executor lock), `dfe52b1` (before) against the tree with this change
+(after), one run each in turn; the first run of `dfe52b1` was not kept, so it has two runs.
+
+| Run | before: trusted ns | before: checked ns | after: trusted ns | after: checked ns |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | not kept | not kept | 35008 | 48132 |
+| 2 | 61026 | 61594 | 38999 | 50421 |
+| 3 | 46993 | 59585 | 35739 | 50828 |
+
+Each is ns for one render of the 270 KiB ASCII text, from strict CBOR into the JSON value writer ("cbor to json render, trusted
+vs checked" in the output; trusted skips the UTF-8 check on the way in and out). The run-to-run spread of the unchanged code
+is large (the other rows of the same runs moved by up to 20%), so the figures show the direction, not a ratio. A render of
+unicode text, which the gateway's `bench/room-guard.mjs` measures, is not a row of this benchmark and was not measured here.
+
 ## 2026-11-23 - dbbe32f
 
 Changes since previous run: first entry. `bulk.validUtf8` is the standard library's validator where that skips
