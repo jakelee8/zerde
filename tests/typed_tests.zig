@@ -5066,3 +5066,45 @@ test "a key read without allocating is as strictly checked as one that is alloca
     const ok = try zerde.json.parseSliceWith(Holder5, allocator, "{\"u\":{\"\\u0061\\u0062\\u0063\\u0064\":7}}", .{}, .{ .max_string_len = 4 });
     try std.testing.expectEqual(@as(u8, 7), ok.u.abcd);
 }
+
+test "a key no field declares is refused as it is read, and allocates nothing" {
+    const bound = comptime wire.maxArenaSize(zerde.cbor, Tiny200, .{}, .{});
+    try std.testing.expectEqual(@as(usize, 256), bound);
+    // Chunked, 1000 bytes: no buffer of its own, and not recorded.
+    var chunked: std.ArrayList(u8) = .empty;
+    defer chunked.deinit(allocator);
+    try chunked.appendSlice(allocator, &.{ 0xa1, 0x7f });
+    for (0..1000) |_| try chunked.appendSlice(allocator, &.{ 0x61, 'z' });
+    try chunked.appendSlice(allocator, &.{ 0xff, 0x01 });
+    try std.testing.expectError(error.UnknownField, decodeWithin(zerde.cbor, Tiny200, bound, chunked.items, .{}));
+    // Definite and integer keys likewise, and a key past max_string_len keeps its own error.
+    // (In an arena of 16 bytes, under the 24 a record of the key would take.)
+    try std.testing.expectError(error.UnknownField, decodeWithin(zerde.cbor, Tiny200, 16, &.{ 0xa1, 0x63, 'z', 'z', 'z', 0x01 }, .{}));
+    try std.testing.expectError(error.UnknownField, decodeWithin(zerde.cbor, Tiny200, 16, &.{ 0xa1, 0x05, 0x01 }, .{}));
+    try std.testing.expectError(error.StringTooLong, decodeWithin(zerde.cbor, Tiny200, bound, chunked.items, .{ .max_string_len = 100 }));
+    // Where members are not denied the key is checked and recorded as before: a repeated unknown key is refused.
+    const Open = struct {
+        a: u8,
+    };
+    try std.testing.expectError(error.DuplicateField, zerde.cbor.parseSlice(Open, allocator, &.{ 0xa3, 0x7f, 0x61, 'z', 0xff, 0x01, 0x7f, 0x61, 'z', 0xff, 0x02, 0x61, 'a', 0x03 }));
+    try std.testing.expectError(error.InvalidUtf8, zerde.cbor.parseSlice(Open, allocator, &.{ 0xa2, 0x61, 0xff, 0x01, 0x61, 'a', 0x03 }));
+}
+
+test "an escaped string ends at max_string_len, and a long key is no name, in JSON" {
+    const Short = union(enum) {
+        ab: u8,
+        abcd: u8,
+    };
+    const Holder6 = struct {
+        u: Short,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // The run after the last escape is what takes the key over the limit.
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceWith(Holder6, allocator, "{\"u\":{\"\\u0061bcd\":7}}", .{}, .{ .max_string_len = 3 }));
+    const exact = try zerde.json.parseSliceWith(Holder6, allocator, "{\"u\":{\"\\u0061bcd\":7}}", .{}, .{ .max_string_len = 4 });
+    try std.testing.expectEqual(@as(u8, 7), exact.u.abcd);
+    // The characters that fit are not a name when more follow: "abcd" then "e" is not "abcd".
+    try std.testing.expectError(error.InvalidEnumTag, zerde.json.parseSlice(Holder6, allocator, "{\"u\":{\"ab\\u0063\\u0064\\u0065\":7}}"));
+    const matched = try zerde.json.parseSlice(Holder6, allocator, "{\"u\":{\"ab\\u0063\\u0064\":7}}");
+    try std.testing.expectEqual(@as(u8, 7), matched.u.abcd);
+}

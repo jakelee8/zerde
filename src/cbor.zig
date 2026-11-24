@@ -743,6 +743,9 @@ pub fn CborDeserializer(comptime Config: type) type {
         }
 
         fn lookupKey(self: *Self, comptime T: type, comptime cfg: anytype, start: usize) !ObjectFieldLookup {
+            // A key no field declares is an error where unknown members are denied and nothing collects them,
+            // so it is neither checked nor recorded: the typed layer refuses it next.
+            const refused = comptime meta.effectiveDenyUnknownFields(T, cfg) and meta.extrasField(T) == null;
             const header = try self.nextHead();
             switch (header.major) {
                 3 => {
@@ -752,6 +755,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                         if (header.value > self.max_string_len) return error.StringTooLong;
                         const raw = try self.takeBytes(header.value);
                         if (typed.matchStructFieldIndex(T, cfg, raw)) |index| return .{ .field_index = index };
+                        if (refused) return .unknown;
                         if (!self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
                         try self.recordText(.{ .bytes = raw, .allocated = false });
                         return .unknown;
@@ -765,6 +769,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                         .text => |bytes| if (typed.matchStructFieldIndex(T, cfg, bytes)) |index| return .{ .field_index = index },
                         .long => {},
                     }
+                    if (refused) return .unknown;
                     self.index = resume_at;
                     const token = try self.finishString(self.allocator, header);
                     defer token.deinit(self.allocator);
@@ -774,6 +779,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 0, 1 => {
                     const value: i128 = if (header.major == 0) header.value else -@as(i128, header.value) - 1;
                     if (typed.matchStructFieldIndexInteger(T, cfg, value)) |index| return .{ .field_index = index };
+                    if (refused) return .unknown;
                     try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
                     return .unknown;
                 },

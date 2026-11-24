@@ -433,8 +433,8 @@ A map key or string that is only compared with names a type declares (a union's 
 names) is read without allocating, in CBOR and JSON: the format hands the typed layer the bytes (the input's own, or
 the chunks or unescaped characters joined in a stack buffer as long as the longest declared name), and a key longer than
 every name is `.long`, read to its end and checked, and no name. `readStringShort`, `nextObjectKeyShort` and, in JSON,
-`nextObjectFieldIndex` do it. A key that no field declares is allocated only for the repeated-key check of a read that
-accepts unknown members, and for `extras`.
+`nextObjectFieldIndex` do it. A key that no field declares is allocated only for the repeated-key check of a CBOR read that
+accepts unknown members (not under `deny_unknown_fields` without `extras`, where it is refused as it is read), and for `extras`.
 
 ### Raw items
 

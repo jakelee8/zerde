@@ -426,6 +426,12 @@ MUTANTS = [
     ("json.zig", "            parser.index = self.last_key;", "            parser.index = 0;"),
     ("typed.zig", "                        .long => false,\n                    };\n                    if (FieldType != void and matches) {", "                        .long => true,\n                    };\n                    if (FieldType != void and matches) {"),
     ("typed.zig", "            if (try nextUnionKey(deserializer, allocator, cap, &extra_buffer)) |extra| {\n                extra.deinit(allocator);\n                return error.LengthMismatch;\n            }", "            _ = &extra_buffer;"),
+    ("cbor.zig", "            const refused = comptime meta.effectiveDenyUnknownFields(T, cfg) and meta.extrasField(T) == null;", "            const refused = false;"),
+    ("cbor.zig", "                        if (refused) return .unknown;\n                        if (!self.trusted_text", "                        if (!self.trusted_text"),
+    ("cbor.zig", "                    if (refused) return .unknown;\n                    self.index = resume_at;", "                    self.index = resume_at;"),
+    ("cbor.zig", "                    if (refused) return .unknown;\n                    try self.keys.append", "                    try self.keys.append"),
+    ("json.zig", "                    if (c == '\"') {\n                        if (total > self.max_string_len) return error.StringTooLong;\n                        return if (long) .long else .{ .text = buffer[0..length] };", "                    if (c == '\"') {\n                        return if (long) .long else .{ .text = buffer[0..length] };"),
+    ("json.zig", "                        return if (long) .long else .{ .text = buffer[0..length] };", "                        return .{ .text = buffer[0..length] };"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

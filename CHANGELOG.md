@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- changed (CBOR): under `deny_unknown_fields` without `extras`, a struct key no field declares is refused as it is read, without being checked or recorded (a chunked one was allocated)
 - changed: a union's key, a bare variant name, an enum's name and (in JSON) a struct's field name are matched where they are read, into a stack buffer as long as the longest declared name, and are not allocated: an escaped JSON key or a chunked CBOR key used to be allocated and stranded in the arena behind its payload (`readStringShort`, `nextObjectKeyShort`, JSON `nextObjectFieldIndex` and `unknownKey`); `cbor.nextObjectKey` and `typed.ObjectKey` are gone. `maxArenaSize` has no term for union keys (the previous round's open-union charge is removed, and with it the open_unions and name_len fields)
 - changed (`zerde.wire.maxArenaSize`): it takes the `Format` first, like `decode`, so a strict CBOR config is strict only for CBOR (`mode` is a compile error for another format; a JSON read with it had no text charged and could run out of arena); limits absent from the config are `null`, not a target-dependent sentinel
 - fixed (`zerde.wire.maxArenaSize`): a CBOR read keeps a key record per open union map, now charged (eight nested unions ran out of an arena of exactly the bound); a type that recurses is charged down to `max_depth`; `Wire` refuses a pointer, which sent the compiler into endless recursion on a recursive type
