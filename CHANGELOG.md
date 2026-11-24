@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added `trusted_text` to the CBOR and JSON read and write configs: skip the UTF-8 check of text for an item that is known to be valid (escapes, control characters, mode and limits are still checked); `bench/BULK.md` has the cost it removes
 - changed: a write checks every `Raw` and extras value it puts out as it is (well-formed, UTF-8, nesting), and a deterministic CBOR write refuses one that is not deterministic; added `cbor.canonicalize` (the deterministic form of an item) and `cbor.validate`; the encode hook `Encoder` now enforces its stated lengths, the nesting bound, UTF-8, raw items and, in a deterministic write, ascending keys, and has `finish`
 - fixed: the CBOR text writer and the JSON string writer refuse text that is not UTF-8, as the readers do
 - fixed: `parseSliceAliasedWith` ignored the read configuration but `max_input_bytes`

@@ -454,3 +454,10 @@ JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteF
 forbids them in CBOR sets `ReadConfig.refuse_non_finite`: any NaN or infinity, in a field, a skipped
 value or a key, is then `error.NonFiniteFloat`.
 
+`trusted_text = true` (a `ReadConfig` field of both formats) skips the UTF-8 check of text and keys, for an item that has
+been checked once already, such as plaintext this library wrote and a store authenticated. Everything else is still
+checked: escapes, control characters, the mode, the limits. `WriteConfig.trusted_text` skips the check a writer makes of text
+on the way out (`error.InvalidUtf8`) for typed strings, the value writers and the hook encoders, so a render of text read
+under a trusted read does not check it twice. With either set, bytes that are not UTF-8 pass as text, so never set one for
+input that has not been checked: the output of a write that skipped the check may not read back. A `Raw` is still checked in
+full when it is written. Measured in `bench/BULK.md`: it saves the check, which is small natively, not the escape scan.
