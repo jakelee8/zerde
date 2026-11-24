@@ -3664,7 +3664,7 @@ const wire_read_cfg = .{ .max_string_len = 64, .max_items = 256 };
 
 /// A region that holds the input and the arena, so every span is an offset into it from its start.
 const Region = struct {
-    bytes: [16384]u8 align(16) = undefined,
+    bytes: [65536]u8 align(16) = undefined,
     parts: [1][]const u8 = undefined,
 
     fn base(self: *Region) usize {
@@ -3766,7 +3766,7 @@ fn expectSampleDecoded(mem: wire.Memory, w: wire.Wire(WireMsg)) !void {
     try std.testing.expectEqualStrings("n", try mem.bytesOf(put.note.value));
     try std.testing.expectEqual(@as(u8, 7), put.level);
     try std.testing.expectEqual(@as(f32, 0.5), put.ratio);
-    try std.testing.expect(put.flag);
+    try std.testing.expectEqual(@as(u8, 1), put.flag);
     try std.testing.expectEqual(@as(u8, 1), effects[1].tag);
     try std.testing.expectEqualStrings("gone", try mem.bytesOf(effects[1].payload.delete));
     try std.testing.expectEqual(@as(u8, 2), effects[2].tag);
@@ -3878,8 +3878,9 @@ test "a list of scalars is not copied into the wire layout" {
     const back = try wire.fromWire([]const u32, none.allocator(), .{ .base = @intFromPtr(&values), .regions = &.{std.mem.sliceAsBytes(&values)} }, span);
     try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(back.ptr));
     try std.testing.expectEqual(@as(usize, 0), none.end_index);
-    // And the arena bound counts only the typed array: (3 * n + 64) * size + 40 * alignment, and the slack.
-    try std.testing.expectEqual(@as(usize, (3 * 100 + 64) * 4 + 40 * 4 + 256), wire.maxArenaSize(Scalars, .{}, .{}));
+    // And the arena bound counts only the typed array: the capacities an array list grows through (33, 83 and 158 items
+    // of 4 bytes, each with up to 3 bytes of alignment), the copy to its exact size, and the slack.
+    try std.testing.expectEqual(@as(usize, 1764), wire.maxArenaSize(Scalars, .{}, .{}));
 }
 
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
@@ -4127,4 +4128,406 @@ test "a wire type of a wide schema needs no comptime branch quota from the calle
     defer out.deinit();
     try wire.encode(zerde.json, QuotaResponse, &arena, region.memory(), w, &out.writer, .{}, .{});
     try std.testing.expectEqualStrings(input, out.written());
+}
+
+// ---- the arena bound against adversarial input; bools; limits while a JSON string is read --------------------------
+
+/// Decodes `input` into an arena of exactly `bound` bytes, placed after the input, and says how much it took.
+fn decodeWithin(comptime Format: type, comptime T: type, comptime bound: usize, input: []const u8, comptime format_cfg: anytype) !usize {
+    const region = try allocator.alignedAlloc(u8, .@"16", input.len + bound);
+    defer allocator.free(region);
+    @memcpy(region[0..input.len], input);
+    var arena = std.heap.FixedBufferAllocator.init(region[input.len..]);
+    _ = try wire.decode(Format, T, &arena, @intFromPtr(region.ptr), region[0..input.len], .{}, format_cfg);
+    return arena.end_index;
+}
+
+test "a JSON string over its max_len is LengthOutOfBounds, not an arena that ran out" {
+    const Capped = struct {
+        t: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .t = .{ .max_len = 4 } } };
+    };
+    const cfg = .{ .max_string_len = 4096, .max_items = 16 };
+    const bound = comptime wire.maxArenaSize(Capped, .{}, cfg);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "{\"t\":\"");
+    for (0..3000) |_| try input.appendSlice(allocator, "\\n");
+    try input.appendSlice(allocator, "\"}");
+    try std.testing.expectError(error.LengthOutOfBounds, decodeWithin(zerde.json, Capped, bound, input.items, cfg));
+    // The typed read says the same without an arena of any size.
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSlice(Capped, allocator, input.items));
+    // Within the bound, escaped, it reads.
+    _ = try decodeWithin(zerde.json, Capped, bound, "{\"t\":\"\\n\\n\\n\\n\"}", cfg);
+    try std.testing.expectError(error.LengthOutOfBounds, decodeWithin(zerde.json, Capped, bound, "{\"t\":\"\\n\\n\\n\\n\\n\"}", cfg));
+    // A field with no max_len keeps the config's limit and its error.
+    const Free = struct { t: []const u8 };
+    try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceWith(Free, allocator, input.items, .{}, .{ .max_string_len = 100 }));
+    // Bytes in base64: the bound is on the decoded bytes, and the token is a third longer.
+    const BlobBound = struct {
+        b: zerde.ByteString,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .b = .{ .max_len = 6 } } };
+    };
+    const six = try zerde.json.parseSliceWith(BlobBound, allocator, "{\"b\":\"AAECAwQF\"}", .{}, .{ .bytes = .base64 });
+    defer zerde.free(allocator, six);
+    try std.testing.expectEqual(@as(usize, 6), six.b.bytes.len);
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSliceWith(BlobBound, allocator, "{\"b\":\"AAECAwQFBg==\"}", .{}, .{ .bytes = .base64 }));
+    var long_blob: std.ArrayList(u8) = .empty;
+    defer long_blob.deinit(allocator);
+    try long_blob.appendSlice(allocator, "{\"b\":\"");
+    for (0..2000) |_| try long_blob.appendSlice(allocator, "AAAA");
+    try long_blob.appendSlice(allocator, "\"}");
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSliceWith(BlobBound, allocator, long_blob.items, .{}, .{ .bytes = .base64 }));
+}
+
+test "nested lists share the max_items budget, and the bound holds for the input that spends it all" {
+    const Nested = struct {
+        grid: []const []const u32,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const cfg = .{ .max_items = 256, .max_string_len = 64 };
+    const bound = comptime wire.maxArenaSize(Nested, .{}, cfg);
+    // One budget, not one per level: well under the per-level product (256 * (3 * 256 + 32) * 4 = 800 KB).
+    try std.testing.expect(bound < 40_000);
+    try std.testing.expect(bound > 8_000);
+    // Worst shapes: every item a list of one, one list of all the items, and in between.
+    inline for (.{ 1, 3, 20, 120 }) |per_list| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        try input.appendSlice(allocator, "{\"grid\":[");
+        // Each list is one item and so is each number: 256 items in the whole input, counting the object and its key.
+        var items: usize = 3;
+        var first = true;
+        while (items + 1 + per_list <= 256) : (items += 1 + per_list) {
+            if (!first) try input.append(allocator, ',');
+            first = false;
+            try input.append(allocator, '[');
+            for (0..per_list) |k| {
+                if (k != 0) try input.append(allocator, ',');
+                try input.append(allocator, '7');
+            }
+            try input.append(allocator, ']');
+        }
+        try input.appendSlice(allocator, "]}");
+        const used = try decodeWithin(zerde.json, Nested, bound, input.items, cfg);
+        try std.testing.expect(used <= bound);
+    }
+    // One more item than the budget is refused by the reader, not by the arena.
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(allocator);
+    try over.appendSlice(allocator, "{\"grid\":[[");
+    for (0..260) |k| {
+        if (k != 0) try over.append(allocator, ',');
+        try over.append(allocator, '1');
+    }
+    try over.appendSlice(allocator, "]]}");
+    try std.testing.expectError(error.TooManyItems, decodeWithin(zerde.json, Nested, bound, over.items, cfg));
+    // A field with its own max_len is charged in full per element, and still bounded.
+    const Own = struct {
+        rows: []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 3, .elem = .{ .max_len = 5 } } } };
+    };
+    const own_bound = comptime wire.maxArenaSize(Own, .{}, .{ .max_string_len = 64, .max_items = 64 });
+    _ = try decodeWithin(zerde.json, Own, own_bound, "{\"rows\":[\"\\n\\n\\n\\n\\n\",\"\\t\\t\\t\\t\\t\",\"\\r\\r\\r\\r\\r\"]}", .{ .max_string_len = 64, .max_items = 64 });
+}
+
+test "the bound holds for a raw item built to cost the reader most" {
+    const Held = struct {
+        meta: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .meta = .{ .max_len = 600 } } };
+    };
+    const cfg = .{ .max_depth = 16, .max_items = 100_000, .max_string_len = 600 };
+    const bound = comptime wire.maxArenaSize(Held, .{}, cfg);
+    // A map whose key is a map whose key is a map...: each level is a key holding the one inside it, and
+    // so is recorded in canonical form again at every level. `a1 <key> 00` is four bytes more per level.
+    var item: std.ArrayList(u8) = .empty;
+    defer item.deinit(allocator);
+    const levels = 14;
+    for (0..levels) |_| try item.appendSlice(allocator, &.{0xa1});
+    try item.appendSlice(allocator, &.{ 0x61, 'k' });
+    for (0..levels) |_| try item.appendSlice(allocator, &.{0x00});
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x64, 'm', 'e', 't', 'a' });
+    try input.appendSlice(allocator, item.items);
+    const used = try decodeWithin(zerde.cbor, Held, bound, input.items, cfg);
+    try std.testing.expect(used <= bound);
+    // Many small maps in one item: the records, not the key bytes.
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(allocator);
+    try wide.appendSlice(allocator, &.{ 0xa1, 0x64, 'm', 'e', 't', 'a', 0x99, 0x00, 0x60 });
+    for (0..96) |_| try wide.appendSlice(allocator, &.{ 0xa1, 0x00, 0x00 });
+    // 96 maps of one entry in an array of 96: 0x99 0x00 0x60 is 96 items.
+    const used_wide = try decodeWithin(zerde.cbor, Held, bound, wide.items, cfg);
+    try std.testing.expect(used_wide <= bound);
+    // Over the field's max_len is refused by the field, before the reader records anything.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(allocator);
+    try big.appendSlice(allocator, &.{ 0xa1, 0x64, 'm', 'e', 't', 'a', 0x99, 0x01, 0xf4 });
+    for (0..500) |_| try big.appendSlice(allocator, &.{ 0xa1, 0x00, 0x00 });
+    try std.testing.expectError(error.LengthOutOfBounds, decodeWithin(zerde.cbor, Held, bound, big.items, cfg));
+}
+
+test "a union is charged at its worst variant, and a variant that fails halfway leaves the arena as it was" {
+    const Light = struct {
+        n: u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const HeavyBound = struct {
+        rows: []const WireRecord,
+        text: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 2 }, .text = .{ .max_len = 8 } } };
+    };
+    const Choice = union(enum) {
+        heavy: HeavyBound,
+        light: Light,
+        plain,
+    };
+    const Picks = struct {
+        picks: []const Choice,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .picks = .{ .max_len = 3 } } };
+    };
+    const cfg = .{ .max_string_len = 64, .max_items = 256 };
+    const bound = comptime wire.maxArenaSize(Picks, .{}, cfg);
+    // The heaviest variant, three times, with every string escaped.
+    const record = "{\"key\":\"\\n\\n\",\"kind\":\"\\t\\t\",\"revision\":1,\"meta\":\"\\r\",\"level\":7,\"ratio\":1.5,\"flag\":true}";
+    const heavy = "{\"heavy\":{\"rows\":[" ++ record ++ "," ++ record ++ "],\"text\":\"\\n\\n\\n\\n\\n\\n\\n\\n\"}}";
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "{\"picks\":[" ++ heavy ++ "," ++ heavy ++ "," ++ heavy ++ "]}");
+    const used = try decodeWithin(zerde.json, Picks, bound, input.items, cfg);
+    try std.testing.expect(used <= bound);
+    // A variant that fails after it allocated: the next decode in the same arena starts where this one did.
+    var region: Region = .{};
+    const bad = "{\"picks\":[" ++ heavy ++ ",{\"heavy\":{\"rows\":[],\"text\":\"toolongtext\"}}]}";
+    @memcpy(region.bytes[0..bad.len], bad);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[bad.len..][0..bound]);
+    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.json, Picks, &arena, region.base(), region.bytes[0..bad.len], .{}, cfg));
+    try std.testing.expectEqual(@as(usize, 0), arena.end_index);
+    // Two variants in one object, a variant named twice, and an unknown variant: errors, with the same restore.
+    inline for (.{ "{\"picks\":[{\"light\":{\"n\":1},\"plain\":null}]}", "{\"picks\":[{\"light\":{\"n\":1},\"light\":{\"n\":2}}]}", "{\"picks\":[{\"nope\":1}]}" }) |text| {
+        @memcpy(region.bytes[0..text.len], text);
+        try std.testing.expect(std.meta.isError(wire.decode(zerde.json, Picks, &arena, region.base(), region.bytes[0..text.len], .{}, cfg)));
+        try std.testing.expectEqual(@as(usize, 0), arena.end_index);
+    }
+}
+
+test "a bool on the wire is 0 or 1, and anything else is refused, alone or in a list" {
+    const Flags = struct { flag: bool, flags: []const bool, pair: [2]bool };
+    try std.testing.expect(wire.Wire(bool) == u8);
+    var region: Region = .{};
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[256..]);
+    const mem = region.memory();
+    const good = try wire.toWire(Flags, arena.allocator(), mem.base, .{ .flag = true, .flags = &.{ true, false, true }, .pair = .{ false, true } });
+    try std.testing.expectEqual(@as(u8, 1), good.flag);
+    try std.testing.expectEqual(@as([2]u8, .{ 0, 1 }), good.pair);
+    const back = try wire.fromWire(Flags, arena.allocator(), mem, good);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true }, back.flags);
+    // A byte that is neither, in each place a bool can be.
+    var bad = good;
+    bad.flag = 2;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, arena.allocator(), mem, bad));
+    bad = good;
+    bad.pair[1] = 7;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, arena.allocator(), mem, bad));
+    const list = try wire.Memory.resolve(mem, good.flags, 1, 1);
+    @constCast(list)[1] = 2;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, arena.allocator(), mem, good));
+    // And through encode: nothing is written for it that a reader would take for a bool.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var scratch: [512]u8 = undefined;
+    var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
+    try std.testing.expectError(error.InvalidTag, wire.encode(zerde.json, Flags, &scratch_arena, mem, good, &out.writer, .{}, .{}));
+}
+
+// ---- the arena bound is within a small factor of the worst the input can cost ------------------------------------
+
+fn Request(comptime R: type) type {
+    const Effect = struct {
+        key: zerde.ByteString,
+        record_type: []const u8,
+        payload: zerde.ByteString,
+        meta: R,
+        note: ?zerde.ByteString = null,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+            .key = .{ .max_len = 1024 },
+            .record_type = .{ .min_len = 1, .max_len = 63 },
+            .payload = .{ .max_len = 262144 },
+            .meta = .{ .max_len = 16384 },
+            .note = .{ .optional = .absent, .max_len = 16384 },
+        } };
+    };
+    return struct {
+        effects: []const Effect,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .effects = .{ .max_len = 64 } } };
+    };
+}
+
+test "a CBOR request's bound is small next to its field bounds, and holds for chunked strings and nested raw keys" {
+    const Req = Request(zerde.cbor.Raw);
+    const cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .max_depth = 16 };
+    const bound = comptime wire.maxArenaSize(Req, .{}, cfg);
+    // The fields alone allow 64 effects of 262144 + 16384 + ... bytes: tens of megabytes. The input is 32 KiB.
+    // Chunked text everywhere, as many chunks as the input holds: each string is assembled in the arena.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x67, 'e', 'f', 'f', 'e', 'c', 't', 's', 0x98, 64 });
+    for (0..64) |_| {
+        try input.appendSlice(allocator, &.{ 0xa4, 0x63, 'k', 'e', 'y', 0x5f, 0x41, 1, 0x41, 2, 0xff });
+        try input.appendSlice(allocator, &.{ 0x6b, 'r', 'e', 'c', 'o', 'r', 'd', '_', 't', 'y', 'p', 'e', 0x7f, 0x61, 'a', 0x61, 'b', 0xff });
+        try input.appendSlice(allocator, &.{ 0x67, 'p', 'a', 'y', 'l', 'o', 'a', 'd', 0x5f, 0x41, 1, 0xff });
+        try input.appendSlice(allocator, &.{ 0x64, 'm', 'e', 't', 'a', 0xa0 });
+    }
+    const used = try decodeWithin(zerde.cbor, Req, bound, input.items, cfg);
+    try std.testing.expect(used <= bound);
+    // One effect whose raw meta is a chain of maps used as keys, as deep as the config allows.
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(allocator);
+    try deep.appendSlice(allocator, &.{ 0xa1, 0x67, 'e', 'f', 'f', 'e', 'c', 't', 's', 0x81, 0xa4, 0x63, 'k', 'e', 'y', 0x41, 1, 0x6b, 'r', 'e', 'c', 'o', 'r', 'd', '_', 't', 'y', 'p', 'e', 0x61, 'a', 0x67, 'p', 'a', 'y', 'l', 'o', 'a', 'd', 0x41, 1, 0x64, 'm', 'e', 't', 'a' });
+    // meta = { K(0): 0 } with K(i) = { K(i + 1): 0 } and, innermost, a map of 3000 entries: every level's key holds all
+    // of that, so it is recorded in canonical form again at each of the levels the config allows.
+    var level: std.ArrayList(u8) = .empty;
+    defer level.deinit(allocator);
+    try level.appendSlice(allocator, &.{ 0xb9, 0x0b, 0xb8 });
+    for (0..3000) |key| try level.appendSlice(allocator, &.{ 0x19, @intCast(key >> 8), @intCast(key & 0xff), 0x00 });
+    for (0..10) |_| {
+        var next: std.ArrayList(u8) = .empty;
+        try next.append(allocator, 0xa1);
+        try next.appendSlice(allocator, level.items);
+        try next.append(allocator, 0x00);
+        level.deinit(allocator);
+        level = next;
+    }
+    try deep.append(allocator, 0xa1);
+    try deep.appendSlice(allocator, level.items);
+    try deep.append(allocator, 0x00);
+    const deep_used = try decodeWithin(zerde.cbor, Req, bound, deep.items, cfg);
+    try std.testing.expect(deep_used <= bound);
+    // Within a small factor of the worst: the reader's keys for the chain take more than a third of the bound.
+    try std.testing.expect(deep_used * 4 > bound);
+    // The input the bound relies on is enforced.
+    var big: [40000]u8 = undefined;
+    @memset(&big, 0);
+    try std.testing.expectError(error.InputTooLarge, decodeWithin(zerde.cbor, Req, bound, &big, cfg));
+}
+
+test "a JSON request's bound holds for escaped strings and base64 bytes, as many as the input allows" {
+    const Req = Request([]const u8);
+    const cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .bytes = zerde.json.BytesEncoding.base64 };
+    const bound = comptime wire.maxArenaSize(Req, .{}, cfg);
+    try std.testing.expect(bound < 1_500_000);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "{\"effects\":[");
+    for (0..64) |index| {
+        if (index != 0) try input.append(allocator, ',');
+        // Escaped text in every string, base64 in every byte string, within what 32 KiB holds in 64 effects.
+        try input.appendSlice(allocator, "{\"key\":\"AAEC\",\"record_type\":\"\\n\\n\",\"payload\":\"AAECAwQFBgcICQoL\",\"meta\":\"\\t\\t\\t\\t\\t\\t\\t\\t\",\"note\":\"AAEC\"}");
+    }
+    try input.appendSlice(allocator, "]}");
+    try std.testing.expect(input.items.len <= 32768);
+    const used = try decodeWithin(zerde.json, Req, bound, input.items, cfg);
+    try std.testing.expect(used <= bound);
+    // Many tiny escaped strings: each costs a buffer's first capacity, so the count is what the bound must charge.
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(allocator);
+    try many.appendSlice(allocator, "{\"effects\":[");
+    for (0..64) |index| {
+        if (index != 0) try many.append(allocator, ',');
+        try many.appendSlice(allocator, "{\"key\":\"AA\\/\\/\",\"record_type\":\"\\n\",\"payload\":\"AA\\/\\/\",\"meta\":\"\\n\",\"note\":\"AA\\/\\/\"}");
+    }
+    try many.appendSlice(allocator, "]}");
+    const many_used = try decodeWithin(zerde.json, Req, bound, many.items, cfg);
+    try std.testing.expect(many_used <= bound);
+    // The worst the input can do: base64 in every payload with one escape to force a rewrite, so each is
+    // built as a token and decoded. 1.75 times the input, and the bound is under twice that.
+    var worst: std.ArrayList(u8) = .empty;
+    defer worst.deinit(allocator);
+    try worst.appendSlice(allocator, "{\"effects\":[");
+    for (0..64) |index| {
+        if (index != 0) try worst.append(allocator, ',');
+        try worst.appendSlice(allocator, "{\"key\":\"\",\"record_type\":\"a\",\"payload\":\"");
+        for (0..396) |_| try worst.append(allocator, 'A');
+        try worst.appendSlice(allocator, "\\/AAA\",\"meta\":\"\"}");
+    }
+    try worst.appendSlice(allocator, "]}");
+    try std.testing.expect(worst.items.len <= 32768);
+    const worst_used = try decodeWithin(zerde.json, Req, bound, worst.items, cfg);
+    try std.testing.expect(worst_used <= bound);
+    try std.testing.expect(worst_used * 3 > bound);
+}
+
+test "arena bound figures, from small schemas, for the parts of the model" {
+    const Row = struct {
+        a: u32,
+        b: u32,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const Rows = struct {
+        rows: []const Row,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 10 } } };
+    };
+    const Text = struct {
+        s: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 100 } } };
+    };
+    const Blob2 = struct {
+        b: zerde.ByteString,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .b = .{ .max_len = 90 } } };
+    };
+    const Raws = struct {
+        r: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .r = .{ .max_len = 400 } } };
+    };
+    const Pool = struct {
+        grid: []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const Times = struct {
+        names: []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .names = .{ .max_len = 5, .elem = .{ .max_len = 20 } } } };
+    };
+    // Worked by hand: a list of ten 8-byte rows grows through one capacity of 17 (17 * 8 + 3 bytes), is copied to
+    // its exact size (83) and its wire array is 10 * 8 + 16; and the slack is 256.
+    try std.testing.expectEqual(@as(usize, 139 + 83 + 96 + 256), wire.maxArenaSize(Rows, .{}, .{}));
+    // A string of at most 100 bytes costs 100; with an input of 10 bytes it costs at most twice that.
+    try std.testing.expectEqual(@as(usize, 100 + 256), wire.maxArenaSize(Text, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 20 + 256), wire.maxArenaSize(Text, .{}, .{ .max_input_bytes = 10 }));
+    // Bytes: the token it is read from (a third longer: 128) and the 90 it decodes to.
+    try std.testing.expectEqual(@as(usize, 128 + 90 + 256), wire.maxArenaSize(Blob2, .{}, .{}));
+    // A raw item of 400 bytes: its keys at 101 levels (four bytes each), or at the two the config allows below the
+    // two that hold it; a raw item itself is never copied.
+    try std.testing.expectEqual(@as(usize, 187419), wire.maxArenaSize(Raws, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 24751), wire.maxArenaSize(Raws, .{}, .{ .max_depth = 4 }));
+    // Lists with no bound of their own share the one budget of 100 items, whatever the nesting.
+    try std.testing.expectEqual(@as(usize, 9756), wire.maxArenaSize(Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
+    try std.testing.expect(wire.maxArenaSize(Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756);
+    // Lists of lists with bounds of their own multiply: three lists of at most four rows each.
+    const Nest = struct {
+        rows: []const []const Row,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 3, .elem = .{ .max_len = 4 } } } };
+    };
+    // A list that draws on the budget, holding a struct with a list of its own bound: the 100 items of the budget each
+    // cost a bounded list, once per item, not per level.
+    const Held = struct {
+        xs: []const u32,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .xs = .{ .max_len = 5 } } };
+    };
+    const Drawn = struct {
+        held: []const Held,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const Ints = struct {
+        xs: []const u32,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // By hand: the outer list 151 + 55 and its wire array 3 * 8 + 16; each of the three inner lists 139 + 35 and 4 * 8 + 16.
+    try std.testing.expectEqual(@as(usize, 206 + 40 + 3 * 174 + 3 * 48 + 256), wire.maxArenaSize(Nest, .{}, .{}));
+    // The budget alone, per item: a list of one element costs (142 for 33 u32s grown to and copied) over two items.
+    try std.testing.expectEqual(@as(usize, 71 * 100 + 256), wire.maxArenaSize(Ints, .{}, .{ .max_items = 100 }));
+    // Charged per item: 87 for the array of 16-byte lists over two items, 8 + 16 for its wire array: 111 an item.
+    try std.testing.expectEqual(@as(usize, 111 * 100 + 256), wire.maxArenaSize(Drawn, .{}, .{ .max_items = 100 }));
+    // Strings in a list with a max_len and elem bounds: five of at most twenty bytes.
+    try std.testing.expectEqual(@as(usize, 650), wire.maxArenaSize(Times, .{}, .{}));
 }

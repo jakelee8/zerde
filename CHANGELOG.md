@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- fixed (`zerde.wire`): a bool is a `u8` checked as 0 or 1 on `fromWire` and `encode`, and a list of bools is converted, not aliased (an invalid bool byte was accepted)
+- changed (`zerde.wire.maxArenaSize`): lists with no bound of their own share the `max_items` budget instead of multiplying per level; only rewritten text and the reader's key scratch are charged, text at most twice `max_input_bytes`, which `decode` now enforces (`error.InputTooLarge`); an array list's growth is computed from the standard library's capacities; adversarial tests decode into an arena of exactly the bound
+- fixed (JSON): `max_len` of a string or bytes field is applied while an escaped string is built (`readStringMax`, `readByteTokenMax`), so it is `error.LengthOutOfBounds` and not an arena that ran out
+- `wire.Memory.resolve` takes its size and alignment at comptime
 - changed: `bulk.findStringSpecial` scans a vector of bytes where the target has vectors (`findStringSpecialWords` elsewhere), and `bulk.writeEscaped` writes each escape into the writer's spare buffer; real-text numbers in `bench/BULK.md` (escape 1.4-2x on native, 1.6x on wasm with simd128)
 - changed (`zerde.wire`, unreleased): `decode` takes a `*std.heap.FixedBufferAllocator` and restores it on an error; `fromWire` and `encode` take a `wire.Memory` (base and valid ranges) and refuse a span outside it, misaligned or overflowing; an enum is an 8-, 16-, 32- or 64-bit integer, and `usize`, C types and odd widths are a compile error; a list of scalars is not copied; added `maxArenaSize` and `HookedWith`
 - added `tests/mutants.py --check`, which lists patterns the source no longer contains; 9 stale mutants removed and 11 re-pointed

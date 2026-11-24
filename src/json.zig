@@ -482,6 +482,29 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return self.parser.parseStringToken(allocator);
         }
 
+        /// `readString` for a field with a `max_len`: a string longer than `max` is refused as it is
+        /// built, so an escaped string is not joined into memory the bound exists to deny.
+        pub fn readStringMax(self: *Self, allocator: Allocator, max: usize) !StringToken {
+            return self.readWithin(allocator, max, readString);
+        }
+
+        /// `readByteToken` for a field with a `max_len` on the decoded bytes: the token it is read from
+        /// is at most as long as `max` bytes take in the config's encoding.
+        pub fn readByteTokenMax(self: *Self, allocator: Allocator, max: usize) !StringToken {
+            const text_max = switch (bytesEncoding(Config, self.cfg)) {
+                .string => max,
+                .base64, .base64url => std.math.add(usize, max / 3 * 4, 8) catch std.math.maxInt(usize),
+            };
+            return self.readWithin(allocator, text_max, readByteToken);
+        }
+
+        fn readWithin(self: *Self, allocator: Allocator, max: usize, comptime read: anytype) !StringToken {
+            const saved = self.parser.max_string_len;
+            defer self.parser.max_string_len = saved;
+            if (max < saved) self.parser.max_string_len = max;
+            return read(self, allocator) catch |err| if (err == error.StringTooLong and max < saved) error.LengthOutOfBounds else err;
+        }
+
         pub fn beginArray(self: *Self) !void {
             try self.count();
             self.parser.skipWhitespace();
@@ -1517,6 +1540,11 @@ const Parser = struct {
         return bytes;
     }
 
+    /// An escaped string is built a piece at a time; it stops at `max_string_len` instead of when it is whole.
+    fn withinLimit(self: *const Parser, builder: *const std.ArrayList(u8)) Error!void {
+        if (builder.items.len > self.max_string_len) return error.StringTooLong;
+    }
+
     // Plain strings borrow from the input; escaped strings allocate rewritten bytes.
     fn parseStringToken(self: *Parser, allocator: Allocator) Error!StringToken {
         const token = try self.parseStringTokenUnbounded(allocator);
@@ -1556,6 +1584,7 @@ const Parser = struct {
                 '\\' => {
                     try builder.appendSlice(allocator, try self.validUtf8(self.input[start .. self.index - 1]));
                     try self.appendEscape(allocator, &builder);
+                    try self.withinLimit(&builder);
                     builder_owned_here = false;
                     return self.finishEscapedString(allocator, builder);
                 },
@@ -1584,6 +1613,7 @@ const Parser = struct {
                 '\\' => {
                     try builder.appendSlice(allocator, try self.validUtf8(self.input[chunk_start .. self.index - 1]));
                     try self.appendEscape(allocator, &builder);
+                    try self.withinLimit(&builder);
                     chunk_start = self.index;
                 },
                 0...31 => return error.InvalidStringCharacter,

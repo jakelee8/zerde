@@ -7,7 +7,7 @@
 //! policies, validators) applied by the typed layer as it always is: a message is read into `T`
 //! first, then copied into `Wire(T)`, so this module has no second set of rules.
 //!
-//!   - an integer, a float and a bool are themselves; an enum is its integer tag type;
+//!   - an integer and a float are themselves; a bool is a `u8` that must be 0 or 1; an enum is an integer;
 //!   - text, a `ByteString`, a `Raw` and a slice are a `Span`: `extern struct { offset: u32, len: u32 }`,
 //!     pointing at the bytes (`len` counts bytes), or at the contiguous `Wire(element)` array the
 //!     decode wrote (`len` counts elements);
@@ -51,6 +51,8 @@ pub const Error = error{
     OffsetOutOfRange,
     /// A union tag or an enum value in a wire value names no variant or value.
     InvalidTag,
+    /// The input is longer than the config's `max_input_bytes`, which `maxArenaSize` relies on.
+    InputTooLarge,
 };
 
 /// A byte range, relative to a base address.
@@ -71,7 +73,7 @@ pub fn Opt(comptime V: type) type {
 pub fn Wire(comptime T: type) type {
     @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
-        .bool => bool,
+        .bool => u8,
         .int => blk: {
             // A layout that is the same on every target has no usize, no C type, and no width that
             // an extern struct refuses.
@@ -183,12 +185,12 @@ pub const Memory = struct {
 
     /// The `len` items of `size` bytes and `alignment` that `span` names, or `error.OffsetOutOfRange`
     /// when any of it lies outside the regions, the address is misaligned, or a sum overflows.
-    pub fn resolve(self: Memory, span: Span, size: usize, alignment: usize) Error![]const u8 {
+    pub inline fn resolve(self: Memory, span: Span, comptime size: usize, comptime alignment: usize) Error![]const u8 {
         if (span.len == 0) return &.{};
         const start = std.math.add(usize, self.base, span.offset) catch return error.OffsetOutOfRange;
         const length = std.math.mul(usize, span.len, size) catch return error.OffsetOutOfRange;
         const end = std.math.add(usize, start, length) catch return error.OffsetOutOfRange;
-        if (start % alignment != 0) return error.OffsetOutOfRange;
+        if (start & (alignment - 1) != 0) return error.OffsetOutOfRange;
         for (self.regions) |region| {
             const low = @intFromPtr(region.ptr);
             if (start >= low and end <= low + region.len) {
@@ -213,10 +215,11 @@ pub const Memory = struct {
     }
 };
 
-/// Whether a list of `Elem` is its own wire layout: integers, floats, bools and byte arrays.
+/// Whether a list of `Elem` is its own wire layout: integers, floats and byte arrays. (Not bools: a
+/// bool is a byte that must be 0 or 1, which a wire value from outside has to be checked for.)
 fn isScalarList(comptime Elem: type) bool {
     return switch (reflect.kindOf(Elem)) {
-        .bool, .int, .float, .byte_array => true,
+        .int, .float, .byte_array => true,
         else => false,
     };
 }
@@ -226,7 +229,8 @@ fn isScalarList(comptime Elem: type) bool {
 pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Allocator.Error || Error)!Wire(T) {
     @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
-        .bool, .int, .float, .byte_array => value,
+        .bool => @intFromBool(value),
+        .int, .float, .byte_array => value,
         .text => try spanOf(base, value),
         .byte_string, .raw => try spanOf(base, value.bytes),
         .list => blk: {
@@ -288,7 +292,12 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
 pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error)!T {
     @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
-        .bool, .int, .float, .byte_array => wire,
+        .bool => switch (wire) {
+            0 => false,
+            1 => true,
+            else => error.InvalidTag,
+        },
+        .int, .float, .byte_array => wire,
         .text => try memory.bytesOf(wire),
         .byte_string => .{ .bytes = try memory.bytesOf(wire) },
         .raw => .{ .bytes = try memory.bytesOf(wire) },
@@ -357,6 +366,9 @@ pub fn decode(
     comptime serde_cfg: anytype,
     comptime format_cfg: anytype,
 ) !Wire(T) {
+    if (comptime meta.hasField(@TypeOf(format_cfg), "max_input_bytes")) {
+        if (input.len > format_cfg.max_input_bytes) return error.InputTooLarge;
+    }
     const mark = arena.end_index;
     errdefer arena.end_index = mark;
     const allocator = arena.allocator();
@@ -488,19 +500,122 @@ pub fn describe(comptime T: type, comptime cfg: anytype) Node {
 const Limits = struct {
     max_items: usize,
     max_string_len: usize,
+    max_depth: usize,
+    max_input_bytes: usize,
 };
 
 fn limitsOf(comptime format_cfg: anytype) Limits {
+    const unbounded = std.math.maxInt(usize);
     return .{
-        .max_items = if (meta.hasField(@TypeOf(format_cfg), "max_items")) @field(format_cfg, "max_items") else std.math.maxInt(usize),
-        .max_string_len = if (meta.hasField(@TypeOf(format_cfg), "max_string_len")) @field(format_cfg, "max_string_len") else std.math.maxInt(usize),
+        .max_items = if (meta.hasField(@TypeOf(format_cfg), "max_items")) @field(format_cfg, "max_items") else unbounded,
+        .max_string_len = if (meta.hasField(@TypeOf(format_cfg), "max_string_len")) @field(format_cfg, "max_string_len") else unbounded,
+        .max_depth = if (meta.hasField(@TypeOf(format_cfg), "max_depth")) @min(@field(format_cfg, "max_depth"), 128) else 128,
+        .max_input_bytes = if (meta.hasField(@TypeOf(format_cfg), "max_input_bytes")) @field(format_cfg, "max_input_bytes") else unbounded,
     };
 }
 
-/// The bytes a list of `n` items of `size` and `alignment` can take while it grows (an array list
-/// grows by half again, so what it left behind is under twice what it holds) and is shrunk to fit.
+/// A resource a decode takes: `fixed` bytes (or instances) that do not depend on how many items the
+/// input has, and `pool` of them for each item of the shared `max_items` budget. A list with a
+/// `max_len` of its own is charged in full, per element of the list that holds it. A list with none
+/// draws on the one budget the whole input has, so lists nested in it do not multiply it: `pool` is how
+/// much the worst use of one item costs, and combines by the most, not the sum.
+const Amount = struct {
+    fixed: usize = 0,
+    pool: usize = 0,
+
+    fn plus(a: Amount, b: Amount) Amount {
+        return .{ .fixed = a.fixed + b.fixed, .pool = @max(a.pool, b.pool) };
+    }
+
+    fn times(a: Amount, n: usize) Amount {
+        return .{ .fixed = a.fixed * n, .pool = a.pool };
+    }
+
+    fn most(a: Amount, b: Amount) Amount {
+        return .{ .fixed = @max(a.fixed, b.fixed), .pool = @max(a.pool, b.pool) };
+    }
+
+    /// With every item of the budget at most `items` of it.
+    fn total(a: Amount, comptime items: usize) usize {
+        return a.fixed + a.pool * items;
+    }
+};
+
+/// What a decode takes of the arena, by what it is spent on, because each has its own limit:
+///
+/// - `lists`: the arrays of lists (typed, and the wire copy of lists that are not scalars);
+/// - `text`: the bytes of strings that are not borrowed from the input, which are the escaped ones
+///   (JSON), the chunked ones (CBOR) and the bytes JSON decodes from base64, never a definite
+///   CBOR string or a plain JSON one, and never a `Raw` item;
+/// - `scratch`: what the reader keeps to check a `Raw` item, reused from one to the next, so the
+///   most of any one and not their sum;
+/// - the largest list in the schema, for a bound of the lists that does not depend on the fields.
+const Cost = struct {
+    lists: Amount = .{},
+    text: Amount = .{},
+    scratch: usize = 0,
+    list_size: usize = 0,
+    list_align: usize = 0,
+    list_wire: usize = 0,
+
+    fn plus(a: Cost, b: Cost) Cost {
+        return .{
+            .lists = a.lists.plus(b.lists),
+            .text = a.text.plus(b.text),
+            .scratch = @max(a.scratch, b.scratch),
+            .list_size = @max(a.list_size, b.list_size),
+            .list_align = @max(a.list_align, b.list_align),
+            .list_wire = @max(a.list_wire, b.list_wire),
+        };
+    }
+
+    fn times(a: Cost, n: usize) Cost {
+        var out = a;
+        out.lists = a.lists.times(n);
+        out.text = a.text.times(n);
+        return out;
+    }
+
+    fn most(a: Cost, b: Cost) Cost {
+        return .{
+            .lists = a.lists.most(b.lists),
+            .text = a.text.most(b.text),
+            .scratch = @max(a.scratch, b.scratch),
+            .list_size = @max(a.list_size, b.list_size),
+            .list_align = @max(a.list_align, b.list_align),
+            .list_wire = @max(a.list_wire, b.list_wire),
+        };
+    }
+};
+
+/// The bytes a list of `n` items of `size` and `alignment` takes in a fixed buffer, worst case: an
+/// array list grows from nothing through the capacities the standard library gives it, each a new
+/// allocation (the buffer reuses only the last one), and is copied to its exact size at the end.
 fn growth(n: usize, size: usize, alignment: usize) usize {
-    return (3 * n + 64) * size + 40 * alignment;
+    if (n == 0) return 0;
+    const init = @max(1, 128 / size);
+    var capacity: usize = 0;
+    var total: usize = 0;
+    while (capacity < n) {
+        capacity = (capacity + 1) + ((capacity + 1) / 2 + init);
+        total += capacity * size + alignment - 1;
+    }
+    return total + n * size + alignment - 1;
+}
+
+/// The most `growth` costs for one item of the shared budget: a list of `k` items uses `k + 1` of
+/// it (its own place and its elements), and costs most per item just after it grew, so the ratio is
+/// taken at one item and at each capacity boundary up to `budget` items.
+fn growthPerItem(budget: usize, size: usize, alignment: usize) usize {
+    const init = @max(1, 128 / size);
+    var worst = (growth(1, size, alignment) + 1) / 2;
+    var capacity: usize = 0;
+    while (capacity < budget) {
+        capacity = (capacity + 1) + ((capacity + 1) / 2 + init);
+        const k = capacity + 1;
+        worst = @max(worst, (growth(k, size, alignment) + k) / (k + 1));
+    }
+    return worst;
 }
 
 fn bound(comptime name: []const u8, comptime limit: usize, comptime what: []const u8) usize {
@@ -508,86 +623,152 @@ fn bound(comptime name: []const u8, comptime limit: usize, comptime what: []cons
     return limit;
 }
 
-/// An upper bound, in bytes, of what the arena of `decode(Format, T, ...)` allocates for the
-/// typed value and its wire copy, plus what the reader keeps while it checks a `Raw` item. It is
-/// computed from the bounds of `T`: `max_len` and `.elem` of every field, and `max_items` and
-/// `max_string_len` of `format_cfg` where a field has none. It is a compile error when something a
-/// decode reaches has no bound, when a struct accepts unknown members (they would cost without
-/// limit: set `deny_unknown_fields`), or when it collects extras. The bound is not tight: it takes
-/// the worst case of every list and string at once. Strings that are not escaped or chunked cost
-/// nothing, and a list of scalars costs only its typed array.
+/// Whether `limit` is a bound and not the lack of one.
+fn bounded(limit: usize) bool {
+    return limit != std.math.maxInt(usize);
+}
+
+/// An upper bound, in bytes, of what the arena of `decode(Format, T, ...)` allocates, computed from
+/// the bounds of `T` (`max_len` and `.elem` of each field) and from `format_cfg`: `max_items` (the
+/// items of the whole input, which bounds every list that has no `max_len`, and all lists together),
+/// `max_string_len`, `max_depth`, and `max_input_bytes`, which `decode` enforces.
+///
+/// A string that is borrowed from the input (a definite CBOR string, a JSON string without an escape)
+/// and a `Raw` item cost nothing: their span points into the input. Only what is rewritten costs,
+/// and that is at most the input, so with `max_input_bytes` the bound for text is the input times
+/// five (the growth of the buffer a string is built in) and a fixed cost for each such string, if that
+/// is less than the sum of the fields' own bounds. A list costs the capacities an array list grows
+/// through, per list; lists together are charged at most `max_items` items, which is less than the
+/// sum of their `max_len` when those are generous.
+///
+/// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
+/// members (they would cost without limit: set `deny_unknown_fields`), or when it collects extras.
 pub fn maxArenaSize(comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
     @setEvalBranchQuota(1_000_000);
     const limits = comptime limitsOf(format_cfg);
+    const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0).plus(wireOwned(T, .{}, serde_cfg, limits));
     const slack = 256;
-    return comptime typedOwned(T, .{}, serde_cfg, limits) + wireOwned(T, .{}, serde_cfg, limits) + slack;
+    const items = limits.max_items;
+
+    // Arrays of lists: from the fields, and, where the items are bounded, from the budget alone.
+    var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", items, "the items of the input"));
+    if (cost.list_size != 0 and bounded(items)) {
+        const per_item = growthPerItem(items, cost.list_size, cost.list_align) + cost.list_wire + 16;
+        lists = @min(lists, per_item * items);
+    }
+
+    // Text that is rewritten: from the fields, and, where the input and the items are bounded, from the input.
+    var text = if (cost.text.pool == 0) cost.text.fixed else cost.text.total(bound("max_items", items, "the items of the input"));
+    if (comptime bounded(limits.max_input_bytes)) {
+        // Every byte of a rewritten string comes from the input, at most twice: a JSON base64 string is
+        // built (at most the input), then decoded (three quarters of it). A string is built last in the
+        // arena, so its buffer grows in place and costs what it holds.
+        const input: usize = limits.max_input_bytes;
+        text = @min(text, 2 * input);
+    }
+    return lists + text + cost.scratch + slack;
+}
+
+/// The list bound of a field, if it has one of its own: a field's `max_len` is a number of items the
+/// field can hold; without it the list draws on the shared budget.
+fn ownBound(comptime bounds: meta.Bounds) ?usize {
+    return if (bounds.max_len == std.math.maxInt(usize)) null else bounds.max_len;
 }
 
 /// What the typed read allocates for one value of `T`, beyond the storage `T` itself takes.
-fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits) usize {
+fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: usize) Cost {
     return switch (comptime reflect.kindOf(T)) {
-        .bool, .int, .float, .byte_array, .@"enum" => 0,
-        .text, .byte_string => blk: {
+        .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
+        .text => blk: {
             const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a string");
-            break :blk growth(n, 1, 1);
+            break :blk .{ .text = .{ .fixed = n } };
+        },
+        .byte_string => blk: {
+            // The token it is read from (base64 is a third longer) and the bytes it decodes to.
+            const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a byte string");
+            break :blk .{ .text = .{ .fixed = @min(limits.max_string_len, @max(n, n / 3 * 4 + 8)) + n } };
         },
         .raw => blk: {
-            // Checking a raw item records its map keys: at most one entry per two bytes.
+            // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
+            // for a key that is itself an array or map its canonical bytes, once more at each level of
+            // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
+            // the most of the two. Only CBOR does this; the bound is for either format.
             const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a raw item");
-            break :blk 3 * (n / 2 + 8) * 40 + 3 * n + 40 * 8;
+            // The item is itself a container, below the `depth` that hold it.
+            const levels = @min(limits.max_depth -| (depth + 1), n / 4 + 1);
+            break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1)) };
         },
         .list => blk: {
             const Elem = @typeInfo(T).pointer.child;
-            const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_items), "a list");
             const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
-            break :blk growth(n, @sizeOf(Elem), @alignOf(Elem)) + n * typedOwned(Elem, elem_bounds, cfg, limits);
+            const element = typedOwned(Elem, elem_bounds, cfg, limits, depth + 1);
+            var own: Cost = .{ .list_size = @sizeOf(Elem), .list_align = @alignOf(Elem), .list_wire = if (isScalarList(Elem)) 0 else @sizeOf(Wire(Elem)) };
+            if (ownBound(bounds)) |n| {
+                own.lists.fixed = growth(n, @sizeOf(Elem), @alignOf(Elem));
+                break :blk own.plus(element.times(n));
+            }
+            // From the shared budget: each item costs its share of the array and what its own
+            // element costs, and one item's worth of what a list nested in it costs.
+            const items = bound("max_items", limits.max_items, "the items of the input");
+            own.lists.pool = growthPerItem(items, @sizeOf(Elem), @alignOf(Elem)) + element.lists.fixed;
+            own.text.pool = element.text.fixed;
+            break :blk own.plus(.{
+                .lists = .{ .pool = element.lists.pool },
+                .text = .{ .pool = element.text.pool },
+                .scratch = element.scratch,
+            });
         },
-        .array => @typeInfo(T).array.len * typedOwned(@typeInfo(T).array.child, .{}, cfg, limits),
-        .optional => typedOwned(@typeInfo(T).optional.child, bounds, cfg, limits),
-        .pointer => @sizeOf(@typeInfo(T).pointer.child) + 16 + typedOwned(@typeInfo(T).pointer.child, .{}, cfg, limits),
+        .array => typedOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),
+        .optional => typedOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
+        .pointer => blk: {
+            const child = typedOwned(@typeInfo(T).pointer.child, .{}, cfg, limits, depth);
+            break :blk (Cost{ .lists = .{ .fixed = @sizeOf(@typeInfo(T).pointer.child) + 16 } }).plus(child);
+        },
         .@"struct" => blk: {
             if (!meta.effectiveDenyUnknownFields(T, cfg)) @compileError("a struct that accepts unknown members has no arena bound; set deny_unknown_fields: " ++ @typeName(T));
-            var total: usize = 0;
+            var total: Cost = .{};
             for (reflect.fields(T, cfg)) |field| {
                 if (field.extras) @compileError("a struct with extras has no arena bound: " ++ @typeName(T));
-                total += typedOwned(field.type, field.bounds, cfg, limits);
+                total = total.plus(typedOwned(field.type, field.bounds, cfg, limits, depth + 1));
             }
             break :blk total;
         },
         .@"union" => blk: {
-            var most: usize = 0;
+            var most: Cost = .{};
             for (reflect.variants(T, cfg)) |variant| {
-                if (variant.type != void) most = @max(most, typedOwned(variant.type, .{}, cfg, limits));
+                if (variant.type != void) most = most.most(typedOwned(variant.type, .{}, cfg, limits, depth + 1));
             }
             break :blk most;
         },
-        .hook, .none => 0,
     };
 }
 
 /// What the copy into the wire layout allocates for one value of `T`: the arrays of its lists.
-fn wireOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits) usize {
+fn wireOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits) Cost {
     return switch (comptime reflect.kindOf(T)) {
-        .bool, .int, .float, .byte_array, .@"enum", .text, .byte_string, .raw, .hook, .none => 0,
+        .bool, .int, .float, .byte_array, .@"enum", .text, .byte_string, .raw, .hook, .none => .{},
         .list => blk: {
             const Elem = @typeInfo(T).pointer.child;
-            if (isScalarList(Elem)) break :blk 0;
-            const n: usize = @min(bounds.max_len, limits.max_items);
+            if (isScalarList(Elem)) break :blk .{};
             const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
-            break :blk n * @sizeOf(Wire(Elem)) + 16 + n * wireOwned(Elem, elem_bounds, cfg, limits);
+            const element = wireOwned(Elem, elem_bounds, cfg, limits);
+            if (ownBound(bounds)) |n| {
+                break :blk (Cost{ .lists = .{ .fixed = n * @sizeOf(Wire(Elem)) + 16 } }).plus(element.times(n));
+            }
+            break :blk .{ .lists = .{ .pool = @max(@sizeOf(Wire(Elem)) + 16 + element.lists.fixed, element.lists.pool) } };
         },
-        .array => @typeInfo(T).array.len * wireOwned(@typeInfo(T).array.child, .{}, cfg, limits),
+        .array => wireOwned(@typeInfo(T).array.child, .{}, cfg, limits).times(@typeInfo(T).array.len),
         .optional => wireOwned(@typeInfo(T).optional.child, bounds, cfg, limits),
         .pointer => wireOwned(@typeInfo(T).pointer.child, .{}, cfg, limits),
         .@"struct" => blk: {
-            var total: usize = 0;
-            for (reflect.fields(T, cfg)) |field| total += wireOwned(field.type, field.bounds, cfg, limits);
+            var total: Cost = .{};
+            for (reflect.fields(T, cfg)) |field| total = total.plus(wireOwned(field.type, field.bounds, cfg, limits));
             break :blk total;
         },
         .@"union" => blk: {
-            var most: usize = 0;
+            var most: Cost = .{};
             for (reflect.variants(T, cfg)) |variant| {
-                if (variant.type != void) most = @max(most, wireOwned(variant.type, .{}, cfg, limits));
+                if (variant.type != void) most = most.most(wireOwned(variant.type, .{}, cfg, limits));
             }
             break :blk most;
         },

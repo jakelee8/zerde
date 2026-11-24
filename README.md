@@ -455,7 +455,8 @@ write.
 reads it by offset out of linear memory (TypeScript over WebAssembly, say) with no parser:
 
 - `wire.Wire(T)` is the type. Integers are u8, u16, u32, u64 or the signed kind (`usize`, `isize`, C types and other
-  widths are a compile error, so the layout is the same on every target); floats are f32 or f64; a bool is a bool; an
+  widths are a compile error, so the layout is the same on every target); floats are f32 or f64; a bool is a `u8`
+  that must be 0 or 1 (`error.InvalidTag` otherwise); an
   enum is the smallest 8-, 16-, 32- or 64-bit integer that holds its values (signed if one is negative); `[N]T` is
   `[N]Wire(T)`; text, a `ByteString`, a `Raw` and any slice are a `wire.Span` (`extern struct { offset: u32, len: u32 }`:
   `len` counts bytes, or elements for a slice, which is a contiguous `Wire(element)` array); `?T` is `wire.Opt(Wire(T))`
@@ -470,14 +471,21 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   that holds both the input and the arena on a native target. An offset or an end beyond `u32`, or an address before `base`, is
   `error.OffsetOutOfRange`.
 - Where the bytes are: a plain text or byte string and a `Raw` stay in `input` (it must stay put while the wire value is
-  read); a JSON string with an escape, a chunked CBOR string and every array of structs, unions, optionals, enums or arrays
-  are written into the arena (the latter twice: the typed array, then the wire array). A list of integers, floats and bools is
-  not copied: its typed array already has the wire layout and the span points at it. So a span points into the input or the
-  arena, and both must be in memory `base` reaches.
-- `wire.maxArenaSize(T, serde_cfg, format_cfg)` is an upper bound, computed at comptime, of the bytes a decode takes from the
-  arena, from the `max_len` and `.elem` of each field and the `max_items` and `max_string_len` of the read config where a field
-  has none. It is a compile error when something a decode reaches has no bound, when a struct accepts unknown members (set
-  `deny_unknown_fields`) or collects extras. It takes the worst case of every list and string at once, so it is not tight.
+  read); a JSON string with an escape, a chunked CBOR string, bytes JSON decodes from base64 and every array of structs,
+  unions, optionals, enums, bools or arrays are written into the arena (the latter twice: the typed array, then the wire
+  array). A list of integers and floats is not copied: its typed array already has the wire layout and the span points at it.
+  So a span points into the input or the arena, and both must be in memory `base` reaches.
+- `wire.maxArenaSize(T, serde_cfg, format_cfg)` is an upper bound, computed at comptime, of the bytes a decode takes
+  from the arena. It uses the `max_len` and `.elem` of each field and, from `format_cfg`: `max_items` (items in the whole
+  input, which bounds every list without a `max_len` and all lists together, so nesting such lists does not multiply it),
+  `max_string_len`, `max_depth` and `max_input_bytes`, which `decode` enforces (`error.InputTooLarge`). Only what is
+  rewritten costs: text is at most twice the input, a list the capacities an array list grows through, and a `Raw` item
+  only what the CBOR reader keeps to check its map keys (once, reused from one item to the next). It is a compile error when
+  something a decode reaches has no bound, when a struct accepts unknown members (set `deny_unknown_fields`) or collects
+  extras. It is not tight, but is within a small factor of the worst input: tests decode adversarial requests (escaped
+  and chunked strings, base64 payloads, a chain of maps used as keys) into an arena of exactly the bound, and the bound is
+  between one and four times what they use. Without `max_input_bytes` the text bound is the sum of the fields' own
+  `max_len`, which with a large `max_len` is large.
 - `wire.encode(Format, T, arena, memory, wire, writer, serde_cfg, format_cfg)` writes a wire value as the typed value would be
   written (same order, keys, optional policy, determinism). It rebuilds the typed value first, in `arena` (put back after), because
   the writers stream and keep no memory of their own. A wire value that came from outside is not trusted: `memory` is a
