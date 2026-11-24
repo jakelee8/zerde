@@ -1158,6 +1158,188 @@ test "a strict read refuses a composite key that holds a float zero, and takes a
     try zerde.serializeWith(zerde.cbor, &out.writer, fine, .{}, .{ .deterministic = true });
 }
 
+// ---- canonicalizeInto, the deterministic form into caller buffers ------------------------------------------------
+
+/// `canonicalizeInto` with buffers of exactly the sizes it documents, and `canonicalize` to compare with.
+fn expectCanonicalInto(input: []const u8) !void {
+    const expected = try zerde.cbor.canonicalize(allocator, input);
+    defer allocator.free(expected);
+    var dst: [4096]u8 = undefined;
+    var scratch: [zerde.cbor.canonicalScratchSize(64)]u8 = undefined;
+    const got = try zerde.cbor.canonicalizeInto(dst[0..input.len], &scratch, input);
+    try std.testing.expectEqualSlices(u8, expected, got);
+    // And it is what a strict read takes, which is its point.
+    var again = try zerde.cbor.pullReader(allocator, got, strict);
+    defer again.deinit();
+    while (try again.next()) |_| {}
+    try again.finish();
+}
+
+fn canonicalError(expected: anyerror, input: []const u8) !void {
+    var dst: [4096]u8 = undefined;
+    var scratch: [zerde.cbor.canonicalScratchSize(64)]u8 = undefined;
+    try std.testing.expectError(expected, zerde.cbor.canonicalizeInto(dst[0..@min(input.len, dst.len)], &scratch, input));
+}
+
+test "canonicalizeInto gives what canonicalize gives, for items in every spelling" {
+    // Scalars: non-minimal heads, floats in every width, simple values.
+    try expectCanonicalInto(&.{ 0x18, 0x05 });
+    try expectCanonicalInto(&.{ 0x19, 0x00, 0x20 });
+    try expectCanonicalInto(&.{ 0x3b, 0, 0, 0, 0, 0, 0, 0, 0x04 });
+    try expectCanonicalInto(&.{ 0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0 });
+    try expectCanonicalInto(&.{ 0xfa, 0x7f, 0xc0, 0, 0 });
+    try expectCanonicalInto(&.{ 0xfa, 0x47, 0xc3, 0x50, 0x00 });
+    try expectCanonicalInto(&.{0xf6});
+    // A simple value in two bytes stays; the pull reader has no event for it, so only the form is compared.
+    var simple: [4]u8 = undefined;
+    var none: [8]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{ 0xf8, 0xff }, try zerde.cbor.canonicalizeInto(&simple, &none, &.{ 0xf8, 0xff }));
+    // Strings in chunks, and the empty ones.
+    try expectCanonicalInto(&.{ 0x7f, 0x61, 'a', 0x60, 0x62, 'b', 'c', 0xff });
+    try expectCanonicalInto(&.{ 0x5f, 0x41, 1, 0x40, 0x42, 2, 3, 0xff });
+    try expectCanonicalInto(&.{ 0x7f, 0xff });
+    // An indefinite array and map nested in a definite one, keys in a scrambled order and in mixed spellings.
+    try expectCanonicalInto(&.{ 0x9f, 0xbf, 0x62, 'b', 'b', 0x01, 0x61, 'z', 0x02, 0x18, 0x07, 0x03, 0x01, 0x04, 0x7f, 0x61, 'k', 0xff, 0x05, 0xff, 0xa1, 0x41, 0x61, 0x80, 0xff });
+    try expectCanonicalInto(&.{ 0xa3, 0x61, 'b', 0x01, 0x20, 0x02, 0x0a, 0x03 });
+    try expectCanonicalInto(&.{ 0xa4, 0xf5, 0x00, 0xf4, 0x01, 0xf6, 0x02, 0xf9, 0x3c, 0x00, 0x03 });
+    // Keys that differ only in a long common prefix, and one that is a prefix of another.
+    try expectCanonicalInto(&.{ 0xa3, 0x63, 'a', 'b', 'd', 0x00, 0x63, 'a', 'b', 'c', 0x01, 0x62, 'a', 'b', 0x02 });
+    // The same key spelled chunked and plain is one key; chunked keys in two spellings of different strings are two.
+    try expectCanonicalInto(&.{ 0xa2, 0x7f, 0x61, 'a', 0x61, 'c', 0xff, 0x00, 0x7f, 0x62, 'a', 'b', 0xff, 0x01 });
+    // A float key beside an integer key, and 0.0 and 1.0 in different widths.
+    try expectCanonicalInto(&.{ 0xa3, 0xfa, 0x3f, 0x80, 0, 0, 0x00, 0xf9, 0x00, 0x00, 0x01, 0x01, 0x02 });
+    // Real items: the corpus files, written with indefinite maps in declaration order, come out in the deterministic form.
+    inline for (.{ "object_nested.cbor", "object_array.cbor", "object_integer_keys.cbor", "mixed_scalars.cbor", "union_struct_payload.cbor", "object_optional_patch_value.cbor", "float.cbor" }) |name| {
+        try expectCanonicalInto(@embedFile("corpus/cbor/" ++ name));
+    }
+}
+
+test "canonicalizeInto moves the items of an indefinite array up when their count needs a longer head" {
+    // 30 items: a head of two bytes; 300: three. Nested, so the inner shift happens inside the outer one.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.append(allocator, 0x9f);
+    for (0..30) |index| try input.append(allocator, @intCast(index % 20));
+    try input.append(allocator, 0x9f);
+    for (0..300) |_| try input.append(allocator, 0x01);
+    try input.appendSlice(allocator, &.{ 0xff, 0xff });
+    const expected = try zerde.cbor.canonicalize(allocator, input.items);
+    defer allocator.free(expected);
+    var dst: [1024]u8 = undefined;
+    var scratch: [8]u8 = undefined;
+    const got = try zerde.cbor.canonicalizeInto(&dst, &scratch, input.items);
+    try std.testing.expectEqualSlices(u8, expected, got);
+    try std.testing.expectEqual(@as(u8, 0x98), got[0]);
+    try std.testing.expectEqual(@as(u8, 31), got[1]);
+    // The head of the inner array is three bytes (0x99 and 300).
+    try std.testing.expectEqualSlices(u8, &.{ 0x99, 0x01, 0x2c }, got[2 + 30 ..][0..3]);
+    // Not enough room for the move is an error and not an overrun.
+    try std.testing.expectError(error.NoSpaceLeft, zerde.cbor.canonicalizeInto(dst[0 .. expected.len - 1], &scratch, input.items));
+}
+
+test "canonicalizeInto refuses what canonicalize refuses, and a map key that is an array or a map" {
+    try canonicalError(error.UnexpectedTag, &.{ 0xc1, 0x01 });
+    try canonicalError(error.UnexpectedTag, &.{ 0xa1, 0x01, 0xc1, 0x01 });
+    try canonicalError(error.InvalidUtf8, &.{ 0x62, 0xc3, 0x28 });
+    try canonicalError(error.InvalidUtf8, &.{ 0xa1, 0x62, 0xc3, 0x28, 0x00 });
+    try canonicalError(error.InvalidUtf8, &.{ 0x7f, 0x61, 'a', 0x61, 0xff, 0xff });
+    try canonicalError(error.InvalidStringChunk, &.{ 0x7f, 0x41, 'a', 0xff });
+    try canonicalError(error.UnexpectedEndOfInput, &.{ 0x82, 0x01 });
+    try canonicalError(error.UnexpectedEndOfInput, &.{ 0xa1, 0x01 });
+    try canonicalError(error.UnexpectedEndOfInput, &.{ 0x9f, 0x01 });
+    try canonicalError(error.UnexpectedEndOfInput, &.{ 0xb9, 0xff, 0xff });
+    try canonicalError(error.TrailingCharacters, &.{ 0x01, 0x02 });
+    try canonicalError(error.InvalidSimpleValue, &.{ 0xf8, 0x10 });
+    try canonicalError(error.InvalidAdditionalInfo, &.{0x1c});
+    // A key that is an array or a map, or a tag.
+    try canonicalError(error.UnexpectedType, &.{ 0xa1, 0x81, 0x01, 0x00 });
+    try canonicalError(error.UnexpectedType, &.{ 0xa1, 0xa0, 0x00 });
+    try canonicalError(error.UnexpectedTag, &.{ 0xa1, 0xc1, 0x01, 0x00 });
+    // Nesting: 128 containers is the most, a 129th is refused.
+    var deep: [300]u8 = undefined;
+    @memset(deep[0..128], 0x81);
+    deep[128] = 0x01;
+    var dst: [300]u8 = undefined;
+    var scratch: [8]u8 = undefined;
+    _ = try zerde.cbor.canonicalizeInto(&dst, &scratch, deep[0..129]);
+    @memset(deep[0..129], 0x81);
+    deep[129] = 0x01;
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.canonicalizeInto(&dst, &scratch, deep[0..130]));
+    // A map as the 129th container, under arrays: only the map's own check can refuse it.
+    @memset(deep[0..128], 0x81);
+    deep[128] = 0xa0;
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.canonicalizeInto(&dst, &scratch, deep[0..129]));
+    var maps: [300]u8 = undefined;
+    for (0..129) |level| {
+        maps[level * 2] = 0xa1;
+        maps[level * 2 + 1] = 0x00;
+    }
+    maps[258] = 0x00;
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.cbor.canonicalizeInto(&dst, &scratch, maps[0..259]));
+}
+
+test "canonicalizeInto finds a repeated key in any spelling, and 0.0 with -0.0, wherever they sort" {
+    const E = error.DuplicateField;
+    try canonicalError(E, &.{ 0xa2, 0x01, 0x00, 0x18, 0x01, 0x01 }); // 1 and 1 spelled in two ways
+    try canonicalError(E, &.{ 0xa2, 0x61, 'a', 0x00, 0x7f, 0x61, 'a', 0xff, 0x01 }); // "a" and a chunked "a"
+    try canonicalError(E, &.{ 0xa2, 0x42, 1, 2, 0x00, 0x5f, 0x41, 1, 0x41, 2, 0xff, 0x01 }); // h'0102' twice
+    try canonicalError(E, &.{ 0xa2, 0xf9, 0x3c, 0x00, 0x00, 0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0, 0x01 }); // 1.0 in two widths
+    try canonicalError(E, &.{ 0xa2, 0xf9, 0x00, 0x00, 0x00, 0xf9, 0x80, 0x00, 0x00 }); // 0.0 and -0.0
+    try canonicalError(E, &.{ 0xa2, 0xf9, 0x00, 0x00, 0x00, 0xfb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x00 });
+    try canonicalError(E, &.{ 0xa3, 0xf9, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x01, 0x00, 0xf9, 0x80, 0x00, 0x00 }); // with a key between
+    try canonicalError(E, &.{ 0xa2, 0xf9, 0x7e, 0x00, 0x00, 0xfa, 0x7f, 0xc0, 0x00, 0x00, 0x01 }); // NaN twice
+    try canonicalError(E, &.{ 0xa1, 0x61, 'x', 0xa2, 0x01, 0x00, 0x01, 0x01 }); // in a value
+    try canonicalError(E, &.{ 0x81, 0xbf, 0x00, 0x00, 0x00, 0x01, 0xff }); // in an indefinite map in an array
+    // Different keys are fine: 0.0 alone, -0.0 alone, 1 and 1.0.
+    try expectCanonicalInto(&.{ 0xa1, 0xf9, 0x80, 0x00, 0x00 });
+    try expectCanonicalInto(&.{ 0xa2, 0x01, 0x00, 0xf9, 0x3c, 0x00, 0x01 });
+    // And the same key in different maps.
+    try expectCanonicalInto(&.{ 0x82, 0xa1, 0x01, 0x00, 0xa1, 0x01, 0x01 });
+}
+
+test "canonicalizeInto refuses an input its 32-bit offsets cannot name, before it reads any of it" {
+    if (@sizeOf(usize) <= 4) return error.SkipZigTest;
+    const byte: u8 = 1;
+    // A slice of 4 GiB and a byte, over memory that is never touched.
+    const huge = @as([*]const u8, @ptrCast(&byte))[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+    var dst: [1]u8 = undefined;
+    var scratch: [8]u8 = undefined;
+    try std.testing.expectError(error.InputTooLarge, zerde.cbor.canonicalizeInto(&dst, &scratch, huge));
+}
+
+test "canonicalizeInto allocates nothing, and says when its scratch or its output is too small" {
+    // Nested maps hold their entries at once: 3 + 2 + 1.
+    const input = [_]u8{ 0xa3, 0x03, 0xa2, 0x02, 0xa1, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x02, 0x00 };
+    var dst: [64]u8 = undefined;
+    var scratch: [zerde.cbor.canonicalScratchSize(6)]u8 = undefined;
+    const got = try zerde.cbor.canonicalizeInto(&dst, &scratch, &input);
+    const expected = try zerde.cbor.canonicalize(allocator, &input);
+    defer allocator.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, got);
+    // The entries of a map and of the maps that hold it are counted together: five entries are not enough, six are.
+    var small: [zerde.cbor.canonicalScratchSize(5)]u8 = undefined;
+    try std.testing.expectError(error.OutOfMemory, zerde.cbor.canonicalizeInto(&dst, &small, &input));
+    // A scratch that is not aligned still works, with the bytes the size function adds.
+    var offset: [zerde.cbor.canonicalScratchSize(6) + 1]u8 align(8) = undefined;
+    _ = try zerde.cbor.canonicalizeInto(&dst, offset[1..], &input);
+    // The output is at most the input, so a buffer of the input's length is enough, and one byte short is not for a
+    // map that is already deterministic.
+    _ = try zerde.cbor.canonicalizeInto(dst[0..input.len], &scratch, &input);
+    try std.testing.expectError(error.NoSpaceLeft, zerde.cbor.canonicalizeInto(dst[0 .. input.len - 1], &scratch, &input));
+    try std.testing.expectError(error.NoSpaceLeft, zerde.cbor.canonicalizeInto(dst[0..0], &scratch, &.{0x01}));
+    // Strings are copied once and checked: a long chunked one that is exactly the buffer.
+    var chunked: std.ArrayList(u8) = .empty;
+    defer chunked.deinit(allocator);
+    try chunked.append(allocator, 0x7f);
+    for (0..40) |_| try chunked.appendSlice(allocator, &.{ 0x65, 'h', 'e', 'l', 'l', 'o' });
+    try chunked.append(allocator, 0xff);
+    var big: [256]u8 = undefined;
+    const joined = try zerde.cbor.canonicalizeInto(big[0..202], &scratch, chunked.items);
+    try std.testing.expectEqual(@as(usize, 202), joined.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x78, 200 }, joined[0..2]);
+    try std.testing.expectError(error.NoSpaceLeft, zerde.cbor.canonicalizeInto(big[0..201], &scratch, chunked.items));
+}
+
 test "limits: depth, items and string length" {
     // Depth: a map holding an array holding an array is three levels.
     const three = [_]u8{ 0xa1, 0x61, 'x', 0x81, 0x81, 0x00 };

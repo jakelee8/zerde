@@ -458,6 +458,15 @@ back as it is. `zerde.cbor.validate(allocator, bytes)` checks that one item is w
 repeated key. The checks that need no allocation do not look for a repeated key outside a deterministic
 write.
 
+`zerde.cbor.canonicalizeInto(dst, scratch, bytes)` is the same with no allocator: it writes the deterministic form
+to the front of `dst` (never longer than `bytes`, so a `dst` of that length is enough; `error.NoSpaceLeft` otherwise)
+and returns it. A map is put in key order through an index of its entries in `scratch`, 8 bytes an entry, each
+entry then written once, from the input, in order: there is no working buffer and no copy of the result.
+`zerde.cbor.canonicalScratchSize(n)` is the scratch for `n` map entries open at once (a map's own and those of the
+maps that hold it; `error.OutOfMemory` when short). It differs from `canonicalize` in one way: a map key that is
+an array or a map is `error.UnexpectedType`, as in the pull reader, because ordering it would need its own
+canonical form kept, which has no bound. Repeated keys (any spelling, and 0.0 with -0.0) are `error.DuplicateField`.
+
 ### Fixed-layout wire types
 
 `zerde.wire` generates, from a schema type, the same value laid out the way C lays out a struct, for code that

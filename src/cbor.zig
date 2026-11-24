@@ -1535,6 +1535,297 @@ pub fn canonicalize(allocator: Allocator, bytes: []const u8) ![]u8 {
     return allocator.dupe(u8, d.key_bytes.items);
 }
 
+/// The bytes of scratch `canonicalizeInto` needs for an item with at most `max_entries` map entries open at once
+/// (the entries of a map and of the maps that hold it, all counted): eight bytes each, and the three bytes
+/// that aligning the region may cost.
+pub fn canonicalScratchSize(comptime max_entries: usize) usize {
+    return max_entries * @sizeOf(MapEntry) + @alignOf(MapEntry) - 1;
+}
+
+/// Where a map entry is in the input: its key, and its value, which follows the key.
+const MapEntry = struct { key: u32, value: u32 };
+
+/// `canonicalize` into the caller's memory, with no allocator: the deterministic form of the one well-formed item
+/// in `bytes` is written to the front of `dst` and returned. It is never longer than `bytes`, so a `dst` of that
+/// length is enough (`error.NoSpaceLeft` otherwise). `scratch` holds an index of the entries of the maps being
+/// written, 8 bytes each, which is how a map is put in key order without copying its entries: they are
+/// written once, in order, from the input. `canonicalScratchSize(n)` is enough for `n` entries open at once, and
+/// `error.OutOfMemory` says it was not. The nesting bound is `max_nesting`.
+///
+/// The result is what `canonicalize` gives for an item whose map keys are all scalars (integers, strings, floats,
+/// simple values). A map key that is an array or a map is `error.UnexpectedType`, as in `PullReader`: ordering it
+/// would need its own canonical form kept, which has no bound. A tag is `error.UnexpectedTag` and a repeated key,
+/// including 0.0 and -0.0 (RFC 8949 section 5.6.1), is `error.DuplicateField`.
+pub fn canonicalizeInto(dst: []u8, scratch: []u8, bytes: []const u8) ![]u8 {
+    if (bytes.len > std.math.maxInt(u32)) return error.InputTooLarge;
+    const skip = std.mem.alignPointerOffset(scratch.ptr, @alignOf(MapEntry)) orelse scratch.len;
+    const aligned = scratch[@min(skip, scratch.len)..];
+    const entries: []MapEntry = @as([*]MapEntry, @ptrCast(@alignCast(aligned.ptr)))[0 .. aligned.len / @sizeOf(MapEntry)];
+    var writer: CanonicalWriter = .{ .input = bytes, .dst = dst, .entries = entries };
+    var index: usize = 0;
+    try writer.item(&index, 0);
+    if (index != bytes.len) return error.TrailingCharacters;
+    return dst[0..writer.out];
+}
+
+const CanonicalWriter = struct {
+    input: []const u8,
+    dst: []u8,
+    out: usize = 0,
+    entries: []MapEntry,
+    /// Entries of the maps open now, which are `entries[0..top]`.
+    top: usize = 0,
+
+    fn put(self: *CanonicalWriter, bytes: []const u8) !void {
+        if (bytes.len > self.dst.len - self.out) return error.NoSpaceLeft;
+        @memcpy(self.dst[self.out..][0..bytes.len], bytes);
+        self.out += bytes.len;
+    }
+
+    fn putHead(self: *CanonicalWriter, major: u8, value: u64) !void {
+        var head: [9]u8 = undefined;
+        try self.put(head[0..writeHead(&head, major, value)]);
+    }
+
+    /// The canonical form of the item at `index.*`, which is left after it.
+    fn item(self: *CanonicalWriter, index: *usize, depth: usize) anyerror!void {
+        const header = try parseHeader(self.input, index);
+        switch (header.major) {
+            0, 1 => try self.putHead(header.major, header.value),
+            2, 3 => {
+                const total = try self.measure(index, header);
+                try self.putHead(header.major, total);
+                try self.copyString(index, header);
+            },
+            4 => {
+                if (depth >= max_nesting) return error.CborNestingTooDeep;
+                if (!header.indefinite) {
+                    try self.putHead(4, try boundedItems(self.input, index.*, header.value, 1));
+                    for (0..@intCast(header.value)) |_| try self.item(index, depth + 1);
+                    return;
+                }
+                // The count is known at the break: the items go after one byte for the head, and move up if it is longer.
+                const start = self.out;
+                try self.put(&.{0});
+                var count: u64 = 0;
+                while (try moreItems(self.input, index)) : (count += 1) try self.item(index, depth + 1);
+                var head: [9]u8 = undefined;
+                const length = writeHead(&head, 4, count);
+                if (length > 1) {
+                    if (length - 1 > self.dst.len - self.out) return error.NoSpaceLeft;
+                    const moved = self.out - start - 1;
+                    @memmove(self.dst[start + length ..][0..moved], self.dst[start + 1 ..][0..moved]);
+                    self.out += length - 1;
+                }
+                @memcpy(self.dst[start..][0..length], head[0..length]);
+            },
+            5 => try self.map(index, header, depth),
+            6 => return error.UnexpectedTag,
+            else => switch (header.ai) {
+                25, 26, 27 => {
+                    var buffer: [9]u8 = undefined;
+                    var fixed = std.Io.Writer.fixed(&buffer);
+                    try writePreferredFloat(&fixed, floatValue(header));
+                    try self.put(fixed.buffered());
+                },
+                else => try self.putHead(7, header.value),
+            },
+        }
+    }
+
+    /// The map whose head is `header`: its entries are indexed by position in the input, sorted by the canonical
+    /// form of their keys, then written once each, in that order.
+    fn map(self: *CanonicalWriter, index: *usize, header: Header, depth: usize) anyerror!void {
+        if (depth >= max_nesting) return error.CborNestingTooDeep;
+        const base = self.top;
+        defer self.top = base;
+        var zero = false;
+        var signs: u2 = 0;
+        var count: u64 = 0;
+        const definite = !header.indefinite;
+        const expected = if (definite) try boundedItems(self.input, index.*, header.value, 2) else 0;
+        while (if (definite) count < expected else try moreItems(self.input, index)) : (count += 1) {
+            const key = index.*;
+            var cursor = key;
+            const key_head = try parseHeader(self.input, &cursor);
+            switch (key_head.major) {
+                4, 5 => return error.UnexpectedType,
+                6 => return error.UnexpectedTag,
+                // 0.0 and -0.0 are one key (RFC 8949 section 5.6.1) and are written differently, so not always neighbours.
+                7 => if (key_head.ai >= 25 and key_head.ai <= 27 and floatValue(key_head) == 0) {
+                    signs |= if (std.math.signbit(floatValue(key_head))) 2 else 1;
+                    if (signs == 3) return error.DuplicateField;
+                },
+                else => {},
+            }
+            try checkItem(self.input, index, depth + 1, false, &zero);
+            const value = index.*;
+            try checkItem(self.input, index, depth + 1, false, &zero);
+            if (self.top == self.entries.len) return error.OutOfMemory;
+            self.entries[self.top] = .{ .key = @intCast(key), .value = @intCast(value) };
+            self.top += 1;
+        }
+        const mine = self.entries[base..self.top];
+        std.sort.pdq(MapEntry, mine, self, entryLess);
+        for (mine[@min(1, mine.len)..], 0..) |entry, at| {
+            if (try self.keyOrder(mine[at].key, entry.key) == .eq) return error.DuplicateField;
+        }
+
+        try self.putHead(5, mine.len);
+        const end = index.*;
+        for (mine) |entry| {
+            var at: usize = entry.key;
+            try self.item(&at, depth + 1);
+            at = entry.value;
+            try self.item(&at, depth + 1);
+        }
+        index.* = end;
+    }
+
+    fn entryLess(self: *CanonicalWriter, a: MapEntry, b: MapEntry) bool {
+        // The keys were checked when they were indexed, so the order of two cannot fail.
+        return (self.keyOrder(a.key, b.key) catch unreachable) == .lt;
+    }
+
+    /// The order of the canonical forms of the scalar keys at two input positions, compared as bytes: the head,
+    /// which says the type and the length, and then the content of a string, which may be in chunks.
+    fn keyOrder(self: *CanonicalWriter, a: u32, b: u32) !std.math.Order {
+        const x = try self.keyImage(a);
+        const y = try self.keyImage(b);
+        const heads = std.mem.order(u8, x.head[0..x.head_len], y.head[0..y.head_len]);
+        if (heads != .eq) return heads;
+        return self.contentOrder(x, y);
+    }
+
+    const KeyImage = struct {
+        head: [9]u8 = undefined,
+        head_len: usize = 0,
+        /// Where the content is: the bytes of a definite string, else the first chunk head of a chunked one.
+        content: usize = 0,
+        content_len: usize = 0,
+        chunked: bool = false,
+    };
+
+    fn keyImage(self: *CanonicalWriter, at: usize) !KeyImage {
+        var cursor = at;
+        const header = try parseHeader(self.input, &cursor);
+        var image: KeyImage = .{};
+        switch (header.major) {
+            0, 1 => image.head_len = writeHead(&image.head, header.major, header.value),
+            2, 3 => {
+                const total = try self.measure(&cursor, header);
+                image.head_len = writeHead(&image.head, header.major, total);
+                image.content = cursor;
+                image.content_len = @intCast(total);
+                image.chunked = header.indefinite;
+            },
+            7 => switch (header.ai) {
+                25, 26, 27 => {
+                    var fixed = std.Io.Writer.fixed(&image.head);
+                    try writePreferredFloat(&fixed, floatValue(header));
+                    image.head_len = fixed.end;
+                },
+                else => image.head_len = writeHead(&image.head, 7, header.value),
+            },
+            else => return error.UnexpectedType,
+        }
+        return image;
+    }
+
+    fn contentOrder(self: *CanonicalWriter, x: KeyImage, y: KeyImage) !std.math.Order {
+        var left: ChunkCursor = .{ .input = self.input, .at = x.content, .chunked = x.chunked };
+        var right: ChunkCursor = .{ .input = self.input, .at = y.content, .chunked = y.chunked };
+        var remaining = x.content_len;
+        while (remaining != 0) {
+            const a = try left.piece(remaining);
+            const b = try right.piece(remaining);
+            const take = @min(a.len, b.len);
+            const order = std.mem.order(u8, a[0..take], b[0..take]);
+            if (order != .eq) return order;
+            left.advance(take);
+            right.advance(take);
+            remaining -= take;
+        }
+        return .eq;
+    }
+
+    /// The length of the string whose head is `header`, which is the sum of its chunks if it has any.
+    /// `index.*`, after the head, is not moved: it is at the content of a definite string, or the first chunk head.
+    fn measure(self: *CanonicalWriter, index: *usize, header: Header) !u64 {
+        if (!header.indefinite) {
+            if (header.value > self.input.len - index.*) return error.UnexpectedEndOfInput;
+            return header.value;
+        }
+        var cursor = index.*;
+        var total: u64 = 0;
+        while (try moreItems(self.input, &cursor)) {
+            const chunk = try parseHeader(self.input, &cursor);
+            if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;
+            if (chunk.value > self.input.len - cursor) return error.UnexpectedEndOfInput;
+            cursor += @intCast(chunk.value);
+            total += chunk.value;
+        }
+        return total;
+    }
+
+    /// Writes the content of the string whose head is `header`, `index.*` being after it, checking text as
+    /// UTF-8, and leaves `index.*` after the string.
+    fn copyString(self: *CanonicalWriter, index: *usize, header: Header) !void {
+        if (!header.indefinite) {
+            const raw = self.input[index.*..][0..@intCast(header.value)];
+            if (header.major == 3 and !bulk.validUtf8(raw)) return error.InvalidUtf8;
+            try self.put(raw);
+            index.* += raw.len;
+            return;
+        }
+        while (try moreItems(self.input, index)) {
+            const chunk = try parseHeader(self.input, index);
+            const raw = self.input[index.*..][0..@intCast(chunk.value)];
+            if (header.major == 3 and !bulk.validUtf8(raw)) return error.InvalidUtf8;
+            try self.put(raw);
+            index.* += raw.len;
+        }
+    }
+};
+
+/// The bytes of a string's content, which may be in chunks, read piece by piece.
+const ChunkCursor = struct {
+    input: []const u8,
+    at: usize,
+    chunked: bool,
+    left: usize = 0,
+
+    /// The next bytes, at most `most` of them.
+    fn piece(self: *ChunkCursor, most: usize) ![]const u8 {
+        if (!self.chunked) return self.input[self.at..][0..most];
+        while (self.left == 0) {
+            const chunk = try parseHeader(self.input, &self.at);
+            self.left = @intCast(chunk.value);
+        }
+        return self.input[self.at..][0..self.left];
+    }
+
+    fn advance(self: *ChunkCursor, count: usize) void {
+        self.at += count;
+        if (self.chunked) self.left -= count;
+    }
+};
+
+/// The number of items of a definite container at `index`, which cannot be more than the input has bytes
+/// left at `per_item` each.
+fn boundedItems(input: []const u8, index: usize, count: u64, per_item: usize) !u64 {
+    if (count > (input.len - index) / per_item) return error.UnexpectedEndOfInput;
+    return count;
+}
+
+/// Whether an indefinite-length container has another item, consuming its break if not.
+fn moreItems(input: []const u8, index: *usize) !bool {
+    if (index.* >= input.len) return error.UnexpectedEndOfInput;
+    if (input[index.*] != 0xff) return true;
+    index.* += 1;
+    return false;
+}
+
 /// A pull reader over a CBOR input: `next` returns the events of one item in order, for a shape
 /// that is only known while reading. It checks what a typed read does, as the mode and limits say,
 /// including ascending keys in a strict read and no repeated key in a map. A map's keys must be
