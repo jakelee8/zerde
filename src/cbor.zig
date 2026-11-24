@@ -72,6 +72,13 @@ pub const Mode = enum {
     /// only as `0xf97e00`, and no tags (self-described CBOR included). Anything else is
     /// `error.NonDeterministicEncoding`, or `error.DuplicateField` for a repeated key and
     /// `error.UnexpectedTag` for a tag. This is the check a boundary that requires canonical input uses.
+    ///
+    /// A strict read keeps no record of a key and allocates nothing for the repeated-key check: one data item
+    /// has one deterministic encoding, so equal keys are neighbours in the ascending order and are compared as
+    /// bytes. The exception is that RFC 8949 §5.6.1 makes 0.0 and -0.0 the same key though they are written
+    /// differently and need not be neighbours: a map with both as keys is `error.DuplicateField`, and a key
+    /// that is an array or a map and holds a float zero anywhere inside it is `error.NonDeterministicEncoding`
+    /// (the one input strict refuses that is well-formed and valid, because telling its repeats needs a record).
     strict,
 };
 pub const WriteConfig = struct {
@@ -169,10 +176,16 @@ const Container = struct {
     /// keys only and the records are released when it ends.
     keys_base: usize = 0,
     key_bytes_base: usize = 0,
-    /// The encoded bytes of the previous key in the input (an empty span for none), which a strict
-    /// read compares the next key to.
-    prev_key_start: usize = 0,
-    prev_key_end: usize = 0,
+    /// A strict read's check of the keys against each other.
+    order: KeyOrder = .{},
+};
+
+/// The last key of a map in a strict read (an empty span for none), which the next key is compared to, and
+/// which of the zeros 0.0 (bit 0) and -0.0 (bit 1) have been keys.
+const KeyOrder = struct {
+    start: usize = 0,
+    end: usize = 0,
+    zeros: u2 = 0,
 };
 
 const Header = struct {
@@ -425,10 +438,13 @@ pub fn CborDeserializer(comptime Config: type) type {
         extra_keys: std.ArrayList(u8) = .empty,
         stack: [max_nesting]Container = undefined,
         stack_len: usize = 0,
-        /// Keys of the maps being read, innermost last, for the duplicate check.
+        /// Keys of the maps being read, innermost last, for the duplicate check of a lenient read. A strict
+        /// read keeps none: its keys are in order, so a repeat is the key before.
         keys: std.ArrayList(KeyRecord) = .empty,
         /// The bytes of keys that are not contiguous in the input (indefinite-length strings).
         key_bytes: std.ArrayList(u8) = .empty,
+        /// A strict read sets this when it reads a float zero, which a key that holds one is refused for (`recordKeyItem`).
+        zero_float: bool = false,
 
         const Self = @This();
 
@@ -735,10 +751,7 @@ pub fn CborDeserializer(comptime Config: type) type {
             const start = self.index;
             const result = try self.lookupKey(T, cfg, start);
             if (result == .unknown) self.last_key = .{ start, self.index };
-            var previous: [2]usize = .{ frame.prev_key_start, frame.prev_key_end };
-            try self.checkKeyOrder(&previous, start);
-            frame.prev_key_start = previous[0];
-            frame.prev_key_end = previous[1];
+            try self.checkKeyOrder(&frame.order, start);
             return result;
         }
 
@@ -780,7 +793,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                     const value: i128 = if (header.major == 0) header.value else -@as(i128, header.value) - 1;
                     if (typed.matchStructFieldIndexInteger(T, cfg, value)) |index| return .{ .field_index = index };
                     if (refused) return .unknown;
-                    try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
+                    if (!self.strict) try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
                     return .unknown;
                 },
                 else => {
@@ -890,6 +903,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 if (header.major == 6) return error.UnexpectedTag;
                 if (header.indefinite or !isShortestHead(header)) return error.NonDeterministicEncoding;
                 if (header.major == 7 and !isPreferredFloat(header)) return error.NonDeterministicEncoding;
+                if (header.major == 7 and header.ai >= 25 and header.ai <= 27 and floatValue(header) == 0) self.zero_float = true;
             }
             return header;
         }
@@ -987,7 +1001,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                     if (depth >= self.max_depth) return error.CborNestingTooDeep;
                     const keys_base = self.keys.items.len;
                     const key_bytes_base = self.key_bytes.items.len;
-                    var previous: [2]usize = .{ 0, 0 };
+                    var order: KeyOrder = .{};
                     if (header.indefinite) {
                         // A strict read has refused an indefinite map already, so no order to check.
                         while (try self.moreItems()) {
@@ -998,7 +1012,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                         for (0..try self.boundedCount(header.value, 2)) |_| {
                             const key_start = self.index;
                             try self.recordKeyItem(depth + 1);
-                            try self.checkKeyOrder(&previous, key_start);
+                            try self.checkKeyOrder(&order, key_start);
                             try self.skipItem(depth + 1);
                         }
                     }
@@ -1022,24 +1036,25 @@ pub fn CborDeserializer(comptime Config: type) type {
         }
 
         /// A strict read needs each key of a map to sort after the one before it by its encoded bytes
-        /// (RFC 8949 §4.2.1), which also rules out a repeated key. `previous` is the span of the last key.
-        fn checkKeyOrder(self: *Self, previous: *[2]usize, start: usize) !void {
+        /// (RFC 8949 §4.2.1), which also rules out a repeated key: one data item has one deterministic
+        /// encoding. `order` is the last key and what the map has of the zeros 0.0 and -0.0, which are
+        /// the same key (RFC 8949 section 5.6.1) though they are written differently and need not be neighbours.
+        fn checkKeyOrder(self: *Self, order: *KeyOrder, start: usize) !void {
             if (!self.strict) return;
             const key = self.input[start..self.index];
-            if (previous[1] != 0) {
-                const before = self.input[previous[0]..previous[1]];
+            if (order.end != 0) {
+                const before = self.input[order.start..order.end];
                 if (std.mem.eql(u8, before, key)) return error.DuplicateField;
                 if (!std.mem.lessThan(u8, before, key)) return error.NonDeterministicEncoding;
             }
-            previous.* = .{ start, self.index };
+            order.start = start;
+            order.end = self.index;
+            // The preferred form of a zero is the half float (`isPreferredFloat`).
+            if (key.len == 3 and key[0] == 0xf9 and std.mem.readInt(u16, key[1..3], .big) & 0x7fff == 0) try noteZeroKey(order, key);
         }
 
         fn orderFrameKey(self: *Self, start: usize) !void {
-            const frame = self.current();
-            var previous: [2]usize = .{ frame.prev_key_start, frame.prev_key_end };
-            try self.checkKeyOrder(&previous, start);
-            frame.prev_key_start = previous[0];
-            frame.prev_key_end = previous[1];
+            try self.checkKeyOrder(&self.current().order, start);
         }
 
         /// Whether an indefinite-length container has another item, consuming its break if not.
@@ -1057,6 +1072,28 @@ pub fn CborDeserializer(comptime Config: type) type {
             const start = self.index;
             const header = try self.nextHead();
             try self.checkFloat(header);
+            if (self.strict) {
+                // A deterministic encoding has one form for each key, so equal keys are neighbours (`checkKeyOrder`)
+                // and nothing is recorded. The one equal pair of different forms is 0.0 and -0.0 (RFC 8949 section
+                // 5.6.1): a float key is checked for it there, and a key that holds one inside is refused here.
+                switch (header.major) {
+                    0, 1, 7 => {},
+                    2, 3 => {
+                        const token = try self.finishString(self.allocator, header);
+                        token.deinit(self.allocator);
+                    },
+                    else => {
+                        self.index = start;
+                        self.items -= 1;
+                        const outer = self.zero_float;
+                        self.zero_float = false;
+                        try self.skipItem(depth);
+                        if (self.zero_float) return error.NonDeterministicEncoding;
+                        self.zero_float = outer;
+                    },
+                }
+                return;
+            }
             const record: KeyRecord = switch (header.major) {
                 0 => .{ .kind = .uint, .a = header.value },
                 1 => .{ .kind = .nint, .a = header.value },
@@ -1186,6 +1223,8 @@ pub fn CborDeserializer(comptime Config: type) type {
         }
 
         fn recordString(self: *Self, kind: KeyKind, token: StringToken) !void {
+            // A strict read compares neighbours and keeps no record.
+            if (self.strict) return;
             if (!token.allocated) {
                 const offset = @intFromPtr(token.bytes.ptr) - @intFromPtr(self.input.ptr);
                 try self.keys.append(self.allocator, .{ .kind = kind, .a = offset, .b = token.bytes.len });
@@ -1360,11 +1399,15 @@ fn skipTrusted(input: []const u8, index: *usize, depth: usize) !void {
 /// allocation, which `validate` has.
 fn verifyItem(input: []const u8, deterministic: bool) !void {
     var index: usize = 0;
-    try checkItem(input, &index, 0, deterministic);
+    var zero = false;
+    try checkItem(input, &index, 0, deterministic, &zero);
     if (index != input.len) return error.TrailingCharacters;
 }
 
-fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool) anyerror!void {
+/// `zero` is set when the item holds a float zero, which a deterministic check needs for a key: 0.0 and -0.0
+/// are one key (RFC 8949 section 5.6.1), so a map may not have both, and a key that holds one is refused, as a
+/// strict read does (`CborDeserializer.recordKeyItem`).
+fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool, zero: *bool) anyerror!void {
     var header = try parseHeader(input, index);
     while (header.major == 6) {
         // A tag adds no nesting; a strict reader refuses it.
@@ -1374,6 +1417,7 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
     if (deterministic) {
         if (header.indefinite or !isShortestHead(header)) return error.NonDeterministicEncoding;
         if (header.major == 7 and !isPreferredFloat(header)) return error.NonDeterministicEncoding;
+        if (header.major == 7 and header.ai >= 25 and header.ai <= 27 and floatValue(header) == 0) zero.* = true;
     }
     switch (header.major) {
         0, 1, 7 => {},
@@ -1400,26 +1444,38 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
                         break;
                     }
                     var step: u64 = 0;
-                    while (step < per) : (step += 1) try checkItem(input, index, depth + 1, deterministic);
+                    while (step < per) : (step += 1) try checkItem(input, index, depth + 1, deterministic, zero);
                 }
             } else {
-                var previous: ?[]const u8 = null;
+                var order: KeyOrder = .{};
                 var count: u64 = 0;
                 while (count < header.value) : (count += 1) {
                     const key_start = index.*;
-                    try checkItem(input, index, depth + 1, deterministic);
+                    var key_zero = false;
+                    try checkItem(input, index, depth + 1, deterministic, &key_zero);
+                    zero.* = zero.* or key_zero;
                     if (per == 2) {
                         if (deterministic) {
                             const key = input[key_start..index.*];
-                            if (previous) |before| if (!std.mem.lessThan(u8, before, key)) return error.NonDeterministicEncoding;
-                            previous = key;
+                            if (order.end != 0 and !std.mem.lessThan(u8, input[order.start..order.end], key)) return error.NonDeterministicEncoding;
+                            order.start = key_start;
+                            order.end = index.*;
+                            if (key_zero) try noteZeroKey(&order, key);
                         }
-                        try checkItem(input, index, depth + 1, deterministic);
+                        try checkItem(input, index, depth + 1, deterministic, zero);
                     }
                 }
             }
         },
     }
+}
+
+/// A key that holds a float zero: a float zero itself marks its sign in `order`, and both signs are one key
+/// twice; any other key (an array or map) is refused.
+fn noteZeroKey(order: *KeyOrder, key: []const u8) !void {
+    if (key.len != 3 or key[0] != 0xf9) return error.NonDeterministicEncoding;
+    order.zeros |= if (std.mem.readInt(u16, key[1..3], .big) == 0) 1 else 2;
+    if (order.zeros == 3) return error.DuplicateField;
 }
 
 fn checkString(input: []const u8, index: *usize, header: Header) !void {

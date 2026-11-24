@@ -529,6 +529,14 @@ Anything else is `error.NonDeterministicEncoding`, or `error.DuplicateField` for
 `error.UnexpectedTag` for a tag. Strict checks apply to skipped values and keys too. JSON has one form, so
 it has no mode.
 
+A strict read finds a repeated key as its neighbour and keeps no record and no sort for it: one data item has
+one deterministic encoding, so equal keys are adjacent in the ascending order and compared as bytes, and the
+bound of a `Raw` item has no key scratch. The one pair of different encodings that are one key is 0.0 and -0.0
+(RFC 8949 §5.6.1): a map with both is `error.DuplicateField` (checked with two flags per map), and a key that
+is an array or a map and holds a float zero anywhere inside it is `error.NonDeterministicEncoding`, the one input
+a strict read refuses that is well-formed and valid, because telling its repeats needs a record. A deterministic
+write applies the same rule to the `Raw` and extras values it puts out.
+
 Both readers take limits, so a hostile input costs a bounded amount: `max_depth` (open containers; at most
 128, a larger value is a compile error), `max_items` (data items in the whole input, keys and values each counted, `error.TooManyItems`) and
 `max_string_len` (bytes of one string after decoding, `error.StringTooLong`). The input size is

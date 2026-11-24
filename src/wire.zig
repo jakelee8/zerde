@@ -815,6 +815,9 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             break :blk .{ .text = .{ .fixed = token + n }, .transient = building(token) };
         },
         .raw => blk: {
+            // A strict read keeps no record of a key (it compares neighbours, and refuses a composite key that
+            // holds a float zero), so a raw item of CBOR costs nothing.
+            if (limits.strict) break :blk .{};
             // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
             // for a key that is itself an array or map its canonical bytes, once more at each level of
             // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so

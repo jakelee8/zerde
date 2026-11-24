@@ -1061,6 +1061,102 @@ test "strict needs map keys in ascending order of their encoded bytes, with none
     // Lenient takes any order.
     _ = try zerde.cbor.parseSlice(Probe, allocator, &.{ 0xa2, 0x61, 'b', 0x00, 0x61, 'a', 0x00 });
 }
+// ---- a strict read finds a repeated key by its neighbour and keeps no record -------------------------------
+
+const RawHolder = struct { r: zerde.cbor.Raw, a: ?u8 = null };
+
+/// `{"r": <raw>}` read strict.
+fn strictRaw(raw: []const u8) !RawHolder {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x61, 'r' });
+    try input.appendSlice(allocator, raw);
+    return zerde.cbor.parseSliceAliasedWith(RawHolder, allocator, input.items, .{}, strict);
+}
+
+test "a strict read allocates nothing to check keys: text, integer, byte and unknown keys, in a Raw and in a skipped value" {
+    // {1: 0, "a": 1, "b": {1: 0, 2: 0, "k": 0}, "r": {-1: 0, h'61': 0}} in deterministic order.
+    const input = [_]u8{ 0xa4, 0x01, 0x00, 0x61, 'a', 0x01, 0x61, 'b', 0xa3, 0x01, 0x00, 0x02, 0x00, 0x61, 'k', 0x00, 0x61, 'r', 0xa2, 0x20, 0x00, 0x41, 0x61, 0x00 };
+    var none = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const got = try zerde.cbor.parseSliceAliasedWith(RawHolder, none.allocator(), &input, .{}, strict);
+    try std.testing.expectEqual(@as(?u8, 1), got.a);
+    try std.testing.expectEqualSlices(u8, input[18..], got.r.bytes);
+    // The lenient read records the keys, which is what it spends the allocation on.
+    var some = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, zerde.cbor.parseSliceAliasedWith(RawHolder, some.allocator(), &input, .{}, .{}));
+}
+
+test "a strict read refuses a repeated key as its neighbour, in every place a map is read" {
+    // A key no field declares, a key in a skipped value, a key in a Raw, a dynamic value, a pull reader.
+    try expectStrict(Probe, error.DuplicateField, &.{ 0xa2, 0x61, 'x', 0x00, 0x61, 'x', 0x01 });
+    try expectStrict(Probe, error.DuplicateField, &.{ 0xa1, 0x61, 'z', 0xa2, 0x01, 0x00, 0x01, 0x00 });
+    try std.testing.expectError(error.DuplicateField, strictRaw(&.{ 0xa3, 0x61, 'x', 0x00, 0x61, 'y', 0x00, 0x61, 'y', 0x01 }));
+    try std.testing.expectError(error.DuplicateField, zerde.value.parseSliceWith(zerde.cbor, allocator, &.{ 0xa2, 0x61, 'x', 0x00, 0x61, 'x', 0x01 }, strict));
+    var pull = try zerde.cbor.pullReader(allocator, &.{ 0xa2, 0x61, 'x', 0x00, 0x61, 'x', 0x01 }, strict);
+    defer pull.deinit();
+    var failed = false;
+    while (pull.next()) |event| {
+        if (event == null) break;
+    } else |err| {
+        try std.testing.expectEqual(error.DuplicateField, err);
+        failed = true;
+    }
+    try std.testing.expect(failed);
+    // Different keys are fine, and equal keys in different maps are not repeats.
+    _ = try strictRaw(&.{ 0xa2, 0x61, 'x', 0xa1, 0x61, 'k', 0x00, 0x61, 'y', 0xa1, 0x61, 'k', 0x00 });
+}
+
+test "a strict read keeps 0.0 and -0.0 one key though their encodings are not neighbours (RFC 8949 section 5.6.1)" {
+    const zero = [_]u8{ 0xf9, 0x00, 0x00 };
+    const small = [_]u8{ 0xf9, 0x00, 0x01 };
+    const minus = [_]u8{ 0xf9, 0x80, 0x00 };
+    // 0.0, the smallest subnormal and -0.0 sort in this order, so the zeros are not neighbours.
+    const apart = [_]u8{0xa3} ++ zero ++ [_]u8{0x00} ++ small ++ [_]u8{0x00} ++ minus ++ [_]u8{0x00};
+    try expectStrict(Probe, error.DuplicateField, &apart);
+    try expectStrict(Probe, error.DuplicateField, &([_]u8{0xa2} ++ zero ++ [_]u8{0x00} ++ minus ++ [_]u8{0x00}));
+    // In a skipped value, in a Raw, and in a pull reader.
+    try expectStrict(Probe, error.DuplicateField, &([_]u8{ 0xa1, 0x61, 'z' } ++ apart));
+    try std.testing.expectError(error.DuplicateField, strictRaw(&apart));
+    // Either alone is a key, with or without the subnormal.
+    _ = try strictRaw(&([_]u8{0xa2} ++ zero ++ [_]u8{0x00} ++ small ++ [_]u8{0x00}));
+    _ = try strictRaw(&([_]u8{0xa2} ++ small ++ [_]u8{0x00} ++ minus ++ [_]u8{0x00}));
+    _ = try strictRaw(&([_]u8{0xa1} ++ minus ++ [_]u8{0x00}));
+    // A deterministic write puts out a Raw only if a strict read takes it.
+    const bad = RawHolder{ .r = .{ .bytes = &apart } };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.cbor, &out.writer, bad, .{}, .{ .deterministic = true }));
+}
+
+test "a strict read refuses a composite key that holds a float zero, and takes any other composite key" {
+    // The one case where equality of keys is not equality of bytes, so the check without records cannot tell.
+    const E = error.NonDeterministicEncoding;
+    try std.testing.expectError(E, strictRaw(&.{ 0xa1, 0x81, 0xf9, 0x00, 0x00, 0x00 })); // {[0.0]: 0}
+    try std.testing.expectError(E, strictRaw(&.{ 0xa1, 0x81, 0xf9, 0x80, 0x00, 0x00 })); // {[-0.0]: 0}
+    try std.testing.expectError(E, strictRaw(&.{ 0xa1, 0xa1, 0x01, 0xf9, 0x00, 0x00, 0x00 })); // {{1: 0.0}: 0}
+    try std.testing.expectError(E, strictRaw(&.{ 0xa1, 0xa1, 0xf9, 0x00, 0x00, 0x01, 0x00 })); // {{0.0: 1}: 0}
+    // A zero before a composite key inside the key is still inside it: {[0.0, {[1]: 2}]: 0}.
+    try std.testing.expectError(E, strictRaw(&.{ 0xa1, 0x82, 0xf9, 0x00, 0x00, 0xa1, 0x81, 0x01, 0x02, 0x00 }));
+    // The same key twice is a repeat, as its neighbour.
+    try std.testing.expectError(error.DuplicateField, strictRaw(&.{ 0xa2, 0x81, 0x01, 0x00, 0x81, 0x01, 0x01 }));
+    // Composite keys without a zero, and a zero in a value, are fine: no record is kept for them.
+    var none = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x61, 'r', 0xa3, 0x81, 0x01, 0x00, 0x81, 0x02, 0x81, 0xf9, 0x00, 0x00, 0xa1, 0x01, 0x02, 0x00 });
+    const got = try zerde.cbor.parseSliceAliasedWith(RawHolder, none.allocator(), input.items, .{}, strict);
+    try std.testing.expectEqual(@as(usize, 14), got.r.bytes.len);
+    // Lenient is not narrower: [0.0] and [-0.0] are the same key there.
+    try expectCborError(Probe, error.DuplicateField, &.{ 0xa2, 0x81, 0xf9, 0x00, 0x00, 0x00, 0x81, 0xf9, 0x80, 0x00, 0x00 });
+    // The write-side check of a deterministic Raw is the same rule: a composite key with a zero is refused.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const holder = RawHolder{ .r = .{ .bytes = &.{ 0xa1, 0x81, 0xf9, 0x00, 0x00, 0x00 } } };
+    try std.testing.expectError(E, zerde.serializeWith(zerde.cbor, &out.writer, holder, .{}, .{ .deterministic = true }));
+    // Without the zero it is written.
+    const fine = RawHolder{ .r = .{ .bytes = &.{ 0xa1, 0x81, 0x01, 0x00 } } };
+    try zerde.serializeWith(zerde.cbor, &out.writer, fine, .{}, .{ .deterministic = true });
+}
 
 test "limits: depth, items and string length" {
     // Depth: a map holding an array holding an array is three levels.
@@ -4852,6 +4948,20 @@ test "figures for a strict read, and for a union variant that holds a bounded li
     const strict_cfg = .{ .mode = zerde.cbor.Mode.strict };
     // Nothing is rewritten and each list is allocated once, at its exact size: 10 * 8 + 3, the wire array 10 * 8 + 16.
     try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Text, .{}, strict_cfg));
+    // A raw item of a strict read keeps no key record: it costs nothing, and a lenient one is charged for them.
+    const Raws4 = struct {
+        r: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .r = .{ .max_len = 400 } } };
+    };
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Raws4, .{}, strict_cfg));
+    try std.testing.expect(wire.maxArenaSize(zerde.cbor, Raws4, .{}, .{}) > 100_000);
+    // And it decodes a raw item of 130 integer keys in an arena of exactly that.
+    var keys: std.ArrayList(u8) = .empty;
+    defer keys.deinit(allocator);
+    try keys.appendSlice(allocator, &.{ 0xa1, 0x61, 'r', 0xb8, 130 });
+    for (0..130) |index| try keys.appendSlice(allocator, &.{ 0x18, @as(u8, @intCast(index + 24)), 0x00 });
+    const used = try decodeWithin(zerde.cbor, Raws4, 256, keys.items, strict_cfg);
+    try std.testing.expectEqual(@as(usize, 0), used);
     try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Blob3, .{}, strict_cfg));
     try std.testing.expectEqual(@as(usize, 83 + 256), wire.maxArenaSize(zerde.cbor, Rows, .{}, strict_cfg));
     // A strict list that draws on the budget costs its size and alignment per item.
