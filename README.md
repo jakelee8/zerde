@@ -297,6 +297,10 @@ What they refuse, and why:
 - a JSON object member repeated in a field the type reads (`error.DuplicateField`); RFC 8259 §4 allows
   repeated names, so this is a policy, and one that has not been settled. A repeated member in a field
   the type does not read is skipped
+- a JSON object that names a member twice inside a `json.Raw` item, at any depth and however the name is spelled
+  (`a` and `\u0061` are one name): `error.DuplicateField`, as a `cbor.Raw` refuses a repeated key. The read checks the item
+  after it is well-formed, with a record of the names of the objects open, a span of the input each (16 bytes), compared
+  as decoded text when each object closes; `wire.regionSizes` charges that to the scratch region
 - in a dynamic `Value`: a JSON integer beyond 128 bits or a float literal too large for a double
   (`error.InvalidNumber` for an integer beyond 128 bits, `error.FloatOutOfRange` for a float literal that overflows); a CBOR map key that is not text
   (`error.UnexpectedType`), a tag (`error.UnexpectedTag`), and a simple value other than false, true and
@@ -635,7 +639,7 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   API: `output` and `scratch` are byte slices, and it returns `Decoded(T)`, the value and `used`, the bytes of `output`
   that hold what it points at. `wire.regionSizes(Format, T, serde_cfg, format_cfg)` gives at compile time their sizes,
   `.output` for the arrays and rewritten strings (which stay) and `.scratch` for what the reader keeps while it reads
-  (the key records of a lenient CBOR read of a `Raw`; nothing for a strict CBOR read or for JSON), which together are
+  (the key records of a lenient CBOR read of a `Raw`, and the name spans of a JSON `Raw`; nothing for a strict CBOR read or for JSON without a `Raw`), which together are
   `maxArenaSize` and are each an upper bound of their own. The scratch is free again when the call returns, so one
   region serves every decode and the output region stays as small as the value. A region too small is `error.OutOfMemory`.
   A resumable decode into a region (`wire.Resumable`, see Resumable reads) has its own `wire.resumableRegionSizes`.

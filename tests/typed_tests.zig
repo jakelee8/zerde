@@ -714,6 +714,52 @@ test "JSON duplicate members keep their present behaviour" {
     try std.testing.expectEqual(@as(?u8, 3), probe.a);
 }
 
+const JsonMetaBox = struct { meta: zerde.json.Raw };
+
+test "a json.Raw refuses a member that an object of its item names twice, at any depth and however it is spelled" {
+    const refused = [_][]const u8{
+        "{\"meta\":{\"a\":1,\"a\":2}}",
+        "{\"meta\":{\"a\":{\"b\":1},\"c\":{\"d\":[{\"e\":1,\"f\":2,\"e\":3}]}}}",
+        "{\"meta\":[1,{\"k\":{},\"k\":{}}]}",
+        "{\"meta\":{\"\":1,\"\":2}}",
+        // The same text spelled differently: an escape of a plain letter, of a control character, of a code point and a surrogate pair.
+        "{\"meta\":{\"a\":1,\"\\u0061\":2}}",
+        "{\"meta\":{\"\\n\":1,\"\\u000a\":2}}",
+        "{\"meta\":{\"\\/\":1,\"/\":2}}",
+        "{\"meta\":{\"caf\\u00e9\":1,\"caf\xc3\xa9\":2}}",
+        "{\"meta\":{\"\\ud83d\\ude00\":1,\"\xf0\x9f\x98\x80\":2}}",
+        "{\"meta\":{\"x\\ud83d\\ude00y\":1,\"x\\uD83D\\uDE00y\":2}}",
+        // Not neighbours in the input.
+        "{\"meta\":{\"a\":1,\"b\":2,\"c\":3,\"\\u0061\":4}}",
+    };
+    for (refused) |input| try expectJsonError(JsonMetaBox, error.DuplicateField, input);
+
+    // The same names in different objects, names that only share a prefix or differ in case, and names that decode to different text
+    // however they are spelled, are taken, and the item is the text it was read from.
+    const taken = [_][]const u8{
+        "{\"a\":{\"a\":1},\"b\":{\"a\":1}}",
+        "{\"a\":1,\"aa\":2,\"A\":3,\"b\":{\"a\":1,\"aa\":{\"a\":0}}}",
+        "[{\"a\":1},{\"a\":2}]",
+        "{\"ab\":1,\"a\\u0062c\":2,\"\\u0061b\\u0063\\u0064\":3}",
+        "{\"\\ud83d\\ude00\":1,\"\\ud83d\\ude01\":2,\"\xf0\x9f\x98\x80\xf0\x9f\x98\x80\":3}",
+        "{\"\\n\":1,\"\\\\n\":2,\"n\":3}",
+    };
+    for (taken) |item| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(allocator);
+        try text.print(allocator, "{{\"meta\":{s}}}", .{item});
+        const parsed = try zerde.json.parseSlice(JsonMetaBox, allocator, text.items);
+        defer allocator.free(parsed.meta.bytes);
+        try std.testing.expectEqualStrings(item, parsed.meta.bytes);
+    }
+    // A repeat after an item that had none is found: the names of the first item do not take part.
+    try expectJsonError(struct { first: zerde.json.Raw, second: zerde.json.Raw }, error.DuplicateField, "{\"first\":{\"a\":1},\"second\":{\"a\":1,\"a\":1}}");
+    // The pull reader's `raw` is the same read.
+    var pull = try zerde.json.pullReader(allocator, "{\"a\":1,\"\\u0061\":2}", .{});
+    defer pull.deinit();
+    try std.testing.expectError(error.DuplicateField, pull.raw());
+}
+
 test "an integral float is not accepted as an enum tag either" {
     const Role = enum(u8) { captain = 1, doctor = 2 };
     try expectCborError(Role, error.UnexpectedType, &.{ 0xf9, 0x3c, 0x00 });
@@ -4293,6 +4339,38 @@ test "what a lenient CBOR read keeps goes to the scratch region, which is free a
     try std.testing.expectError(error.DuplicateField, wire.decodeInto(zerde.cbor, RawBox, region[1024..][0..sizes.output], &scratch, @intFromPtr(&region), region[0..input.items.len], .{}, .{}));
     // A strict read needs none.
     try std.testing.expectEqual(@as(usize, 0), wire.regionSizes(zerde.cbor, RawBox, .{}, strict).scratch);
+}
+
+const JsonRawBox = struct {
+    r: zerde.json.Raw,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .r = .{ .max_len = 400 } } };
+};
+
+test "a json.Raw read keeps the names of its objects in the scratch region, as much as regionSizes says, and refuses a repeat" {
+    const sizes = comptime wire.regionSizes(zerde.json, JsonRawBox, .{}, .{});
+    try std.testing.expectEqual(wire.maxArenaSize(zerde.json, JsonRawBox, .{}, .{}), sizes.output + sizes.scratch);
+    // An item of 45 members (the list of names grows to its fourth capacity) of 361 bytes, in a region of exactly that scratch.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "{\"r\":{");
+    for (0..45) |index| {
+        if (index != 0) try input.append(allocator, ',');
+        try input.print(allocator, "\"k{d:0>2}\":0", .{index});
+    }
+    try input.appendSlice(allocator, "}}");
+    var region: [4096]u8 align(16) = undefined;
+    @memcpy(region[0..input.items.len], input.items);
+    var scratch: [sizes.scratch]u8 align(16) = undefined;
+    const decoded = try wire.decodeInto(zerde.json, JsonRawBox, region[1024..][0..sizes.output], &scratch, @intFromPtr(&region), region[0..input.items.len], .{}, .{});
+    try std.testing.expectEqual(@as(usize, 0), decoded.used);
+    try std.testing.expectEqual(@as(u32, @intCast(input.items.len - 6)), decoded.value.r.len);
+    // The names are charged to the scratch, not to the output: too little scratch is OutOfMemory.
+    try std.testing.expectError(error.OutOfMemory, wire.decodeInto(zerde.json, JsonRawBox, region[1024..][0..sizes.output], scratch[0..64], @intFromPtr(&region), region[0..input.items.len], .{}, .{}));
+    // The last name repeats the first, and is found with the same scratch.
+    input.items[input.items.len - 7] = '0';
+    input.items[input.items.len - 6] = '0';
+    @memcpy(region[0..input.items.len], input.items);
+    try std.testing.expectError(error.DuplicateField, wire.decodeInto(zerde.json, JsonRawBox, region[1024..][0..sizes.output], &scratch, @intFromPtr(&region), region[0..input.items.len], .{}, .{}));
 }
 
 // ---- a typed value written in windows, resumably ---------------------------------------------------------------

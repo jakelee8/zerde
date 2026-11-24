@@ -91,14 +91,13 @@ fn checkLimits(comptime cfg: anytype) void {
 pub fn readerDeserializer(allocator: Allocator, reader: *std.Io.Reader, comptime cfg: anytype) !JsonDeserializer(@TypeOf(cfg)) {
     comptime checkLimits(cfg);
     const input = try reader.allocRemaining(allocator, .limited(effectiveMaxInputBytes(cfg)));
-    return JsonDeserializer(@TypeOf(cfg)).initOwned(input, cfg);
+    return JsonDeserializer(@TypeOf(cfg)).initOwned(allocator, input, cfg);
 }
 
 /// Slice-backed deserializer. The raw bytes are borrowed from the caller.
 pub fn sliceDeserializer(allocator: Allocator, input: []const u8, comptime cfg: anytype) !JsonDeserializer(@TypeOf(cfg)) {
     comptime checkLimits(cfg);
-    _ = allocator;
-    return JsonDeserializer(@TypeOf(cfg)).initBorrowed(input, cfg);
+    return JsonDeserializer(@TypeOf(cfg)).initBorrowed(allocator, input, cfg);
 }
 
 /// Streaming JSON writer used by the typed layer.
@@ -357,6 +356,8 @@ pub fn JsonSerializer(comptime Config: type) type {
 /// Pull-based JSON reader used by the typed layer.
 pub fn JsonDeserializer(comptime Config: type) type {
     return struct {
+        /// Where `raw_keys` is allocated: the allocator the deserializer was made with.
+        allocator: Allocator,
         input: []const u8,
         cfg: Config,
         parser: Parser,
@@ -374,14 +375,17 @@ pub fn JsonDeserializer(comptime Config: type) type {
         /// Members collected for an extras field, innermost struct last; see `captureExtra`.
         extras: std.ArrayList(ExtraEntry) = .empty,
         extra_keys: std.ArrayList(u8) = .empty,
+        /// The names `readRaw` checks for a repeat, in the memory the deserializer was made with.
+        raw_keys: std.ArrayList(KeyRef) = .empty,
 
         const Self = @This();
 
         /// A tagged union is a string or a one-entry object (see `typed.zig`).
         pub const supports_unions = true;
 
-        fn initBorrowed(input: []const u8, cfg: Config) Self {
+        fn initBorrowed(allocator: Allocator, input: []const u8, cfg: Config) Self {
             return .{
+                .allocator = allocator,
                 .input = input,
                 .cfg = cfg,
                 .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)), .trusted_text = readLimitFlag(cfg, "trusted_text", false) },
@@ -392,8 +396,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
             };
         }
 
-        fn initOwned(input: []const u8, cfg: Config) Self {
+        fn initOwned(allocator: Allocator, input: []const u8, cfg: Config) Self {
             return .{
+                .allocator = allocator,
                 .input = input,
                 .cfg = cfg,
                 .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)), .trusted_text = readLimitFlag(cfg, "trusted_text", false) },
@@ -407,6 +412,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.extras.deinit(allocator);
             self.extra_keys.deinit(allocator);
+            self.raw_keys.deinit(allocator);
             if (self.owns_input) allocator.free(@constCast(self.input));
         }
 
@@ -731,7 +737,20 @@ pub fn JsonDeserializer(comptime Config: type) type {
             self.parser.skipWhitespace();
             const start = self.parser.index;
             try self.skipValue(allocator);
-            return .{ .bytes = self.input[start..self.parser.index], .allocated = false };
+            const bytes = self.input[start..self.parser.index];
+            try self.refuseRepeatedKeys(bytes);
+            return .{ .bytes = bytes, .allocated = false };
+        }
+
+        /// Walks the item `readRaw` has just checked, and refuses an object that names a member twice, however the names are
+        /// spelled (`a` and `\u0061`), at any depth. The names are spans of the input in `raw_keys`, which belongs to the
+        /// deserializer's own allocator and keeps its space for the next item: at most one entry for each member of the objects
+        /// open at once, and a member takes four bytes of the item at least. A read that fails is over, so a leftover is not cleared.
+        fn refuseRepeatedKeys(self: *Self, item: []const u8) !void {
+            if (std.mem.indexOfScalar(u8, item, '{') == null) return;
+            var scan: KeyScan = .{ .list = &self.raw_keys, .allocator = self.allocator };
+            var walk: Parser = .{ .input = item, .keys = &scan };
+            try walk.skipValueTrusted(0);
         }
 
         pub fn skipValue(self: *Self, allocator: Allocator) !void {
@@ -814,7 +833,7 @@ pub fn PullReader(comptime Config: type) type {
 
         fn init(allocator: Allocator, input: []const u8, cfg: Config) !Self {
             const d = try allocator.create(JsonDeserializer(Config));
-            d.* = JsonDeserializer(Config).initBorrowed(input, cfg);
+            d.* = JsonDeserializer(Config).initBorrowed(allocator, input, cfg);
             return .{ .d = d, .owns = true, .base = 0, .allocator = allocator };
         }
 
@@ -1750,43 +1769,98 @@ fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
 /// One member collected for an extras field: its key in `extra_keys`, its value in the input.
 const ExtraEntry = struct { key_start: usize, key_len: usize, value_start: usize, value_end: usize };
 
+/// A member name in the input: the string literal's bytes, quotes included.
+pub const KeyRef = struct { start: usize, end: usize };
+
+/// The names of the objects a walk has open, innermost last, and the memory they are kept in. A name is a span of the input,
+/// 16 bytes at most: the walk checks each object's names for a repeat when it closes, in place, and gives the space back.
+const KeyScan = struct {
+    list: *std.ArrayList(KeyRef),
+    allocator: Allocator,
+
+    /// Closes the object whose names start at `first`: `error.DuplicateField` if two of them decode to the same text.
+    fn close(self: KeyScan, input: []const u8, first: usize) Parser.Error!void {
+        const names = self.list.items[first..];
+        const Order = struct {
+            input: []const u8,
+            fn less(ctx: @This(), a: KeyRef, b: KeyRef) bool {
+                return keyOrder(ctx.input[a.start..a.end], ctx.input[b.start..b.end]) == .lt;
+            }
+        };
+        std.sort.pdq(KeyRef, names, Order{ .input = input }, Order.less);
+        for (names[@min(1, names.len)..], 0..) |name, before| {
+            if (keyOrder(input[names[before].start..names[before].end], input[name.start..name.end]) == .eq) return error.DuplicateField;
+        }
+        self.list.items.len = first;
+    }
+};
+
+/// The decoded bytes of a string literal that is known to be valid, one at a time.
+const KeyBytes = struct {
+    raw: []const u8,
+    at: usize = 1,
+    /// What is left of a code point's UTF-8 after the byte `next` has returned.
+    rest: [4]u8 = undefined,
+    rest_at: usize = 0,
+    rest_len: usize = 0,
+
+    fn next(self: *KeyBytes) ?u8 {
+        if (self.rest_at < self.rest_len) {
+            defer self.rest_at += 1;
+            return self.rest[self.rest_at];
+        }
+        if (self.at + 1 >= self.raw.len) return null;
+        const c = self.raw[self.at];
+        self.at += 1;
+        if (c != '\\') return c;
+        const escape = self.raw[self.at];
+        self.at += 1;
+        switch (escape) {
+            '"', '\\', '/' => return escape,
+            'b' => return 0x08,
+            'f' => return 0x0c,
+            'n' => return '\n',
+            'r' => return '\r',
+            't' => return '\t',
+            'u' => {
+                var scan: Parser = .{ .input = self.raw, .index = self.at };
+                const first = scan.parseHex4() catch return null;
+                var code: u21 = first;
+                if (std.unicode.utf16IsHighSurrogate(first)) {
+                    scan.index += 2; // the `\u` of the low half
+                    const second = scan.parseHex4() catch return null;
+                    code = std.unicode.utf16DecodeSurrogatePair(&.{ first, second }) catch return null;
+                }
+                self.at = scan.index;
+                self.rest_len = std.unicode.utf8Encode(code, &self.rest) catch return null;
+                self.rest_at = 1;
+                return self.rest[0];
+            },
+            else => return null,
+        }
+    }
+};
+
+/// How two string literals (quotes included) order by their decoded bytes: `.eq` when they decode to the same text, however
+/// they are spelled.
+fn keyOrder(a: []const u8, b: []const u8) std.math.Order {
+    if (std.mem.indexOfScalar(u8, a, '\\') == null and std.mem.indexOfScalar(u8, b, '\\') == null) {
+        return std.mem.order(u8, a[1 .. a.len - 1], b[1 .. b.len - 1]);
+    }
+    var x: KeyBytes = .{ .raw = a };
+    var y: KeyBytes = .{ .raw = b };
+    while (true) {
+        const p = x.next() orelse return if (y.next() == null) .eq else .lt;
+        const q = y.next() orelse return .gt;
+        if (p != q) return std.math.order(p, q);
+    }
+}
+
 /// Whether the string literal `raw` (quotes included) decodes to `name`.
 fn rawKeyIs(raw: []const u8, name: []const u8) bool {
-    var i: usize = 1;
-    var n: usize = 0;
-    while (i + 1 < raw.len) {
-        var buffer: [4]u8 = undefined;
-        var piece: []const u8 = raw[i..][0..1];
-        if (raw[i] == '\\') {
-            i += 1;
-            switch (raw[i]) {
-                '"', '\\', '/' => piece = raw[i..][0..1],
-                'b' => piece = "\x08",
-                'f' => piece = "\x0c",
-                'n' => piece = "\n",
-                'r' => piece = "\r",
-                't' => piece = "\t",
-                'u' => {
-                    var scan: Parser = .{ .input = raw, .index = i + 1 };
-                    const first = scan.parseHex4() catch return false;
-                    var code: u21 = first;
-                    i += 4;
-                    if (std.unicode.utf16IsHighSurrogate(first)) {
-                        scan.index += 2; // the `\u` of the low half
-                        const second = scan.parseHex4() catch return false;
-                        code = std.unicode.utf16DecodeSurrogatePair(&.{ first, second }) catch return false;
-                        i += 6;
-                    }
-                    piece = buffer[0 .. std.unicode.utf8Encode(code, &buffer) catch return false];
-                },
-                else => return false,
-            }
-        }
-        if (n + piece.len > name.len or !std.mem.eql(u8, piece, name[n..][0..piece.len])) return false;
-        n += piece.len;
-        i += 1;
-    }
-    return n == name.len;
+    var decoded: KeyBytes = .{ .raw = raw };
+    for (name) |byte| if (decoded.next() != byte) return false;
+    return decoded.next() == null;
 }
 
 /// Parses a number literal as a float. A literal too large for `T` would round to infinity, which
@@ -1826,6 +1900,8 @@ const Parser = struct {
     trusted_text: bool = false,
     /// `skipValueTrusted` checks the strings it steps over (escapes, control characters, UTF-8).
     checked: bool = false,
+    /// Where `skipValueTrusted` records the keys of the objects it steps over, to refuse a repeated one when each closes.
+    keys: ?*KeyScan = null,
 
     const NumberSlice = struct {
         slice: []const u8,
@@ -1848,6 +1924,7 @@ const Parser = struct {
         FloatOutOfRange,
         StringTooLong,
         JsonNestingTooDeep,
+        DuplicateField,
     };
 
     // Shared token parser for both direct typed reads and recursive skipping.
@@ -2240,10 +2317,13 @@ const Parser = struct {
                     _ = self.consume();
                     return;
                 }
+                const first_key = if (self.keys) |scan| scan.list.items.len else 0;
                 while (true) {
                     if (object) {
                         self.skipWhitespace();
+                        const key_start = self.index;
                         if (self.checked) try self.skipStringChecked() else try self.skipStringTrusted();
+                        if (self.keys) |scan| try scan.list.append(scan.allocator, .{ .start = key_start, .end = self.index });
                         self.skipWhitespace();
                         if (self.consume() != ':') return error.UnexpectedToken;
                     }
@@ -2251,7 +2331,10 @@ const Parser = struct {
                     self.skipWhitespace();
                     switch (self.consume() orelse return error.UnexpectedEndOfInput) {
                         ',' => {},
-                        '}', ']' => return,
+                        '}', ']' => {
+                            if (object) if (self.keys) |scan| try scan.close(self.input, first_key);
+                            return;
+                        },
                         else => return error.UnexpectedToken,
                     }
                 }
