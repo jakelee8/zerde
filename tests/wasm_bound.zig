@@ -13,8 +13,8 @@ const Many = struct {
     pub const serde = .{ .deny_unknown_fields = true };
 };
 export fn big() u32 {
-    return wire.maxArenaSize(Big, .{}, cfg);
+    return wire.maxArenaSize(zerde.json, Big, .{}, cfg);
 }
 export fn lists4096() u32 {
-    return wire.maxArenaSize(Many, .{}, .{ .max_items = 4096, .max_string_len = 4 * 1024 * 1024, .max_input_bytes = 8 * 1024 * 1024 });
+    return wire.maxArenaSize(zerde.json, Many, .{}, .{ .max_items = 4096, .max_string_len = 4 * 1024 * 1024, .max_input_bytes = 8 * 1024 * 1024 });
 }

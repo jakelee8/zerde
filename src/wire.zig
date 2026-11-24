@@ -97,7 +97,7 @@ pub fn Wire(comptime T: type) type {
             if (@typeInfo(@typeInfo(T).optional.child) == .optional) @compileError("a nested optional has no wire form: " ++ @typeName(T));
             break :blk Opt(Wire(@typeInfo(T).optional.child));
         },
-        .pointer => Wire(@typeInfo(T).pointer.child),
+        .pointer => @compileError("a pointer has no wire layout (it would be by value, and a recursive type has no size): use a slice, or an optional: " ++ @typeName(T)),
         .@"enum" => EnumInt(T),
         .@"struct" => StructWire(T),
         .@"union" => UnionWire(T),
@@ -261,7 +261,6 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
             }
             break :blk out;
         },
-        .pointer => try toWire(@typeInfo(T).pointer.child, allocator, base, value.*),
         .@"enum" => @intCast(@backingInt(value)),
         .@"struct" => blk: {
             var out: Wire(T) = undefined;
@@ -282,7 +281,7 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
             }
             break :blk out;
         },
-        .hook, .none => unreachable,
+        .hook, .none, .pointer => unreachable,
     };
 }
 
@@ -323,11 +322,6 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
                 else => error.InvalidTag,
             };
         },
-        .pointer => blk: {
-            const pointer = try allocator.create(@typeInfo(T).pointer.child);
-            pointer.* = try fromWire(@typeInfo(T).pointer.child, allocator, memory, wire);
-            break :blk pointer;
-        },
         .@"enum" => blk: {
             const tag = std.math.cast(@typeInfo(T).@"enum".tag_type, wire) orelse break :blk error.InvalidTag;
             break :blk std.enums.fromInt(T, tag) orelse error.InvalidTag;
@@ -348,14 +342,14 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
             }
             break :blk error.InvalidTag;
         },
-        .hook, .none => unreachable,
+        .hook, .none, .pointer => unreachable,
     };
 }
 
 /// Reads one `T` from `input` in `Format` (`zerde.cbor` or `zerde.json`) and returns its wire
 /// layout. The read is aliased and applies every rule of `T` and of `format_cfg` (strict mode,
 /// limits, bounds, validators, keys, optional policies) as a typed read does. `arena` is a fixed
-/// buffer of at least `maxArenaSize(T, serde_cfg, format_cfg)` bytes; on an error it is put back as
+/// buffer of at least `maxArenaSize(Format, T, serde_cfg, format_cfg)` bytes; on an error it is put back as
 /// it was. `base` is the address spans are relative to. The wire value points into `input` and
 /// `arena`, which must stay where they are.
 pub fn decode(
@@ -468,7 +462,6 @@ pub fn describe(comptime T: type, comptime cfg: anytype) Node {
             const element = comptime describe(@typeInfo(T).optional.child, cfg);
             return .{ .kind = kind, .size = @sizeOf(W), .alignment = @alignOf(W), .element = &element, .value_offset = @offsetOf(W, "value") };
         },
-        .pointer => return describe(@typeInfo(T).pointer.child, cfg),
         .@"struct" => {
             const info = reflect.fields(T, cfg);
             comptime var members: [info.len]Member = undefined;
@@ -499,23 +492,44 @@ pub fn describe(comptime T: type, comptime cfg: anytype) Node {
 // ---- the arena a decode needs -----------------------------------------------------------------------------------
 
 const Limits = struct {
-    max_items: u64,
-    max_string_len: u64,
+    /// What the config limits, or null where it does not: a limit that is absent is not a number.
+    max_items: ?u64,
+    max_string_len: ?u64,
+    max_input_bytes: ?u64,
     max_depth: u64,
-    max_input_bytes: u64,
     /// A strict CBOR read: definite lengths only, so no list grows and no string is rewritten.
     strict: bool,
+    /// A CBOR read: it keeps a record of the key of each open map of a union, for its duplicate check.
+    cbor: bool,
 };
 
-fn limitsOf(comptime format_cfg: anytype) Limits {
-    const unbounded: u64 = std.math.maxInt(usize);
+fn optionalOf(comptime cfg: anytype, comptime name: []const u8) ?u64 {
+    return if (meta.hasField(@TypeOf(cfg), name)) @as(u64, @field(cfg, name)) else null;
+}
+
+fn limitsOf(comptime Format: type, comptime format_cfg: anytype) Limits {
+    const has_mode = meta.hasField(@TypeOf(format_cfg), "mode");
+    if (has_mode and Format != cbor) @compileError("`mode` is a CBOR read setting; the format here is " ++ @typeName(Format));
     return .{
-        .max_items = if (meta.hasField(@TypeOf(format_cfg), "max_items")) @field(format_cfg, "max_items") else unbounded,
-        .max_string_len = if (meta.hasField(@TypeOf(format_cfg), "max_string_len")) @field(format_cfg, "max_string_len") else unbounded,
+        .max_items = optionalOf(format_cfg, "max_items"),
+        .max_string_len = optionalOf(format_cfg, "max_string_len"),
+        .max_input_bytes = optionalOf(format_cfg, "max_input_bytes"),
         .max_depth = if (meta.hasField(@TypeOf(format_cfg), "max_depth")) @min(@field(format_cfg, "max_depth"), 128) else 128,
-        .max_input_bytes = if (meta.hasField(@TypeOf(format_cfg), "max_input_bytes")) @field(format_cfg, "max_input_bytes") else unbounded,
-        .strict = meta.hasField(@TypeOf(format_cfg), "mode") and @field(format_cfg, "mode") == cbor.Mode.strict,
+        .strict = has_mode and @field(format_cfg, "mode") == cbor.Mode.strict,
+        .cbor = Format == cbor,
     };
+}
+
+/// The smaller of two limits, where either may be absent.
+fn tighter(a: ?u64, b: ?u64) ?u64 {
+    if (a) |x| return if (b) |y| @min(x, y) else x;
+    return b;
+}
+
+/// What a field's own `max_len` and the config's limit allow, or null for no bound.
+fn fieldLimit(max_len: usize, limit: ?u64) ?u64 {
+    const own: ?u64 = if (max_len == (meta.Bounds{}).max_len) null else max_len;
+    return tighter(own, limit);
 }
 
 /// A resource a decode takes: `fixed` bytes (or instances) that do not depend on how many items the
@@ -560,6 +574,9 @@ const Cost = struct {
     /// The most one string takes while it is built, over what it holds when done (the most of any, not a sum).
     transient: u64 = 0,
     scratch: u64 = 0,
+    /// The most maps of unions that are open at once along a path of the type, and the longest variant name.
+    open_unions: u64 = 0,
+    name_len: u64 = 0,
     list_size: u64 = 0,
     list_align: u64 = 0,
     list_wire: u64 = 0,
@@ -570,6 +587,8 @@ const Cost = struct {
             .text = a.text.plus(b.text),
             .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
+            .open_unions = @max(a.open_unions, b.open_unions),
+            .name_len = @max(a.name_len, b.name_len),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
             .list_wire = @max(a.list_wire, b.list_wire),
@@ -597,6 +616,8 @@ const Cost = struct {
             .text = a.text.most(b.text),
             .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
+            .open_unions = @max(a.open_unions, b.open_unions),
+            .name_len = @max(a.name_len, b.name_len),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
             .list_wire = @max(a.list_wire, b.list_wire),
@@ -647,14 +668,8 @@ fn listPerItem(budget: u64, size: u64, alignment: u64, strict: bool) u64 {
     return size + alignment;
 }
 
-fn bound(comptime name: []const u8, comptime limit: u64, comptime what: []const u8) u64 {
-    if (limit == std.math.maxInt(usize)) @compileError(what ++ " has no bound a decode can rely on: " ++ name);
-    return limit;
-}
-
-/// Whether `limit` is a bound and not the lack of one.
-fn bounded(limit: u64) bool {
-    return limit != std.math.maxInt(usize);
+fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const u8) u64 {
+    return limit orelse @compileError(what ++ " has no bound a decode can rely on: " ++ name);
 }
 
 /// An upper bound, in bytes, of what the arena of `decode(Format, T, ...)` allocates, computed from
@@ -673,38 +688,49 @@ fn bounded(limit: u64) bool {
 /// list grows through, per list; lists together are charged at most `max_items` items, which is less
 /// than the sum of their `max_len` when those are generous.
 ///
+/// A CBOR read also keeps a 24-byte record of the key of each map of a union that is open (a union
+/// nested in a union is one more), so the bound adds those for the most that are open along a path of
+/// the type, and no more than `max_depth`. A strict CBOR read (`mode = .strict`, which is refused for
+/// another format) is charged no rewritten text and exact lists. A pointer has no wire layout.
+///
 /// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
 /// members (they would cost without limit: set `deny_unknown_fields`), or when it collects extras.
-pub fn maxArenaSize(comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
-    return comptime computeBound(T, serde_cfg, format_cfg);
+pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
+    return comptime computeBound(Format, T, serde_cfg, format_cfg);
 }
 
-fn computeBound(comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
+fn computeBound(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
     @setEvalBranchQuota(1_000_000);
-    const limits = comptime limitsOf(format_cfg);
-    const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0).together(wireOwned(T, .{}, serde_cfg, limits));
+    const limits = comptime limitsOf(Format, format_cfg);
+    const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0).together(wireOwned(T, .{}, serde_cfg, limits, 0));
     const slack = 256;
     const items = limits.max_items;
 
     // Arrays of lists: from the fields, and, where the items are bounded, from the budget alone.
     var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", items, "the items of the input"));
-    if (cost.list_size != 0 and bounded(items)) {
-        const per_item = listPerItem(items, cost.list_size, cost.list_align, limits.strict) + cost.list_wire + 16;
-        lists = @min(lists, per_item * items);
-    }
+    if (items) |budget| if (cost.list_size != 0) {
+        const per_item = listPerItem(budget, cost.list_size, cost.list_align, limits.strict) + cost.list_wire + 16;
+        lists = @min(lists, per_item * budget);
+    };
 
     // Text that is rewritten: from the fields, and, where the input and the items are bounded, from the input.
     var text = if (cost.text.pool == 0) cost.text.fixed else cost.text.total(bound("max_items", items, "the items of the input"));
     var transient = cost.transient;
-    if (comptime bounded(limits.max_input_bytes)) {
+    if (limits.max_input_bytes) |input| {
         // Every byte of a rewritten string comes from the input, at most twice: a JSON base64 string is
         // built (at most the input), then decoded (three quarters of it). A string is built last in the
         // arena, so its buffer grows in place and costs what it holds.
-        const input: u64 = limits.max_input_bytes;
         text = @min(text, 2 * input);
         transient = @min(transient, building(input));
     }
-    const total = lists + text + transient + cost.scratch + slack;
+    // A CBOR read keeps a record of the key of each open map of a union (24 bytes, and the key's text when it
+    // was rewritten), for as many as the type nests and the depth allows.
+    var scratch = cost.scratch;
+    if (limits.cbor and cost.open_unions > 0) {
+        const levels = cost.open_unions;
+        scratch += growth(levels, 24, 8) + growth(levels * cost.name_len, 1, 1);
+    }
+    const total = lists + text + transient + scratch + slack;
     if (total > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
     return @intCast(total);
 }
@@ -718,24 +744,27 @@ fn building(n: u64) u64 {
 /// The list bound of a field, if it has one of its own: a field's `max_len` is a number of items the
 /// field can hold; without it the list draws on the shared budget.
 fn ownBound(comptime bounds: meta.Bounds) ?u64 {
-    return if (bounds.max_len == std.math.maxInt(usize)) null else bounds.max_len;
+    return if (bounds.max_len == (meta.Bounds{}).max_len) null else bounds.max_len;
 }
 
 /// What the typed read allocates for one value of `T`, beyond the storage `T` itself takes.
 fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) Cost {
+    // A read refuses nesting deeper than `max_depth`, so a type that recurses through a list is
+    // charged down to it and no further.
+    if (depth > limits.max_depth) return .{};
     return switch (comptime reflect.kindOf(T)) {
         .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
         .text => blk: {
             // A strict read has only definite strings, which it never rewrites: they are spans of the input.
             if (limits.strict) break :blk .{};
-            const n: u64 = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a string");
+            const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a string");
             break :blk .{ .text = .{ .fixed = n }, .transient = building(n) };
         },
         .byte_string => blk: {
             if (limits.strict) break :blk .{};
             // The token it is read from (base64 is a third longer) and the bytes it decodes to.
-            const n: u64 = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a byte string");
-            const token = @min(limits.max_string_len, @max(n, n / 3 * 4 + 8));
+            const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a byte string");
+            const token = tighter(limits.max_string_len, @max(n, n / 3 * 4 + 8)).?;
             break :blk .{ .text = .{ .fixed = token + n }, .transient = building(token) };
         },
         .raw => blk: {
@@ -743,7 +772,7 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             // for a key that is itself an array or map its canonical bytes, once more at each level of
             // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
             // the most of the two. Only CBOR does this; the bound is for either format.
-            const n: u64 = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a raw item");
+            const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item");
             // The item is itself a container, below the `depth` that hold it.
             const levels = @min(limits.max_depth -| (depth + 1), n / 4 + 1);
             break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1)) };
@@ -771,10 +800,7 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         },
         .array => typedOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),
         .optional => typedOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
-        .pointer => blk: {
-            const child = typedOwned(@typeInfo(T).pointer.child, .{}, cfg, limits, depth);
-            break :blk (Cost{ .lists = .{ .fixed = @sizeOf(@typeInfo(T).pointer.child) + 16 } }).plus(child);
-        },
+        .pointer => @compileError("a pointer has no wire layout: " ++ @typeName(T)),
         .@"struct" => blk: {
             if (!meta.effectiveDenyUnknownFields(T, cfg)) @compileError("a struct that accepts unknown members has no arena bound; set deny_unknown_fields: " ++ @typeName(T));
             var total: Cost = .{};
@@ -786,40 +812,49 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         },
         .@"union" => blk: {
             var most: Cost = .{};
+            var name_len: u64 = 0;
             for (reflect.variants(T, cfg)) |variant| {
                 if (variant.type != void) most = most.most(typedOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
+                name_len = @max(name_len, switch (variant.wire) {
+                    .text => |name| name.len,
+                    .integer => 0,
+                });
             }
+            // This union's map is open while its payload is read.
+            most.open_unions += 1;
+            most.name_len = @max(most.name_len, name_len);
             break :blk most;
         },
     };
 }
 
 /// What the copy into the wire layout allocates for one value of `T`: the arrays of its lists.
-fn wireOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits) Cost {
+fn wireOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) Cost {
+    if (depth > limits.max_depth) return .{};
     return switch (comptime reflect.kindOf(T)) {
         .bool, .int, .float, .byte_array, .@"enum", .text, .byte_string, .raw, .hook, .none => .{},
         .list => blk: {
             const Elem = @typeInfo(T).pointer.child;
             if (isScalarList(Elem)) break :blk .{};
             const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
-            const element = wireOwned(Elem, elem_bounds, cfg, limits);
+            const element = wireOwned(Elem, elem_bounds, cfg, limits, depth + 1);
             if (ownBound(bounds)) |n| {
                 break :blk (Cost{ .lists = .{ .fixed = n * @sizeOf(Wire(Elem)) + 16 } }).plus(element.times(n));
             }
             break :blk .{ .lists = .{ .pool = @max(@sizeOf(Wire(Elem)) + 16 + element.lists.fixed, element.lists.pool) } };
         },
-        .array => wireOwned(@typeInfo(T).array.child, .{}, cfg, limits).times(@typeInfo(T).array.len),
-        .optional => wireOwned(@typeInfo(T).optional.child, bounds, cfg, limits),
-        .pointer => wireOwned(@typeInfo(T).pointer.child, .{}, cfg, limits),
+        .array => wireOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),
+        .optional => wireOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
+        .pointer => @compileError("a pointer has no wire layout: " ++ @typeName(T)),
         .@"struct" => blk: {
             var total: Cost = .{};
-            for (reflect.fields(T, cfg)) |field| total = total.plus(wireOwned(field.type, field.bounds, cfg, limits));
+            for (reflect.fields(T, cfg)) |field| total = total.plus(wireOwned(field.type, field.bounds, cfg, limits, depth + 1));
             break :blk total;
         },
         .@"union" => blk: {
             var most: Cost = .{};
             for (reflect.variants(T, cfg)) |variant| {
-                if (variant.type != void) most = most.most(wireOwned(variant.type, variant.bounds, cfg, limits));
+                if (variant.type != void) most = most.most(wireOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
             }
             break :blk most;
         },

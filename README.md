@@ -475,11 +475,14 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   unions, optionals, enums, bools or arrays are written into the arena (the latter twice: the typed array, then the wire
   array). A list of integers and floats is not copied: its typed array already has the wire layout and the span points at it.
   So a span points into the input or the arena, and both must be in memory `base` reaches.
-- `wire.maxArenaSize(T, serde_cfg, format_cfg)` is an upper bound, computed at comptime, of the bytes a decode takes
+- `wire.maxArenaSize(Format, T, serde_cfg, format_cfg)` is an upper bound, computed at comptime, of the bytes a decode takes
   from the arena. It uses the `max_len` and `.elem` of each field and, from `format_cfg`: `max_items` (items in the whole
   input, which bounds every list without a `max_len` and all lists together, so nesting such lists does not multiply it),
   `max_string_len`, `max_depth`, `max_input_bytes`, which `decode` enforces (`error.InputTooLarge`), and `mode`: a strict
   CBOR read has only definite strings and lengths, so it rewrites no string and allocates each list once, at its exact size.
+  `mode` is a CBOR setting and a compile error for another `Format`. A CBOR read also keeps a record of the key of each open
+  union map, charged for the deepest nesting of unions along a path, up to `max_depth`. A pointer has no wire layout (use a
+  slice or an optional); a type that recurses through a list is charged down to `max_depth`.
   The bound is worked out in 64 bits and is a compile error only when it does not fit the target's `usize`. A bound set on a
   union variant (`serde.fields.<variant>`) applies to its payload, in the read and in the bound. Only what is
   rewritten costs: the strings together hold at most twice the input (a JSON base64 string is built, then decoded), and one string at a time, at the top of the arena, costs half again and 128 bytes more while its buffer grows, which the bound adds once for the largest; a list the capacities an array list grows through, and a `Raw` item

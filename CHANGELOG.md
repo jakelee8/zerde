@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- changed (`zerde.wire.maxArenaSize`): it takes the `Format` first, like `decode`, so a strict CBOR config is strict only for CBOR (`mode` is a compile error for another format; a JSON read with it had no text charged and could run out of arena); limits absent from the config are `null`, not a target-dependent sentinel
+- fixed (`zerde.wire.maxArenaSize`): a CBOR read keeps a key record per open union map, now charged (eight nested unions ran out of an arena of exactly the bound); a type that recurses is charged down to `max_depth`; `Wire` refuses a pointer, which sent the compiler into endless recursion on a recursive type
 - fixed (`zerde.wire.maxArenaSize`): the arithmetic is in 64 bits (it overflowed a 32-bit `usize` on wasm32 for 4,096-item lists and 4 MiB strings) and `zig build test` compiles a probe for wasm32; the typed copy and the wire copy of the same budget items are added, not taken as the most; a strict CBOR read (`mode = .strict` in the format config) is charged no rewritten text and exact list sizes
 - fixed: a bound on a union variant (`serde.fields.<variant>`, such as `max_len` on a `Raw` payload) is applied by the typed read, which ignored it, and by the arena bound; `reflect.variants` reports it
 - fixed (`zerde.wire.maxArenaSize`): the bound now adds the most one rewritten string takes while its buffer grows (half again and 128 bytes over its length), so a string over about 260 bytes fits an arena of exactly the bound; its doc states one rule for the text cap

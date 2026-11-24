@@ -3814,7 +3814,7 @@ fn repeatText(w: *std.Io.Writer, text: []const u8, count: usize) !void {
 }
 
 test "the arena bound holds for the worst input, escapes and all, and a decode puts the arena back on an error" {
-    const bound = comptime wire.maxArenaSize(WireMsg, .{}, wire_read_cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, WireMsg, .{}, wire_read_cfg);
     // Four put effects with the longest strings the bounds allow, escaped in JSON so each is copied.
     var json: std.Io.Writer.Allocating = .init(allocator);
     defer json.deinit();
@@ -3880,7 +3880,7 @@ test "a list of scalars is not copied into the wire layout" {
     try std.testing.expectEqual(@as(usize, 0), none.end_index);
     // And the arena bound counts only the typed array: the capacities an array list grows through (33, 83 and 158 items
     // of 4 bytes, each with up to 3 bytes of alignment), the copy to its exact size, and the slack.
-    try std.testing.expectEqual(@as(usize, 1764), wire.maxArenaSize(Scalars, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1764), wire.maxArenaSize(zerde.json, Scalars, .{}, .{}));
 }
 
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
@@ -4087,7 +4087,7 @@ test "integer keys, a Raw and bounds in a wire type, and their keys in the descr
     // The raw span is the very bytes of the input: no copy, and the arena holds nothing for it.
     try std.testing.expect(@intFromPtr(meta_bytes.ptr) >= region.base() and @intFromPtr(meta_bytes.ptr) < region.base() + len);
     try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, Frame, &arena, region.base(), &.{ 0xa3, 0x00, 0x01, 0x01, 0xa0, 0x02, 0x64, 'a', 'b', 'c', 'd' }, .{}, cfg));
-    try std.testing.expect(wire.maxArenaSize(Frame, .{}, cfg) > 0);
+    try std.testing.expect(wire.maxArenaSize(zerde.cbor, Frame, .{}, cfg) > 0);
 }
 
 // ---- a wide schema needs no help with the comptime branch quota --------------------------------------------------
@@ -4148,7 +4148,7 @@ test "a JSON string over its max_len is LengthOutOfBounds, not an arena that ran
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .t = .{ .max_len = 4 } } };
     };
     const cfg = .{ .max_string_len = 4096, .max_items = 16 };
-    const bound = comptime wire.maxArenaSize(Capped, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, Capped, .{}, cfg);
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(allocator);
     try input.appendSlice(allocator, "{\"t\":\"");
@@ -4186,7 +4186,7 @@ test "nested lists share the max_items budget, and the bound holds for the input
         pub const serde = .{ .deny_unknown_fields = true };
     };
     const cfg = .{ .max_items = 256, .max_string_len = 64 };
-    const bound = comptime wire.maxArenaSize(Nested, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, Nested, .{}, cfg);
     // One budget, not one per level: well under the per-level product (256 * (3 * 256 + 32) * 4 = 800 KB).
     try std.testing.expect(bound < 40_000);
     try std.testing.expect(bound > 8_000);
@@ -4227,7 +4227,7 @@ test "nested lists share the max_items budget, and the bound holds for the input
         rows: []const []const u8,
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 3, .elem = .{ .max_len = 5 } } } };
     };
-    const own_bound = comptime wire.maxArenaSize(Own, .{}, .{ .max_string_len = 64, .max_items = 64 });
+    const own_bound = comptime wire.maxArenaSize(zerde.json, Own, .{}, .{ .max_string_len = 64, .max_items = 64 });
     _ = try decodeWithin(zerde.json, Own, own_bound, "{\"rows\":[\"\\n\\n\\n\\n\\n\",\"\\t\\t\\t\\t\\t\",\"\\r\\r\\r\\r\\r\"]}", .{ .max_string_len = 64, .max_items = 64 });
 }
 
@@ -4237,7 +4237,7 @@ test "the bound holds for a raw item built to cost the reader most" {
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .meta = .{ .max_len = 600 } } };
     };
     const cfg = .{ .max_depth = 16, .max_items = 100_000, .max_string_len = 600 };
-    const bound = comptime wire.maxArenaSize(Held, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.cbor, Held, .{}, cfg);
     // A map whose key is a map whose key is a map...: each level is a key holding the one inside it, and
     // so is recorded in canonical form again at every level. `a1 <key> 00` is four bytes more per level.
     var item: std.ArrayList(u8) = .empty;
@@ -4288,7 +4288,7 @@ test "a union is charged at its worst variant, and a variant that fails halfway 
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .picks = .{ .max_len = 3 } } };
     };
     const cfg = .{ .max_string_len = 64, .max_items = 256 };
-    const bound = comptime wire.maxArenaSize(Picks, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, Picks, .{}, cfg);
     // The heaviest variant, three times, with every string escaped.
     const record = "{\"key\":\"\\n\\n\",\"kind\":\"\\t\\t\",\"revision\":1,\"meta\":\"\\r\",\"level\":7,\"ratio\":1.5,\"flag\":true}";
     const heavy = "{\"heavy\":{\"rows\":[" ++ record ++ "," ++ record ++ "],\"text\":\"\\n\\n\\n\\n\\n\\n\\n\\n\"}}";
@@ -4367,7 +4367,7 @@ fn Request(comptime R: type) type {
 test "a CBOR request's bound is small next to its field bounds, and holds for chunked strings and nested raw keys" {
     const Req = Request(zerde.cbor.Raw);
     const cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .max_depth = 16 };
-    const bound = comptime wire.maxArenaSize(Req, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.cbor, Req, .{}, cfg);
     // The fields alone allow 64 effects of 262144 + 16384 + ... bytes: tens of megabytes. The input is 32 KiB.
     // Chunked text everywhere, as many chunks as the input holds: each string is assembled in the arena.
     var input: std.ArrayList(u8) = .empty;
@@ -4415,7 +4415,7 @@ test "a CBOR request's bound is small next to its field bounds, and holds for ch
 test "a JSON request's bound holds for escaped strings and base64 bytes, as many as the input allows" {
     const Req = Request([]const u8);
     const cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .bytes = zerde.json.BytesEncoding.base64 };
-    const bound = comptime wire.maxArenaSize(Req, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, Req, .{}, cfg);
     try std.testing.expect(bound < 1_500_000);
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(allocator);
@@ -4490,28 +4490,28 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     };
     // Worked by hand: a list of ten 8-byte rows grows through one capacity of 17 (17 * 8 + 3 bytes), is copied to
     // its exact size (83) and its wire array is 10 * 8 + 16; and the slack is 256.
-    try std.testing.expectEqual(@as(usize, 139 + 83 + 96 + 256), wire.maxArenaSize(Rows, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 139 + 83 + 96 + 256), wire.maxArenaSize(zerde.json, Rows, .{}, .{}));
     // A string of at most 100 bytes costs 100 and, while it is built, 50 + 128 more; with an input of 10 bytes
     // the strings hold at most 20, and one is built from at most 10 bytes: 5 + 128 more.
-    try std.testing.expectEqual(@as(usize, 100 + 178 + 256), wire.maxArenaSize(Text, .{}, .{}));
-    try std.testing.expectEqual(@as(usize, 20 + 133 + 256), wire.maxArenaSize(Text, .{}, .{ .max_input_bytes = 10 }));
+    try std.testing.expectEqual(@as(usize, 100 + 178 + 256), wire.maxArenaSize(zerde.json, Text, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 20 + 133 + 256), wire.maxArenaSize(zerde.json, Text, .{}, .{ .max_input_bytes = 10 }));
     // Two strings: both held, and only the larger one being built at a time.
     const Two = struct {
         a: []const u8,
         b: []const u8,
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .a = .{ .max_len = 100 }, .b = .{ .max_len = 40 } } };
     };
-    try std.testing.expectEqual(@as(usize, 140 + 178 + 256), wire.maxArenaSize(Two, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 140 + 178 + 256), wire.maxArenaSize(zerde.json, Two, .{}, .{}));
     // Bytes: the token it is read from (a third longer: 128, built with 64 + 128 more) and the 90 it decodes to.
-    try std.testing.expectEqual(@as(usize, 128 + 90 + 192 + 256), wire.maxArenaSize(Blob2, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 128 + 90 + 192 + 256), wire.maxArenaSize(zerde.json, Blob2, .{}, .{}));
     // A raw item of 400 bytes: its keys at 101 levels (four bytes each), or at the two the config allows below the
     // two that hold it; a raw item itself is never copied.
-    try std.testing.expectEqual(@as(usize, 187419), wire.maxArenaSize(Raws, .{}, .{}));
-    try std.testing.expectEqual(@as(usize, 24751), wire.maxArenaSize(Raws, .{}, .{ .max_depth = 4 }));
+    try std.testing.expectEqual(@as(usize, 187419), wire.maxArenaSize(zerde.cbor, Raws, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 24751), wire.maxArenaSize(zerde.cbor, Raws, .{}, .{ .max_depth = 4 }));
     // Lists with no bound of their own share the one budget of 100 items, whatever the nesting.
     // (4 + 128 more for the one string being built, and each item's wire array: 8 + 16 bytes).
-    try std.testing.expectEqual(@as(usize, 9756 + 132 + 24 * 100), wire.maxArenaSize(Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
-    try std.testing.expect(wire.maxArenaSize(Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756 + 132 + 24 * 100);
+    try std.testing.expectEqual(@as(usize, 9756 + 132 + 24 * 100), wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
+    try std.testing.expect(wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756 + 132 + 24 * 100);
     // Lists of lists with bounds of their own multiply: three lists of at most four rows each.
     const Nest = struct {
         rows: []const []const Row,
@@ -4532,13 +4532,13 @@ test "arena bound figures, from small schemas, for the parts of the model" {
         pub const serde = .{ .deny_unknown_fields = true };
     };
     // By hand: the outer list 151 + 55 and its wire array 3 * 8 + 16; each of the three inner lists 139 + 35 and 4 * 8 + 16.
-    try std.testing.expectEqual(@as(usize, 206 + 40 + 3 * 174 + 3 * 48 + 256), wire.maxArenaSize(Nest, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 206 + 40 + 3 * 174 + 3 * 48 + 256), wire.maxArenaSize(zerde.json, Nest, .{}, .{}));
     // The budget alone, per item: a list of one element costs (142 for 33 u32s grown to and copied) over two items.
-    try std.testing.expectEqual(@as(usize, 71 * 100 + 256), wire.maxArenaSize(Ints, .{}, .{ .max_items = 100 }));
+    try std.testing.expectEqual(@as(usize, 71 * 100 + 256), wire.maxArenaSize(zerde.json, Ints, .{}, .{ .max_items = 100 }));
     // Charged per item: 87 for the array of 16-byte lists over two items, 8 + 16 for its wire array: 111 an item.
-    try std.testing.expectEqual(@as(usize, 111 * 100 + 256), wire.maxArenaSize(Drawn, .{}, .{ .max_items = 100 }));
+    try std.testing.expectEqual(@as(usize, 111 * 100 + 256), wire.maxArenaSize(zerde.json, Drawn, .{}, .{ .max_items = 100 }));
     // Strings in a list with a max_len and elem bounds: five of at most twenty bytes.
-    try std.testing.expectEqual(@as(usize, 650 + 138), wire.maxArenaSize(Times, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 650 + 138), wire.maxArenaSize(zerde.json, Times, .{}, .{}));
 }
 
 test "a long string that is rewritten fits an arena of exactly the bound, while its buffer grows and after" {
@@ -4547,7 +4547,7 @@ test "a long string that is rewritten fits an arena of exactly the bound, while 
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 2700 } } };
     };
     const cfg = .{ .max_string_len = 4096 };
-    const bound = comptime wire.maxArenaSize(Long, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, Long, .{}, cfg);
     // The buffer of a 2700-byte string is 1.5 times that and 128 more while it is built.
     try std.testing.expect(bound >= 2700 + 1350 + 128);
     var plain: std.ArrayList(u8) = .empty;
@@ -4597,13 +4597,13 @@ test "a long string that is rewritten fits an arena of exactly the bound, while 
     try optional_input.appendSlice(allocator, small.items);
     try optional_input.appendSlice(allocator, "\\n\"}");
     const small_cfg = .{ .max_string_len = 1000 };
-    _ = try decodeWithin(zerde.json, Optional, comptime wire.maxArenaSize(Optional, .{}, small_cfg), optional_input.items, small_cfg);
+    _ = try decodeWithin(zerde.json, Optional, comptime wire.maxArenaSize(zerde.json, Optional, .{}, small_cfg), optional_input.items, small_cfg);
     var variant_input: std.ArrayList(u8) = .empty;
     defer variant_input.deinit(allocator);
     try variant_input.appendSlice(allocator, "{\"v\":{\"a\":\"");
     try variant_input.appendSlice(allocator, small.items);
     try variant_input.appendSlice(allocator, "\\n\"}}");
-    _ = try decodeWithin(zerde.json, Holder2, comptime wire.maxArenaSize(Holder2, .{}, small_cfg), variant_input.items, small_cfg);
+    _ = try decodeWithin(zerde.json, Holder2, comptime wire.maxArenaSize(zerde.json, Holder2, .{}, small_cfg), variant_input.items, small_cfg);
     // Base64 whose token is built and then decoded: 2700 bytes of bytes are a token of 3600.
     const Bytes = struct {
         b: zerde.ByteString,
@@ -4615,7 +4615,7 @@ test "a long string that is rewritten fits an arena of exactly the bound, while 
     try token.appendSlice(allocator, "{\"b\":\"");
     for (0..3596) |_| try token.append(allocator, 'A');
     try token.appendSlice(allocator, "\\/AAA\"}");
-    _ = try decodeWithin(zerde.json, Bytes, comptime wire.maxArenaSize(Bytes, .{}, bytes_cfg), token.items, bytes_cfg);
+    _ = try decodeWithin(zerde.json, Bytes, comptime wire.maxArenaSize(zerde.json, Bytes, .{}, bytes_cfg), token.items, bytes_cfg);
 }
 
 // ---- pooled transient, union variant bounds, strict mode, large limits -----------------------------
@@ -4626,7 +4626,7 @@ test "a pooled list of long escaped strings fits an arena of exactly the bound" 
         pub const serde = .{ .deny_unknown_fields = true };
     };
     const cfg = .{ .max_items = 4, .max_string_len = 1000 };
-    const bound = comptime wire.maxArenaSize(Pooled, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, Pooled, .{}, cfg);
     // One string of 1000 bytes built while the list holds nothing else: its buffer is 1.5 times its length and 128 more.
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(allocator);
@@ -4684,7 +4684,7 @@ test "a bound set on a union variant applies to its payload, and to the arena bo
     } }, allocator, "{\"c\":{\"text\":\"abcd\"}}"));
     // The arena bound uses them: a 16 MiB string allowance does not make a 64-byte raw item cost 16 MiB.
     const loose = .{ .max_string_len = 16 * 1024 * 1024 };
-    const bound = comptime wire.maxArenaSize(Holder, .{}, loose);
+    const bound = comptime wire.maxArenaSize(zerde.cbor, Holder, .{}, loose);
     try std.testing.expect(bound < 100_000);
     reflectVariantBounds: {
         const variants = comptime zerde.reflect.variants(Choice, .{});
@@ -4698,8 +4698,8 @@ test "a strict read rewrites no string and builds no list: the bound says so" {
     const Req = Request(zerde.cbor.Raw);
     const lenient_cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .max_depth = 16 };
     const strict_cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .max_depth = 16, .mode = zerde.cbor.Mode.strict };
-    const lenient = comptime wire.maxArenaSize(Req, .{}, lenient_cfg);
-    const strict_bound = comptime wire.maxArenaSize(Req, .{}, strict_cfg);
+    const lenient = comptime wire.maxArenaSize(zerde.cbor, Req, .{}, lenient_cfg);
+    const strict_bound = comptime wire.maxArenaSize(zerde.cbor, Req, .{}, strict_cfg);
     try std.testing.expect(strict_bound < lenient);
     // The effects list is a definite array of 64: 64 * 128 bytes of Effect and the wire copy, exactly, and the
     // reader's keys for a raw item; no string, no growth.
@@ -4773,22 +4773,22 @@ test "figures for a strict read, and for a union variant that holds a bounded li
     };
     const strict_cfg = .{ .mode = zerde.cbor.Mode.strict };
     // Nothing is rewritten and each list is allocated once, at its exact size: 10 * 8 + 3, the wire array 10 * 8 + 16.
-    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(Text, .{}, strict_cfg));
-    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(Blob3, .{}, strict_cfg));
-    try std.testing.expectEqual(@as(usize, 83 + 96 + 256), wire.maxArenaSize(Rows, .{}, strict_cfg));
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Text, .{}, strict_cfg));
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.cbor, Blob3, .{}, strict_cfg));
+    try std.testing.expectEqual(@as(usize, 83 + 96 + 256), wire.maxArenaSize(zerde.cbor, Rows, .{}, strict_cfg));
     // A strict list that draws on the budget costs its size and alignment per item.
     const Drawn = struct {
         xs: []const []const u8,
         pub const serde = .{ .deny_unknown_fields = true };
     };
-    try std.testing.expectEqual(@as(usize, (16 + 8 + 8 + 16) * 10 + 256), wire.maxArenaSize(Drawn, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 10 }));
+    try std.testing.expectEqual(@as(usize, (16 + 8 + 8 + 16) * 10 + 256), wire.maxArenaSize(zerde.cbor, Drawn, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 10 }));
     // A variant with a list of its own bound: typed 139 + 35, wire 4 * 8 + 16, with no budget needed.
     const Pick = union(enum) {
         rows: []const Row,
         none,
         pub const serde = .{ .fields = .{ .rows = .{ .max_len = 4 } } };
     };
-    try std.testing.expectEqual(@as(usize, 139 + 35 + 48 + 256), wire.maxArenaSize(Pick, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 139 + 35 + 48 + 256), wire.maxArenaSize(zerde.json, Pick, .{}, .{}));
 }
 
 test "the bound is computed in 64 bits, so limits that overflow a 32-bit usize do not stop it" {
@@ -4798,7 +4798,96 @@ test "the bound is computed in 64 bits, so limits that overflow a 32-bit usize d
     };
     // 4,096 strings of 4 MiB each is 16 GiB by the fields; the input of 8 MiB is what the bound rests on.
     const cfg = .{ .max_items = 8192, .max_string_len = 4 * 1024 * 1024, .max_input_bytes = 8 * 1024 * 1024 };
-    const bound = comptime wire.maxArenaSize(Big, .{}, cfg);
+    const bound = comptime wire.maxArenaSize(zerde.json, Big, .{}, cfg);
     try std.testing.expect(bound > 16 * 1024 * 1024 and bound < 20 * 1024 * 1024);
     // (19,227,081 on a 64-bit target and 19,043,431 on wasm32, where slices are half the size: the arithmetic is in 64 bits.)
+}
+
+// ---- keys of open union maps, the format decides strictness -----------------------------------------
+
+fn NestedUnion(comptime depth: usize) type {
+    if (depth == 0) return union(enum) { leaf: u8 };
+    return union(enum) { next: NestedUnion(depth - 1), leaf: u8 };
+}
+
+fn nestedUnionInput(comptime depth: usize, out: *std.ArrayList(u8)) !void {
+    // {"next": {"next": ... {"leaf": 1}}} in deterministic CBOR (keys of equal length, one entry each).
+    for (0..depth) |_| try out.appendSlice(allocator, &.{ 0xa1, 0x64, 'n', 'e', 'x', 't' });
+    try out.appendSlice(allocator, &.{ 0xa1, 0x64, 'l', 'e', 'a', 'f', 0x01 });
+}
+
+test "the keys a CBOR read keeps for open union maps are in the bound, nested eight deep, in both modes" {
+    const Root = struct {
+        u: NestedUnion(8),
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    inline for (.{ .lenient, .strict }) |mode| {
+        const cfg = .{ .mode = if (mode == .strict) zerde.cbor.Mode.strict else zerde.cbor.Mode.lenient };
+        const bound = comptime wire.maxArenaSize(zerde.cbor, Root, .{}, cfg);
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        try input.appendSlice(allocator, &.{ 0xa1, 0x61, 'u' });
+        try nestedUnionInput(8, &input);
+        const used = try decodeWithin(zerde.cbor, Root, bound, input.items, cfg);
+        try std.testing.expect(used <= bound);
+        // 9 maps are open at the deepest point (8 nexts and the leaf), each with a 24-byte record.
+        try std.testing.expect(bound >= 256 + 9 * 24);
+    }
+    // JSON keeps no such records, and says so in its bound: the same schema is smaller.
+    try std.testing.expect(wire.maxArenaSize(zerde.json, Root, .{}, .{}) < wire.maxArenaSize(zerde.cbor, Root, .{}, .{}));
+    // By hand: nine open maps. The records (24 bytes) grow through 6 and 15 slots (151 and 367 bytes with alignment),
+    // and are copied to 9 slots (223); the key text, at most 9 * 4 bytes, takes a first buffer of 129 and its exact copy 36.
+    try std.testing.expectEqual(@as(usize, 151 + 367 + 223 + 129 + 36 + 256), wire.maxArenaSize(zerde.cbor, Root, .{}, .{}));
+}
+
+test "figures for the keys of open union maps: a path, not a sum; the depth; a field's limit and the config's" {
+    const Root = struct {
+        u: NestedUnion(8),
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // max_depth 4 stops the walk at four unions open: records 151 + 103, key text 129 + 16.
+    try std.testing.expectEqual(@as(usize, 151 + 103 + 129 + 16 + 256), wire.maxArenaSize(zerde.cbor, Root, .{}, .{ .max_depth = 4 }));
+    // Two fields of two nested unions each: two open at a time, not four (records 151 + 55, key text 129 + 8).
+    const Pair = struct {
+        a: NestedUnion(1),
+        b: NestedUnion(1),
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    try std.testing.expectEqual(@as(usize, 151 + 55 + 129 + 8 + 256), wire.maxArenaSize(zerde.cbor, Pair, .{}, .{}));
+    // The field's max_len and the config's max_string_len: the smaller is the bound (50, and 25 + 128 to build it).
+    const Both = struct {
+        s: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 100 } } };
+    };
+    try std.testing.expectEqual(@as(usize, 50 + 153 + 256), wire.maxArenaSize(zerde.json, Both, .{}, .{ .max_string_len = 50 }));
+    // JSON keeps no records for union keys.
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(zerde.json, Pair, .{}, .{}));
+}
+
+const RecTree = union(enum) {
+    node: []const RecTree,
+    leaf: u8,
+};
+
+test "a union that recurses through a list is charged down to max_depth and no further" {
+    const Holder3 = struct {
+        t: RecTree,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const cfg = .{ .max_depth = 11, .max_items = 64 };
+    const bound = comptime wire.maxArenaSize(zerde.cbor, Holder3, .{}, cfg);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x61, 't' });
+    for (0..4) |_| try input.appendSlice(allocator, &.{ 0xa1, 0x64, 'n', 'o', 'd', 'e', 0x81 });
+    try input.appendSlice(allocator, &.{ 0xa1, 0x64, 'l', 'e', 'a', 'f', 0x01 });
+    const used = try decodeWithin(zerde.cbor, Holder3, bound, input.items, cfg);
+    try std.testing.expect(used <= bound);
+    // Deeper than max_depth is refused by the reader, not by the arena.
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(allocator);
+    try deep.appendSlice(allocator, &.{ 0xa1, 0x61, 't' });
+    for (0..9) |_| try deep.appendSlice(allocator, &.{ 0xa1, 0x64, 'n', 'o', 'd', 'e', 0x81 });
+    try deep.appendSlice(allocator, &.{ 0xa1, 0x64, 'l', 'e', 'a', 'f', 0x01 });
+    try std.testing.expectError(error.CborNestingTooDeep, decodeWithin(zerde.cbor, Holder3, bound, deep.items, cfg));
 }
