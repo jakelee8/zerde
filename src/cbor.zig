@@ -49,6 +49,11 @@ pub const ReadConfig = struct {
     refuse_non_finite: bool = false,
     /// Which encodings are accepted; see `Mode`.
     mode: Mode = .lenient,
+    /// Do not check that text is UTF-8: for an item that is known to be valid already, such as one
+    /// this library wrote and a store authenticated, where checking again costs more than the rest of
+    /// the read. Bytes that are not UTF-8 are then handed on as text, so it is never for input that
+    /// has not been checked once.
+    trusted_text: bool = false,
     /// Most containers open at once, at most `max_nesting`.
     max_depth: usize = max_nesting,
     /// Most data items in the whole input, map keys and values each counted (`error.TooManyItems`).
@@ -77,6 +82,10 @@ pub const WriteConfig = struct {
     /// lengths are always written in their shortest form. Asking for another `field_order` is a
     /// compile error.
     deterministic: bool = false,
+    /// Do not check that text is UTF-8 on the way out (`error.InvalidUtf8`): for text that is known
+    /// to be valid already, such as a string just read from a source that was checked. A value
+    /// written this way may not read back.
+    trusted_text: bool = false,
 };
 
 /// Field order of a write with `cfg`: `encoded_key`, and required, when it is deterministic.
@@ -244,7 +253,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         }
 
         pub fn emitString(self: *Self, value: []const u8) !void {
-            try writeTextString(self.writer, value);
+            try encodeText(self.writer, value, readOption(self.cfg, "trusted_text", false));
         }
 
         pub fn emitBytes(self: *Self, value: []const u8) !void {
@@ -299,7 +308,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
 
         /// A streaming writer for a wire type's encode hook; see `Encoder`.
         pub fn encoder(self: *Self) Encoder {
-            return .{ .writer = self.writer, .deterministic = deterministic };
+            return .{ .writer = self.writer, .deterministic = deterministic, .trusted_text = readOption(self.cfg, "trusted_text", false) };
         }
 
         pub const raw_format: typed.RawFormat = .cbor;
@@ -399,6 +408,7 @@ pub fn CborDeserializer(comptime Config: type) type {
         owns_input: bool,
         can_borrow_strings: bool,
         strict: bool = false,
+        trusted_text: bool = false,
         /// `canonicalItem` writes the deterministic encoding (preferred floats; no tags) instead of
         /// the form that compares keys.
         canon_det: bool = false,
@@ -431,6 +441,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 .owns_input = false,
                 .can_borrow_strings = effectiveBorrowStrings(cfg),
                 .strict = readOption(cfg, "mode", Mode.lenient) == .strict,
+                .trusted_text = readOption(cfg, "trusted_text", false),
                 .max_depth = limit(cfg, "max_depth", max_nesting),
                 .max_items = limit(cfg, "max_items", std.math.maxInt(usize)),
                 .max_string_len = limit(cfg, "max_string_len", std.math.maxInt(usize)),
@@ -700,7 +711,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                         if (header.value > self.max_string_len) return error.StringTooLong;
                         const raw = try self.takeBytes(header.value);
                         if (typed.matchStructFieldIndex(T, cfg, raw)) |index| return .{ .field_index = index };
-                        if (!bulk.validUtf8(raw)) return error.InvalidUtf8;
+                        if (!self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
                         try self.recordText(.{ .bytes = raw, .allocated = false });
                         return .unknown;
                     }
@@ -872,7 +883,7 @@ pub fn CborDeserializer(comptime Config: type) type {
             if (!header.indefinite) {
                 if (header.value > self.max_string_len) return error.StringTooLong;
                 const raw = try self.takeBytes(header.value);
-                if (is_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
+                if (is_text and !self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
                 return .{ .bytes = raw, .allocated = false };
             }
 
@@ -888,7 +899,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;
                 if (chunk.value > self.max_string_len - assembled.items.len) return error.StringTooLong;
                 const raw = try self.takeBytes(chunk.value);
-                if (is_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
+                if (is_text and !self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
                 try assembled.appendSlice(allocator, raw);
             }
             return .{ .bytes = try assembled.toOwnedSlice(allocator), .allocated = true };
@@ -1559,7 +1570,7 @@ pub fn PullReader(comptime Config: type) type {
 /// shortest exact width; without it entries keep the order they were written in and a float is a
 /// double. A map's items are keys and values alternately, and a key can be any item.
 pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
-    return ValueWriter.init(allocator, writer, effectiveDeterministic(cfg));
+    return ValueWriter.init(allocator, writer, effectiveDeterministic(cfg), readOption(cfg, "trusted_text", false));
 }
 
 /// A writer for a wire type's encode hook: items go out as they are written, with no buffering and
@@ -1580,6 +1591,7 @@ pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: a
 pub const Encoder = struct {
     writer: *std.Io.Writer,
     deterministic: bool,
+    trusted_text: bool = false,
     frames: [max_nesting]Frame = undefined,
     depth: usize = 0,
     root_done: bool = false,
@@ -1617,7 +1629,7 @@ pub const Encoder = struct {
     }
 
     pub fn writeText(self: *Encoder, value: []const u8) !void {
-        try self.put(writeTextString, .{value});
+        try self.put(encodeText, .{ value, self.trusted_text });
     }
 
     pub fn writeBytes(self: *Encoder, value: []const u8) !void {
@@ -1745,6 +1757,7 @@ pub const ValueWriter = struct {
     allocator: Allocator,
     out: *std.Io.Writer,
     deterministic: bool,
+    trusted_text: bool = false,
     frames: [max_nesting]Frame = undefined,
     depth: usize = 0,
 
@@ -1762,8 +1775,8 @@ pub const ValueWriter = struct {
     /// One map entry in its frame's buffer: the key, then its value.
     const Entry = struct { key_start: usize, key_end: usize, end: usize };
 
-    fn init(allocator: Allocator, writer: *std.Io.Writer, deterministic: bool) ValueWriter {
-        return .{ .allocator = allocator, .out = writer, .deterministic = deterministic };
+    fn init(allocator: Allocator, writer: *std.Io.Writer, deterministic: bool, trusted_text: bool) ValueWriter {
+        return .{ .allocator = allocator, .out = writer, .deterministic = deterministic, .trusted_text = trusted_text };
     }
 
     /// Releases the buffers of containers still open.
@@ -1806,7 +1819,7 @@ pub const ValueWriter = struct {
 
     pub fn writeText(self: *ValueWriter, value: []const u8) !void {
         try self.beforeItem();
-        try writeTextString(self.sink(), value);
+        try encodeText(self.sink(), value, self.trusted_text);
         try self.afterItem();
     }
 
@@ -2156,11 +2169,16 @@ fn writePreferredFloat(writer: *std.Io.Writer, value: anytype) !void {
     return writeFloat(writer, wide);
 }
 
-/// A text string is UTF-8 (RFC 8949 §3.1): bytes that are not would write output no reader accepts.
-fn writeTextString(writer: *std.Io.Writer, value: []const u8) !void {
-    if (!bulk.validUtf8(value)) return error.InvalidUtf8;
+/// A text string is UTF-8 (RFC 8949 §3.1): bytes that are not would write output no reader accepts,
+/// unless the caller has said the text is known to be valid.
+fn encodeText(writer: *std.Io.Writer, value: []const u8, trusted: bool) !void {
+    if (!trusted and !bulk.validUtf8(value)) return error.InvalidUtf8;
     try writeMajorValue(writer, 3, value.len);
     try writer.writeAll(value);
+}
+
+fn writeTextString(writer: *std.Io.Writer, value: []const u8) !void {
+    try encodeText(writer, value, false);
 }
 
 fn writeMajorValue(writer: *std.Io.Writer, major: u8, value: anytype) !void {

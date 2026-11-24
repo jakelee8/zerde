@@ -3224,3 +3224,87 @@ test "raw items are checked in full: keys in order, chunks, depth, escapes, extr
         try std.testing.expectError(case[1], zerde.serializeWith(zerde.json, &out.writer, Scripted(case[0]){}, .{}, .{}));
     }
 }
+
+// ---- text known to be valid is not checked again ----------------------------------------------------------
+
+test "trusted_text skips the UTF-8 check on read, in both formats, and nothing else" {
+    const Text = struct { s: []const u8 };
+    const cbor_plain = [_]u8{ 0xa1, 0x61, 's', 0x62, 'a', 0xff };
+    const cbor_chunked = [_]u8{ 0xa1, 0x61, 's', 0x7f, 0x61, 0xff, 0xff };
+    inline for (.{ &cbor_plain, &cbor_chunked }) |input| {
+        try std.testing.expectError(error.InvalidUtf8, zerde.cbor.parseSlice(Text, allocator, input));
+        const parsed = try zerde.cbor.parseSliceWith(Text, allocator, input, .{}, .{ .trusted_text = true });
+        defer zerde.free(allocator, parsed);
+        try std.testing.expect(std.mem.indexOfScalar(u8, parsed.s, 0xff) != null);
+    }
+    const aliased = try zerde.cbor.parseSliceAliasedWith(Text, allocator, &cbor_plain, .{}, .{ .trusted_text = true });
+    try std.testing.expectEqualSlices(u8, &.{ 'a', 0xff }, aliased.s);
+    // Strict mode still refuses the other things it refuses, and a text key is read too.
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.cbor.parseSliceWith(Text, allocator, &.{ 0xbf, 0x61, 's', 0x61, 'a', 0xff }, .{}, .{ .trusted_text = true, .mode = .strict }));
+    const skipped = try zerde.cbor.parseSliceWith(Text, allocator, &.{ 0xa2, 0x61, 's', 0x61, 'a', 0x62, 'x', 0xff, 0x00 }, .{}, .{ .trusted_text = true });
+    defer zerde.free(allocator, skipped);
+    try std.testing.expectError(error.InvalidUtf8, zerde.cbor.parseSlice(Text, allocator, &.{ 0xa2, 0x61, 's', 0x61, 'a', 0x62, 'x', 0xff, 0x00 }));
+    // The pull reader and Raw take it too.
+    var pull = try zerde.cbor.pullReader(allocator, &cbor_plain, .{ .trusted_text = true });
+    defer pull.deinit();
+    while (try pull.next()) |_| {}
+    const Held = struct { s: zerde.cbor.Raw };
+    const raw = try zerde.cbor.parseSliceWith(Held, allocator, &cbor_plain, .{}, .{ .trusted_text = true });
+    defer zerde.free(allocator, raw);
+
+    // JSON: plain and escaped runs.
+    const plain = "{\"s\":\"a\xff\"}";
+    const escaped = "{\"s\":\"\\n\xff\\t\"}";
+    inline for (.{ plain, escaped }) |input| {
+        try std.testing.expectError(error.InvalidUtf8, zerde.json.parseSlice(Text, allocator, input));
+        const parsed = try zerde.json.parseSliceWith(Text, allocator, input, .{}, .{ .trusted_text = true });
+        defer zerde.free(allocator, parsed);
+        try std.testing.expect(std.mem.indexOfScalar(u8, parsed.s, 0xff) != null);
+    }
+    // Escapes and control characters are still checked.
+    try std.testing.expectError(error.InvalidStringEscape, zerde.json.parseSliceWith(Text, allocator, "{\"s\":\"\\q\"}", .{}, .{ .trusted_text = true }));
+    try std.testing.expectError(error.InvalidStringCharacter, zerde.json.parseSliceWith(Text, allocator, "{\"s\":\"\x01\"}", .{}, .{ .trusted_text = true }));
+    var json_pull = try zerde.json.pullReader(allocator, plain, .{ .trusted_text = true });
+    defer json_pull.deinit();
+    while (try json_pull.next()) |_| {}
+    // A Raw written back is checked in full, trusted or not.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.json, &out.writer, FramedJson{ .id = 1, .meta = .{ .bytes = "\"\xff\"" } }, .{}, .{ .trusted_text = true }));
+}
+
+test "trusted_text skips the UTF-8 check on write" {
+    const Text = struct { s: []const u8 };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.cbor, &out.writer, Text{ .s = "\xff" }, .{}, .{}));
+    out.clearRetainingCapacity();
+    try zerde.serializeWith(zerde.cbor, &out.writer, Text{ .s = "\xff" }, .{}, .{ .trusted_text = true });
+    try std.testing.expectEqualSlices(u8, &.{ 0xbf, 0x61, 's', 0x61, 0xff, 0xff }, out.written());
+    out.clearRetainingCapacity();
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.json, &out.writer, Text{ .s = "\xff" }, .{}, .{}));
+    out.clearRetainingCapacity();
+    try zerde.serializeWith(zerde.json, &out.writer, Text{ .s = "\xff" }, .{}, .{ .trusted_text = true });
+    try std.testing.expectEqualSlices(u8, "{\"s\":\"\xff\"}", out.written());
+    // The value writers and the hook encoders follow the config too.
+    out.clearRetainingCapacity();
+    var cbor = zerde.cbor.valueWriter(allocator, &out.writer, .{ .trusted_text = true });
+    defer cbor.deinit();
+    try cbor.writeText("\xff");
+    var checking = zerde.cbor.valueWriter(allocator, &out.writer, .{});
+    defer checking.deinit();
+    try std.testing.expectError(error.InvalidUtf8, checking.writeText("\xff"));
+    var json = zerde.json.valueWriter(allocator, &out.writer, .{ .trusted_text = true });
+    defer json.deinit();
+    try json.writeText("\xff");
+    const Hook = struct {
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            _ = self;
+            try encoder.writeText("\xff");
+        }
+    };
+    out.clearRetainingCapacity();
+    try zerde.serializeWith(zerde.cbor, &out.writer, Hook{}, .{}, .{ .trusted_text = true });
+    try zerde.serializeWith(zerde.json, &out.writer, Hook{}, .{}, .{ .trusted_text = true });
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.json, &out.writer, Hook{}, .{}, .{}));
+}

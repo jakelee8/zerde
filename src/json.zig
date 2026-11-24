@@ -40,9 +40,16 @@ pub const ReadConfig = struct {
     max_items: usize = std.math.maxInt(usize),
     /// Longest string in bytes after its escapes are decoded (`error.StringTooLong`).
     max_string_len: usize = std.math.maxInt(usize),
+    /// Do not check that text is UTF-8 (`error.InvalidUtf8`): for an item known to be valid already,
+    /// such as one this library wrote and a store authenticated, where checking again costs more than
+    /// the rest of the read. Input that has not been checked once must not be read this way.
+    trusted_text: bool = false,
 };
 pub const WriteConfig = struct {
     bytes: BytesEncoding = .string,
+    /// Do not check that text is UTF-8 on the way out (`error.InvalidUtf8`): for text known to be
+    /// valid already, such as a string just read from a source that was checked.
+    trusted_text: bool = false,
     /// For `valueWriter`: sort each map's keys as deterministic CBOR does (shorter first, then bytewise).
     sort_keys: bool = true,
 };
@@ -133,7 +140,7 @@ pub fn JsonSerializer(comptime Config: type) type {
         }
 
         pub fn emitString(self: *Self, value: []const u8) !void {
-            try writeEscapedString(self.writer, value);
+            try writeStringText(self.writer, value, readLimitFlag(self.cfg, "trusted_text", false));
         }
 
         /// Where the writer is in an extras object (see `beginExtras`).
@@ -195,7 +202,7 @@ pub fn JsonSerializer(comptime Config: type) type {
 
         /// A streaming writer for a wire type's encode hook; see `Encoder`.
         pub fn encoder(self: *Self) Encoder {
-            return .{ .writer = self.writer, .encoding = bytesEncoding(Config, self.cfg) };
+            return .{ .writer = self.writer, .encoding = bytesEncoding(Config, self.cfg), .trusted_text = readLimitFlag(self.cfg, "trusted_text", false) };
         }
 
         pub const raw_format: typed.RawFormat = .json;
@@ -331,7 +338,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return .{
                 .input = input,
                 .cfg = cfg,
-                .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)) },
+                .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)), .trusted_text = readLimitFlag(cfg, "trusted_text", false) },
                 .max_depth = readLimit(cfg, "max_depth", 128),
                 .max_items = readLimit(cfg, "max_items", std.math.maxInt(usize)),
                 .owns_input = false,
@@ -343,7 +350,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
             return .{
                 .input = input,
                 .cfg = cfg,
-                .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)) },
+                .parser = .{ .input = input, .max_string_len = readLimit(cfg, "max_string_len", std.math.maxInt(usize)), .trusted_text = readLimitFlag(cfg, "trusted_text", false) },
                 .max_depth = readLimit(cfg, "max_depth", 128),
                 .max_items = readLimit(cfg, "max_items", std.math.maxInt(usize)),
                 .owns_input = true,
@@ -809,6 +816,7 @@ pub fn PullReader(comptime Config: type) type {
 pub const Encoder = struct {
     writer: *std.Io.Writer,
     encoding: BytesEncoding,
+    trusted_text: bool = false,
     frames: [128]struct { kind: ContainerKind, first: bool, expect_key: bool, remaining: u64 } = undefined,
     depth: usize = 0,
     root_done: bool = false,
@@ -846,7 +854,7 @@ pub const Encoder = struct {
                 if (frame.remaining == 0) return error.LengthMismatch;
                 if (!frame.first) try self.writer.writeByte(',');
                 frame.first = false;
-                try writeEscapedString(self.writer, value);
+                try writeStringText(self.writer, value, self.trusted_text);
                 try self.writer.writeByte(':');
                 frame.expect_key = false;
                 frame.remaining -= 1;
@@ -854,7 +862,7 @@ pub const Encoder = struct {
             }
         }
         try self.beforeValue();
-        try writeEscapedString(self.writer, value);
+        try writeStringText(self.writer, value, self.trusted_text);
         self.afterValue();
     }
 
@@ -944,7 +952,9 @@ pub const Encoder = struct {
 /// deterministic CBOR keys, and a repeated key is `error.DuplicateField`. Arrays are written as they
 /// come. Bytes are written in the config's `bytes` encoding, and a NaN or infinity is refused.
 pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
-    return ValueWriter.init(allocator, writer, readLimitFlag(cfg, "sort_keys", true), bytesEncoding(@TypeOf(cfg), cfg));
+    var result = ValueWriter.init(allocator, writer, readLimitFlag(cfg, "sort_keys", true), bytesEncoding(@TypeOf(cfg), cfg));
+    result.trusted_text = readLimitFlag(cfg, "trusted_text", false);
+    return result;
 }
 
 pub const ValueWriter = struct {
@@ -952,6 +962,7 @@ pub const ValueWriter = struct {
     out: *std.Io.Writer,
     sort_keys: bool,
     encoding: BytesEncoding,
+    trusted_text: bool = false,
     frames: [128]Frame = undefined,
     depth: usize = 0,
 
@@ -1019,7 +1030,7 @@ pub const ValueWriter = struct {
             if (frame.kind == .object and frame.expect_key) {
                 const out = &frame.buf.writer;
                 frame.entry_start = frame.buf.written().len;
-                try writeEscapedString(out, value);
+                try writeStringText(out, value, self.trusted_text);
                 try out.writeByte(':');
                 frame.key_start = frame.keys.items.len;
                 frame.key_len = value.len;
@@ -1029,7 +1040,7 @@ pub const ValueWriter = struct {
             }
         }
         try self.beforeValue();
-        try writeEscapedString(self.sink(), value);
+        try writeStringText(self.sink(), value, self.trusted_text);
         try self.afterValue();
     }
 
@@ -1266,6 +1277,11 @@ fn readLimitFlag(cfg: anytype, comptime name: []const u8, default: bool) bool {
     return default;
 }
 
+/// A JSON string for `value`, checked for UTF-8 unless the caller says it is known to be valid.
+fn writeStringText(writer: *std.Io.Writer, value: []const u8, trusted: bool) !void {
+    if (trusted) try writeQuoted(writer, value) else try writeEscapedString(writer, value);
+}
+
 pub fn writeEscapedString(writer: *std.Io.Writer, bytes: []const u8) !void {
     if (!bulk.validUtf8(bytes)) return error.InvalidUtf8;
     try writeQuoted(writer, bytes);
@@ -1358,6 +1374,8 @@ const Parser = struct {
     input: []const u8,
     index: usize = 0,
     max_string_len: usize = std.math.maxInt(usize),
+    /// Text is not checked for UTF-8; see `ReadConfig.trusted_text`.
+    trusted_text: bool = false,
     /// `skipValueTrusted` checks the strings it steps over (escapes, control characters, UTF-8).
     checked: bool = false,
 
@@ -1445,8 +1463,8 @@ const Parser = struct {
 
     /// A string's raw bytes between escapes must be UTF-8. Each run is checked alone, which is
     /// enough: an escape is ASCII, so no code point spans two runs.
-    fn validUtf8(bytes: []const u8) Error![]const u8 {
-        if (!bulk.validUtf8(bytes)) return error.InvalidUtf8;
+    fn validUtf8(self: *const Parser, bytes: []const u8) Error![]const u8 {
+        if (!self.trusted_text and !bulk.validUtf8(bytes)) return error.InvalidUtf8;
         return bytes;
     }
 
@@ -1475,19 +1493,19 @@ const Parser = struct {
                 '"' => {
                     if (builder.items.len == 0) {
                         return .{
-                            .bytes = try validUtf8(self.input[start .. self.index - 1]),
+                            .bytes = try self.validUtf8(self.input[start .. self.index - 1]),
                             .allocated = false,
                         };
                     }
 
-                    try builder.appendSlice(allocator, try validUtf8(self.input[start .. self.index - 1]));
+                    try builder.appendSlice(allocator, try self.validUtf8(self.input[start .. self.index - 1]));
                     return .{
                         .bytes = try builder.toOwnedSlice(allocator),
                         .allocated = true,
                     };
                 },
                 '\\' => {
-                    try builder.appendSlice(allocator, try validUtf8(self.input[start .. self.index - 1]));
+                    try builder.appendSlice(allocator, try self.validUtf8(self.input[start .. self.index - 1]));
                     try self.appendEscape(allocator, &builder);
                     builder_owned_here = false;
                     return self.finishEscapedString(allocator, builder);
@@ -1508,14 +1526,14 @@ const Parser = struct {
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
                 '"' => {
-                    try builder.appendSlice(allocator, try validUtf8(self.input[chunk_start .. self.index - 1]));
+                    try builder.appendSlice(allocator, try self.validUtf8(self.input[chunk_start .. self.index - 1]));
                     return .{
                         .bytes = try builder.toOwnedSlice(allocator),
                         .allocated = true,
                     };
                 },
                 '\\' => {
-                    try builder.appendSlice(allocator, try validUtf8(self.input[chunk_start .. self.index - 1]));
+                    try builder.appendSlice(allocator, try self.validUtf8(self.input[chunk_start .. self.index - 1]));
                     try self.appendEscape(allocator, &builder);
                     chunk_start = self.index;
                 },
@@ -1595,7 +1613,7 @@ const Parser = struct {
             self.index = bulk.findStringSpecial(self.input, self.index);
             switch (self.consume() orelse return error.UnexpectedEndOfInput) {
                 '"' => {
-                    _ = try validUtf8(self.input[start .. self.index - 1]);
+                    if (!bulk.validUtf8(self.input[start .. self.index - 1])) return error.InvalidUtf8;
                     return;
                 },
                 '\\' => switch (self.consume() orelse return error.UnexpectedEndOfInput) {

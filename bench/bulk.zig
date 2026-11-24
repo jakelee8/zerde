@@ -43,7 +43,32 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
         try report(out, input.name, "escape", try time(io, escapeBulk, input.bytes, &sink.writer), try time(io, escapeStd, input.bytes, &sink.writer), input.bytes.len);
         try report(out, input.name, "find special", try time(io, scanBulk, input.bytes, &sink.writer), try time(io, scanByte, input.bytes, &sink.writer), input.bytes.len);
     }
+
+    // A strict CBOR read of a long text, rendered as JSON: checked on the way in and out, and trusted.
+    var cbor_text: std.Io.Writer.Allocating = .init(allocator);
+    defer cbor_text.deinit();
+    var writer = zerde.cbor.valueWriter(allocator, &cbor_text.writer, .{ .deterministic = true });
+    defer writer.deinit();
+    try writer.writeText(ascii);
+    try report(out, "ascii", "cbor to json render, trusted vs checked", try time(io, renderTrusted, cbor_text.written(), &sink.writer), try time(io, renderChecked, cbor_text.written(), &sink.writer), ascii.len);
     try out.flush();
+}
+
+fn render(bytes: []const u8, sink: *std.Io.Writer, comptime trusted: bool) !usize {
+    var pull = try zerde.cbor.pullReader(std.heap.page_allocator, bytes, .{ .mode = .strict, .trusted_text = trusted });
+    defer pull.deinit();
+    var json = zerde.json.valueWriter(std.heap.page_allocator, sink, .{ .trusted_text = trusted });
+    defer json.deinit();
+    while (try pull.next()) |event| try json.writeEvent(event);
+    return sink.end;
+}
+
+fn renderTrusted(bytes: []const u8, sink: *std.Io.Writer) anyerror!usize {
+    return render(bytes, sink, true);
+}
+
+fn renderChecked(bytes: []const u8, sink: *std.Io.Writer) anyerror!usize {
+    return render(bytes, sink, false);
 }
 
 fn report(out: *std.Io.Writer, input: []const u8, what: []const u8, bulk_ns: u64, std_ns: u64, bytes: usize) !void {

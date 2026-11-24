@@ -59,3 +59,12 @@ Without SIMD the standard library has no ASCII fast path, so the word-at-a-time 
   the noise of that benchmark (its own write path moved by up to 10% with no change to it), and its strings are short, so
   it does not show the gain on long strings above. A repeat on the benchmark machine would settle it.
 - The multibyte validation is not faster than the standard library's on either target; the scans help text that is mostly ASCII.
+
+### Trusted text (`trusted_text`), 2026-11-24
+
+`zig build bench-bulk -Doptimize=ReleaseFast`, native x86_64, one run. A strict CBOR read of one 270 KiB ASCII text, through the pull
+reader into the JSON value writer, with UTF-8 checked on the way in and out against `trusted_text = true` on both:
+75.2 µs trusted, 82.9 µs checked (1.10x). Validation is 5 µs of the 83 here (native validation runs at about 50 GiB/s on ASCII);
+the rest is the scan for characters to escape and the copy, about 63 µs. So the option removes the checks but not the cost that
+dominates a long-text render; a faster scan or a copy of text known to need no escapes would be what gets near a plain `memcpy`.
+On wasm without SIMD validation costs more (see the table above), so the option is worth more there; it was not measured.
