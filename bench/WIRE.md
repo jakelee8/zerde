@@ -9,6 +9,24 @@ Time is ns for one decode, 200 decodes, two runs back to back under `flock`, loa
 first section and the second (the files this benchmark read were edited by the work itself), so each section compares
 its own before and after, measured in the same session on the same input.
 
+## 2026-11-24 - 3bd3e6a
+
+New rows: the decode in chunks and the render in windows, against the whole ones, on the fixed corpus of the 41c3439 section (301,382 B of
+strict CBOR, 195 effects; 358,403 B of JSON). Runs under `flock`, shared machine, so ratios are read, not the absolute times (the unchanged
+whole decode moved between 38 and 64 µs across three runs).
+
+|Row|Memory|Time (three runs)|
+|---|---|---|
+|`wire.decode`, whole input, spans into it|arena 5,462 B (input held whole)|39.4, 63.8, 38.4 µs|
+|`wire.Resumable`, chunks of 4, 16, 64 KiB|region 301,548 B (every string copied), state 9,624 B|about 2.0x of the whole (1.2x in the noisy run)|
+|pull reader into `json.valueWriter`, whole|358,403 B output buffer, plus a buffer per open map|8.9 to 9.9 ms|
+|`resumable.Render`, windows of 4, 16, 64 KiB|the window, state 3,408 B|0.30 to 0.46 ms (0.03 to 0.05x)|
+
+- The decode in chunks copies the strings, so its region is about the size of the input; a mode that leaves them in the caller's buffer is the next step.
+- The windowed render is far under the whole render because it buffers and sorts nothing; the windows cost nothing measurable over each other.
+- The destination-passing typed read (every format) measured the same as before within the spread: bench-cbor, bench-json and bench-wire
+  decode rows, base against this tree, alternating; bench-memory output identical.
+
 ## 2026-11-23 - 879332e before, direct decode after
 
 `wire.decode` reads straight into `Wire(T)`, with no typed value and no typed array first.
