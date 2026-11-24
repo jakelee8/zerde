@@ -621,7 +621,7 @@ MUTANTS = [
     ("wire.zig", "            if (limits.strict and (!limits.copy or limits.in_stream)) break :blk .{};\n            // A string with an escape", "            if (limits.strict and !limits.copy) break :blk .{};\n            // A string with an escape"),
     ("wire.zig", "            if (limits.strict and (!limits.copy or limits.in_stream)) break :blk .{};\n            // The bytes only", "            if (limits.strict and !limits.copy) break :blk .{};\n            // The bytes only"),
     ("wire.zig", "std.mem.eql(u8, field.name, \"key\")) adjusted.in_stream = false;", "std.mem.eql(u8, field.name, \"key\")) adjusted.in_stream = true;"),
-    ("wire.zig", "        if (end > std.math.maxInt(u32)) return error.OffsetOutOfRange;\n        return .{ .offset = @intCast(start)", "        return .{ .offset = @intCast(start)"),
+    ("wire.zig", "        if (end > std.math.maxInt(u32)) return error.OffsetOutOfRange;\n        return .{ .offset = @intCast(start)", "        _ = end;\n        return .{ .offset = @intCast(start)"),
     ("typed_resume.zig", "if (major == 3 and !deserializer.trustedText() and !leaf.utf8.feed(piece)) return error.InvalidUtf8;\n        leaf.at += piece.len;\n    }\n    const start", "leaf.at += piece.len;\n    }\n    const start"),
     ("typed_resume.zig", "    if (unfinished) return error.InvalidUtf8;\n    try typed.checkLength(bounds, len);\n    dest.* = try s.span", "    _ = unfinished;\n    try typed.checkLength(bounds, len);\n    dest.* = try s.span"),
     ("typed_resume.zig", "    try typed.checkLength(bounds, len);\n    dest.* = try s.span", "    dest.* = try s.span"),
