@@ -258,17 +258,9 @@ pub fn Reader(comptime Config: type) type {
             };
         }
 
-        /// Refuses a NaN or an infinity when the config says to, as the whole-input reader does.
+        /// Refuses what the config says to in a float, as the whole-input reader does.
         fn checkFloat(self: *Self, header: Header) !void {
-            if (comptime !meta.hasField(Config, "refuse_non_finite")) return;
-            if (!self.cfg.refuse_non_finite or header.major != 7) return;
-            const exponent_all_ones = switch (header.ai) {
-                25 => (header.value >> 10) & 0x1f == 0x1f,
-                26 => (header.value >> 23) & 0xff == 0xff,
-                27 => (header.value >> 52) & 0x7ff == 0x7ff,
-                else => false,
-            };
-            if (exponent_all_ones) return error.NonFiniteFloat;
+            try cbor.checkFloatHeader(Config, self.cfg, header);
         }
 
         /// `count` items of at least `per` bytes each cannot fit in what the stream may still hold, nor in what

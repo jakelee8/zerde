@@ -689,6 +689,19 @@ JSON has none (RFC 8259 §6), so the JSON writer refuses them (`error.NonFiniteF
 forbids them in CBOR sets `ReadConfig.refuse_non_finite`: any NaN or infinity, in a field, a skipped
 value or a key, is then `error.NonFiniteFloat`.
 
+Negative zero is a value distinct from 0.0 in CBOR (RFC 8949 §4.2.2 writes it `0xf98000`, and a strict read takes it), so
+by default it is read and written as it is. A profile that keeps no negative zero sets two options, both off by default:
+`ReadConfig.refuse_negative_zero` refuses -0.0 in any float width, in a field, a skipped value, a key or a `Raw` item, a
+`cbor.PullReader` and the resumable reads too (`error.NegativeZero`), and `WriteConfig.normalize_negative_zero` writes any
+float zero as +0 (`0xf90000` when deterministic), in the typed write, the value writer, the hook encoder and a resumable
+write, with or without `deterministic`. A `Raw` or extras item copied as it is cannot be rewritten, so a typed or hook
+write that normalizes refuses one that holds -0.0 with `error.NegativeZero`; `ValueWriter.writeRaw` rewrites it when it is
+deterministic and refuses it otherwise, and `cbor.canonicalizeWith(allocator, bytes, cfg)` and
+`cbor.canonicalizeIntoWith(dst, scratch, bytes, cfg)` (`canonicalize` and `canonicalizeInto` with the write options in `cfg`)
+write it as +0 and order float keys as written. A lenient read that does not refuse, followed by a write or a
+canonicalization that normalizes, stores -0 from JSON text and from any CBOR width as the same bytes; a strict read that
+refuses reads those bytes back. JSON text output of -0 is unchanged (`-0`).
+
 `trusted_text = true` (a `ReadConfig` field of both formats) skips the UTF-8 check of text and keys, for an item that has
 been checked once already, such as plaintext this library wrote and a store authenticated. Everything else is still
 checked: escapes, control characters, the mode, the limits. `WriteConfig.trusted_text` skips the check a writer makes of text

@@ -8216,3 +8216,281 @@ test "a key and a string are read by every format with no allocation, whatever t
     var bson = try zerde.bson.sliceDeserializer(allocator, &.{ 23, 0, 0, 0, 0x10, 'a', 0, 1, 0, 0, 0, 0x02, 'c', 0, 4, 0, 0, 0, 'r', 'e', 'd', 0, 0 }, .{});
     try expectKeyReadsFree(&bson);
 }
+
+// ---- negative zero: `refuse_negative_zero` on a read, `normalize_negative_zero` on a write ----------------------------------
+
+const negative_zero_heads = [_][]const u8{
+    &.{ 0xf9, 0x80, 0x00 },
+    &.{ 0xfa, 0x80, 0x00, 0x00, 0x00 },
+    &.{ 0xfb, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+};
+
+/// `{"v": <head>}`, the item a body of one float is.
+fn floatBody(head: []const u8) !std.ArrayList(u8) {
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try body.appendSlice(allocator, &.{ 0xa1, 0x61, 'v' });
+    try body.appendSlice(allocator, head);
+    return body;
+}
+
+test "refuse_negative_zero refuses -0.0 in every width, wherever it is, and the default reads it" {
+    const refuse = .{ .refuse_negative_zero = true };
+    for (negative_zero_heads) |head| {
+        var body = try floatBody(head);
+        defer body.deinit(allocator);
+        try std.testing.expectError(error.NegativeZero, zerde.cbor.parseSliceWith(Real, allocator, body.items, .{}, refuse));
+        const read = try zerde.cbor.parseSliceWith(Real, allocator, body.items, .{}, .{});
+        try std.testing.expect(read.v == 0 and std.math.signbit(read.v));
+    }
+    // In the strict mode of a deterministic read, where the half float is the one form of it.
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xf9, 0x80, 0x00 }, .{}, .{ .mode = .strict, .refuse_negative_zero = true }));
+    _ = try zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xf9, 0x80, 0x00 }, .{}, .{ .mode = .strict });
+    // In a skipped value, in a skipped key, inside a skipped array, and in a `Raw` item.
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x61, 'x', 0x81, 0xf9, 0x80, 0x00 }, .{}, refuse));
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0xf9, 0x80, 0x00, 0x01 }, .{}, refuse));
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.parseSliceWith(Probe, allocator, &.{ 0xa1, 0x81, 0xf9, 0x80, 0x00, 0x01 }, .{}, refuse));
+    const Boxed = struct { raw: zerde.cbor.Raw };
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.parseSliceWith(Boxed, allocator, &.{ 0xa1, 0x63, 'r', 'a', 'w', 0x82, 0x01, 0xf9, 0x80, 0x00 }, .{}, refuse));
+    // The pull reader reads the same way.
+    var pull = try zerde.cbor.pullReader(allocator, &.{ 0xf9, 0x80, 0x00 }, refuse);
+    defer pull.deinit();
+    try std.testing.expectError(error.NegativeZero, pull.next());
+    // What is not -0.0 is read: +0 in every width, the smallest negative half, a negative single that is not zero, and -1.
+    const fine = [_][]const u8{
+        &.{ 0xf9, 0x00, 0x00 },
+        &.{ 0xfa, 0x00, 0x00, 0x00, 0x00 },
+        &.{ 0xfb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        &.{ 0xf9, 0x80, 0x01 },
+        &.{ 0xfa, 0x80, 0x00, 0x00, 0x01 },
+        &.{ 0xfb, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        &.{ 0xf9, 0xbc, 0x00 },
+    };
+    for (fine) |head| {
+        var body = try floatBody(head);
+        defer body.deinit(allocator);
+        _ = try zerde.cbor.parseSliceWith(Real, allocator, body.items, .{}, refuse);
+    }
+}
+
+test "a resumable read honours refuse_negative_zero in a field and inside a Raw, as the whole read does" {
+    const Holder = struct {
+        t: []const u8,
+        raw: zerde.cbor.Raw,
+        f: f64,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 16 } } };
+    };
+    // Keys in encoded order: "f", "t", "raw".
+    const field = [_]u8{ 0xa3, 0x61, 'f', 0xf9, 0x80, 0x00, 0x61, 't', 0x61, 'x', 0x63, 'r', 'a', 'w', 0x01 };
+    const inside_raw = [_]u8{ 0xa3, 0x61, 'f', 0xf9, 0x3c, 0x00, 0x61, 't', 0x61, 'x', 0x63, 'r', 'a', 'w', 0x81, 0xf9, 0x80, 0x00 };
+    const refuse = .{ .mode = zerde.cbor.Mode.strict, .refuse_negative_zero = true };
+    for ([_][]const u8{ &field, &inside_raw }) |input| {
+        try expectRefusedInChunks(Holder, .{}, refuse, error.NegativeZero, input);
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const whole = try zerde.cbor.parseSliceWith(Holder, arena_state.allocator(), input, .{}, strict);
+        for (0..input.len + 1) |cut| {
+            const got = try readInChunks(Holder, .{}, strict, arena_state.allocator(), input, &.{cut});
+            try std.testing.expectEqualDeep(whole, got);
+        }
+    }
+}
+
+const ZeroFloats = struct { h: f16, s: f32, d: f64 };
+
+test "normalize_negative_zero writes -0.0 as +0 in every width, and leaves every other float and the default alone" {
+    const normalize = .{ .normalize_negative_zero = true, .deterministic = true };
+    var out = try writeCbor(Real{ .v = -0.0 }, .{}, normalize);
+    defer out.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'v', 0xf9, 0x00, 0x00 }, out.written());
+    var plain = try writeCbor(Real{ .v = -0.0 }, .{}, .{ .deterministic = true });
+    defer plain.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'v', 0xf9, 0x80, 0x00 }, plain.written());
+    // Without `deterministic` a float keeps its width (here a double), and still has no sign.
+    var wide = try writeCbor(Real{ .v = -0.0 }, .{}, .{ .normalize_negative_zero = true });
+    defer wide.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xbf, 0x61, 'v', 0xfb, 0, 0, 0, 0, 0, 0, 0, 0, 0xff }, wide.written());
+    // Half, single and double fields, deterministic or not: what is written reads back with the refusal on.
+    inline for (.{ .{ .normalize_negative_zero = true }, normalize }) |cfg| {
+        var zeros = try writeCbor(ZeroFloats{ .h = -0.0, .s = -0.0, .d = -0.0 }, .{}, cfg);
+        defer zeros.deinit();
+        const back = try zerde.cbor.parseSliceWith(ZeroFloats, allocator, zeros.written(), .{}, .{ .refuse_negative_zero = true });
+        try std.testing.expect(!std.math.signbit(back.h) and !std.math.signbit(back.s) and !std.math.signbit(back.d));
+    }
+    // Other floats are written as they were: a negative number, the smallest negative half, a NaN and an infinity.
+    for ([_]f64{ -1.5, -5.960464477539063e-8, std.math.nan(f64), -std.math.inf(f64), 0.0 }) |value| {
+        var same = try writeCbor(Real{ .v = value }, .{}, normalize);
+        defer same.deinit();
+        var base = try writeCbor(Real{ .v = value }, .{}, .{ .deterministic = true });
+        defer base.deinit();
+        try std.testing.expectEqualSlices(u8, base.written(), same.written());
+    }
+}
+
+test "normalize_negative_zero refuses a Raw or extras item that holds -0.0, which a write copies as it is" {
+    const Boxed = struct { raw: zerde.cbor.Raw };
+    const holds = Boxed{ .raw = .{ .bytes = &.{ 0x82, 0x01, 0xf9, 0x80, 0x00 } } };
+    inline for ([_]bool{ false, true }) |deterministic| {
+        var plain = try writeCbor(holds, .{}, .{ .deterministic = deterministic });
+        plain.deinit();
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        try std.testing.expectError(error.NegativeZero, zerde.cbor.serializeWith(&sink.writer, holds, .{}, .{ .deterministic = deterministic, .normalize_negative_zero = true }));
+    }
+    // A Raw without one is written.
+    var fine = try writeCbor(Boxed{ .raw = .{ .bytes = &.{ 0x82, 0x01, 0xf9, 0x00, 0x00 } } }, .{}, .{ .deterministic = true, .normalize_negative_zero = true });
+    fine.deinit();
+    // The same for the extras of a struct.
+    const input = [_]u8{ 0xa3, 0x62, 'i', 'd', 0x01, 0x64, 'n', 'a', 'm', 'e', 0x61, 'n', 0x61, 'x', 0xf9, 0x80, 0x00 };
+    const decoded = try zerde.cbor.parseSlice(WithExtras, allocator, &input);
+    defer zerde.free(allocator, decoded);
+    var kept = try writeCbor(decoded, .{}, .{ .deterministic = true });
+    kept.deinit();
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.serializeWith(&sink.writer, decoded, .{}, .{ .deterministic = true, .normalize_negative_zero = true }));
+}
+
+test "the value writer and the encoder of a hook normalize -0.0 on request, and a Raw is rewritten or refused" {
+    inline for ([_]bool{ false, true }) |deterministic| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var writer = zerde.cbor.valueWriter(allocator, &out.writer, .{ .deterministic = deterministic, .normalize_negative_zero = true });
+        defer writer.deinit();
+        try writer.beginArray();
+        try writer.writeFloat(-0.0);
+        try writer.writeFloat(-2.0);
+        try writer.endArray();
+        try writer.finish();
+        const zero_bytes: []const u8 = if (deterministic) &.{ 0xf9, 0x00, 0x00 } else &.{ 0xfb, 0, 0, 0, 0, 0, 0, 0, 0 };
+        const two_bytes: []const u8 = if (deterministic) &.{ 0xf9, 0xc0, 0x00 } else &.{ 0xfb, 0xc0, 0, 0, 0, 0, 0, 0, 0 };
+        try std.testing.expectEqualSlices(u8, zero_bytes, out.written()[1..][0..zero_bytes.len]);
+        try std.testing.expectEqualSlices(u8, two_bytes, out.written()[1 + zero_bytes.len ..]);
+        // The default keeps the sign.
+        out.clearRetainingCapacity();
+        var keeping = zerde.cbor.valueWriter(allocator, &out.writer, .{ .deterministic = deterministic });
+        defer keeping.deinit();
+        try keeping.writeFloat(-0.0);
+        try std.testing.expect(out.written()[0] == (if (deterministic) @as(u8, 0xf9) else 0xfb));
+        try std.testing.expect(out.written()[1] == 0x80);
+        // A Raw: a deterministic write puts it in canonical form, without the sign; another refuses it.
+        out.clearRetainingCapacity();
+        var raw = zerde.cbor.valueWriter(allocator, &out.writer, .{ .deterministic = deterministic, .normalize_negative_zero = true });
+        defer raw.deinit();
+        const item = [_]u8{ 0x82, 0x01, 0xfa, 0x80, 0x00, 0x00, 0x00 };
+        if (deterministic) {
+            try raw.writeRaw(&item);
+            try std.testing.expectEqualSlices(u8, &.{ 0x82, 0x01, 0xf9, 0x00, 0x00 }, out.written());
+        } else {
+            try std.testing.expectError(error.NegativeZero, raw.writeRaw(&item));
+        }
+    }
+    // The encoder of a hook.
+    var buffer: [16]u8 = undefined;
+    var fixed = std.Io.Writer.fixed(&buffer);
+    var encoder: zerde.cbor.Encoder = .{ .writer = &fixed, .deterministic = true, .normalize_zero = true };
+    try encoder.writeFloat(-0.0);
+    try std.testing.expectEqualSlices(u8, &.{ 0xf9, 0x00, 0x00 }, fixed.buffered());
+    try std.testing.expectError(error.NegativeZero, encoder.writeRaw(&.{ 0xf9, 0x80, 0x00 }));
+    var kept = std.Io.Writer.fixed(&buffer);
+    var keeping: zerde.cbor.Encoder = .{ .writer = &kept, .deterministic = true };
+    try keeping.writeFloat(-0.0);
+    try std.testing.expectEqualSlices(u8, &.{ 0xf9, 0x80, 0x00 }, kept.buffered());
+}
+
+test "canonicalizeWith and canonicalizeIntoWith write -0.0 as +0, keys in the order they are written, and the default keeps it" {
+    // A map of 0.5 and -0.0 as keys: -0.0 sorts after 0.5 as 0xf98000 and before it as 0xf90000.
+    const input = [_]u8{ 0xa2, 0xf9, 0x38, 0x00, 0x01, 0xf9, 0x80, 0x00, 0x02, 0x00 };
+    const kept = [_]u8{ 0xa2, 0xf9, 0x38, 0x00, 0x01, 0xf9, 0x80, 0x00, 0x02 };
+    const normalized = [_]u8{ 0xa2, 0xf9, 0x00, 0x00, 0x02, 0xf9, 0x38, 0x00, 0x01 };
+    const item = input[0 .. input.len - 1];
+    const heap_kept = try zerde.cbor.canonicalize(allocator, item);
+    defer allocator.free(heap_kept);
+    try std.testing.expectEqualSlices(u8, &kept, heap_kept);
+    const heap_normalized = try zerde.cbor.canonicalizeWith(allocator, item, .{ .normalize_negative_zero = true });
+    defer allocator.free(heap_normalized);
+    try std.testing.expectEqualSlices(u8, &normalized, heap_normalized);
+    var dst: [32]u8 = undefined;
+    var scratch: [zerde.cbor.canonicalScratchSize(8)]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &kept, try zerde.cbor.canonicalizeInto(&dst, &scratch, item));
+    try std.testing.expectEqualSlices(u8, &normalized, try zerde.cbor.canonicalizeIntoWith(&dst, &scratch, item, .{ .normalize_negative_zero = true }));
+    // 0.0 and -0.0 as keys of one map are still one key twice.
+    const both = [_]u8{ 0xa2, 0xf9, 0x00, 0x00, 0x01, 0xf9, 0x80, 0x00, 0x02 };
+    try std.testing.expectError(error.DuplicateField, zerde.cbor.canonicalizeWith(allocator, &both, .{ .normalize_negative_zero = true }));
+    try std.testing.expectError(error.DuplicateField, zerde.cbor.canonicalizeIntoWith(&dst, &scratch, &both, .{ .normalize_negative_zero = true }));
+    // Every width of -0.0, as a value, is the half +0.
+    for (negative_zero_heads) |head| {
+        var body = try floatBody(head);
+        defer body.deinit(allocator);
+        const want = [_]u8{ 0xa1, 0x61, 'v', 0xf9, 0x00, 0x00 };
+        try std.testing.expectEqualSlices(u8, &want, try zerde.cbor.canonicalizeIntoWith(&dst, &scratch, body.items, .{ .normalize_negative_zero = true }));
+        const heap = try zerde.cbor.canonicalizeWith(allocator, body.items, .{ .normalize_negative_zero = true });
+        defer allocator.free(heap);
+        try std.testing.expectEqualSlices(u8, &want, heap);
+    }
+}
+
+test "a public body with -0 is stored as +0: a lenient read that does not refuse, then a write that normalizes, from JSON or CBOR alike" {
+    const store = .{ .deterministic = true, .normalize_negative_zero = true };
+    const refuse_strict = .{ .mode = zerde.cbor.Mode.strict, .refuse_negative_zero = true };
+    // The JSON body and the CBOR bodies (each width of -0.0) are the same value, with its sign, to the lenient read.
+    const from_json = try zerde.json.parseSlice(Real, allocator, "{\"v\":-0}");
+    try std.testing.expect(from_json.v == 0 and std.math.signbit(from_json.v));
+    var from_json_bytes = try writeCbor(from_json, .{}, store);
+    defer from_json_bytes.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'v', 0xf9, 0x00, 0x00 }, from_json_bytes.written());
+    for (negative_zero_heads) |head| {
+        var body = try floatBody(head);
+        defer body.deinit(allocator);
+        const lenient = try zerde.cbor.parseSlice(Real, allocator, body.items);
+        try std.testing.expect(std.math.signbit(lenient.v));
+        var stored = try writeCbor(lenient, .{}, store);
+        defer stored.deinit();
+        try std.testing.expectEqualSlices(u8, from_json_bytes.written(), stored.written());
+        // The same bytes by rewriting the body itself.
+        var dst: [16]u8 = undefined;
+        var scratch: [zerde.cbor.canonicalScratchSize(4)]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, from_json_bytes.written(), try zerde.cbor.canonicalizeIntoWith(&dst, &scratch, body.items, .{ .normalize_negative_zero = true }));
+    }
+    // A strict read of frames and stored values that refuses -0.0 takes what was stored.
+    const stored = try zerde.cbor.parseSliceWith(Real, allocator, from_json_bytes.written(), .{}, refuse_strict);
+    try std.testing.expect(stored.v == 0 and !std.math.signbit(stored.v));
+    // And the same read refuses the body itself.
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.parseSliceWith(Real, allocator, &.{ 0xa1, 0x61, 'v', 0xf9, 0x80, 0x00 }, .{}, refuse_strict));
+}
+
+/// A value written by a hook, whose encoder is the one the write config sets up: it writes -0.0 and a raw item that holds one.
+const ZeroHook = struct {
+    raw: bool,
+
+    pub fn zerdeEncode(self: ZeroHook, encoder: anytype) anyerror!void {
+        if (self.raw) return encoder.writeRaw(&.{ 0xf9, 0x80, 0x00 });
+        try encoder.writeFloat(-0.0);
+    }
+};
+
+test "the encoder a hook is given normalizes -0.0 and refuses a raw item that holds it, as the write config says" {
+    const Hooked = struct { z: ZeroHook };
+    var out = try writeCbor(Hooked{ .z = .{ .raw = false } }, .{}, .{ .deterministic = true, .normalize_negative_zero = true });
+    defer out.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'z', 0xf9, 0x00, 0x00 }, out.written());
+    var kept = try writeCbor(Hooked{ .z = .{ .raw = false } }, .{}, .{ .deterministic = true });
+    defer kept.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'z', 0xf9, 0x80, 0x00 }, kept.written());
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+    try std.testing.expectError(error.NegativeZero, zerde.cbor.serializeWith(&sink.writer, Hooked{ .z = .{ .raw = true } }, .{}, .{ .deterministic = true, .normalize_negative_zero = true }));
+}
+
+test "a resumable write normalizes -0.0 and refuses a Raw that holds it, for any window" {
+    const cfg = .{ .deterministic = true, .normalize_negative_zero = true };
+    try expectWindows(zerde.cbor, ZeroFloats, .{ .h = -0.0, .s = -0.0, .d = -0.0 }, .{}, cfg);
+    const min = zerde.resumable.Writer(zerde.cbor, ZeroFloats, .{}, cfg).min_window;
+    const got = try writeInWindows(zerde.cbor, ZeroFloats, .{ .h = -0.0, .s = -0.0, .d = -0.0 }, .{}, cfg, min);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa3, 0x61, 'd', 0xf9, 0x00, 0x00, 0x61, 'h', 0xf9, 0x00, 0x00, 0x61, 's', 0xf9, 0x00, 0x00 }, got);
+    const Boxed = struct { raw: zerde.cbor.Raw };
+    const holds = Boxed{ .raw = .{ .bytes = &.{ 0x82, 0x01, 0xf9, 0x80, 0x00 } } };
+    const raw_min = zerde.resumable.Writer(zerde.cbor, Boxed, .{}, cfg).min_window;
+    try std.testing.expectError(error.NegativeZero, writeInWindows(zerde.cbor, Boxed, holds, .{}, cfg, raw_min + 8));
+}

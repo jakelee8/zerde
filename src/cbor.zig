@@ -47,6 +47,10 @@ pub const ReadConfig = struct {
     /// (`error.NonFiniteFloat`). RFC 8949 §3.3 makes them values, so the default reads them; a
     /// profile that forbids them turns this on.
     refuse_non_finite: bool = false,
+    /// Refuse -0.0, in any float width, including in skipped values, keys and a `Raw` item (`error.NegativeZero`). RFC 8949 §4.2.2
+    /// makes it a value distinct from 0.0 and `Mode.strict` takes it, so the default reads it; a profile that keeps no negative zero
+    /// turns this on, and writes with `WriteConfig.normalize_negative_zero`.
+    refuse_negative_zero: bool = false,
     /// Which encodings are accepted; see `Mode`.
     mode: Mode = .lenient,
     /// Do not check that text is UTF-8: for an item that is known to be valid already, such as one
@@ -93,6 +97,11 @@ pub const WriteConfig = struct {
     /// to be valid already, such as a string just read from a source that was checked. A value
     /// written this way may not read back.
     trusted_text: bool = false,
+    /// Write a float zero as +0 (`0xf90000`), -0.0 included, so that equal numbers have one encoding whatever sign a source gave
+    /// them, as a profile that keeps no negative zero requires. RFC 8949 §4.2.2 writes -0.0 as `0xf98000`, so the default keeps it.
+    /// A `Raw` or extras item that holds -0.0 is `error.NegativeZero`, since it is copied as it is (`ValueWriter.writeRaw` and
+    /// `canonicalizeWith` rewrite it instead). It applies with or without `deterministic`.
+    normalize_negative_zero: bool = false,
 };
 
 /// Field order of a write with `cfg`: `encoded_key`, and required, when it is deterministic.
@@ -286,8 +295,14 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         }
 
         pub fn emitFloat(self: *Self, value: anytype) !void {
-            if (deterministic) return writePreferredFloat(self.writer, value);
-            try writeFloat(self.writer, value);
+            const written = if (self.normalizesZero()) unsignedZero(value) else value;
+            if (deterministic) return writePreferredFloat(self.writer, written);
+            try writeFloat(self.writer, written);
+        }
+
+        /// Whether the write puts -0.0 out as +0 (`WriteConfig.normalize_negative_zero`), so an item it copies as it is may not hold one.
+        fn normalizesZero(self: *const Self) bool {
+            return readOption(self.cfg, "normalize_negative_zero", false);
         }
 
         pub fn emitString(self: *Self, value: []const u8) !void {
@@ -330,8 +345,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
 
         /// How many entries an extras map holds, for the head of the map it joins.
         pub fn extrasCount(self: *Self, bytes: []const u8) !usize {
-            _ = self;
-            if (bytes.len != 0) try verifyItem(bytes, deterministic);
+            if (bytes.len != 0) try verifyItem(bytes, deterministic, self.normalizesZero());
             return @intCast((try extrasHead(bytes)).remaining);
         }
 
@@ -375,7 +389,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
 
         /// A streaming writer for a wire type's encode hook; see `Encoder`.
         pub fn encoder(self: *Self) Encoder {
-            return .{ .writer = self.writer, .deterministic = deterministic, .trusted_text = readOption(self.cfg, "trusted_text", false) };
+            return .{ .writer = self.writer, .deterministic = deterministic, .trusted_text = readOption(self.cfg, "trusted_text", false), .normalize_zero = self.normalizesZero() };
         }
 
         pub const raw_format: typed.RawFormat = .cbor;
@@ -384,7 +398,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         /// write must already be deterministic (see `canonicalize`), so the output is what the write
         /// promises whatever mode the item was read in.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
-            try verifyItem(value, deterministic);
+            try verifyItem(value, deterministic, self.normalizesZero());
             if (self.gather) |state| if (value.len >= state.min_len) return state.add(self.writer.end, value);
             try self.writer.writeAll(value);
         }
@@ -392,7 +406,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         /// `emitRaw` in pieces, for a resumable write: the item is checked once, before the first byte.
         pub fn emitRawPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
             if (!state.started) {
-                try verifyItem(value, deterministic);
+                try verifyItem(value, deterministic, self.normalizesZero());
                 state.started = true;
             }
             try typed.copyPart(self.writer, value, &state.at);
@@ -501,6 +515,8 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// `canonicalItem` writes the deterministic encoding (preferred floats; no tags) instead of
         /// the form that compares keys.
         canon_det: bool = false,
+        /// `canonicalItem` writes a float zero as +0.
+        canon_zero: bool = false,
         max_depth: usize = max_nesting,
         max_items: usize = std.math.maxInt(usize),
         max_string_len: usize = std.math.maxInt(usize),
@@ -1146,17 +1162,9 @@ pub fn CborDeserializer(comptime Config: type) type {
             }
         }
 
-        /// Refuses a NaN or an infinity when the config says to: the exponent field is all ones.
+        /// Refuses what the config says to in a float; see `checkFloatHeader`.
         fn checkFloat(self: *Self, header: Header) !void {
-            if (comptime !meta.hasField(Config, "refuse_non_finite")) return;
-            if (!self.cfg.refuse_non_finite or header.major != 7) return;
-            const exponent_all_ones = switch (header.ai) {
-                25 => (header.value >> 10) & 0x1f == 0x1f,
-                26 => (header.value >> 23) & 0xff == 0xff,
-                27 => (header.value >> 52) & 0x7ff == 0x7ff,
-                else => false,
-            };
-            if (exponent_all_ones) return error.NonFiniteFloat;
+            try checkFloatHeader(Config, self.cfg, header);
         }
 
         /// A strict read needs each key of a map to sort after the one before it by its encoded bytes
@@ -1277,7 +1285,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                     25, 26, 27 => if (self.canon_det) {
                         var buffer: [9]u8 = undefined;
                         var fixed = std.Io.Writer.fixed(&buffer);
-                        try writePreferredFloat(&fixed, floatValue(header));
+                        try writePreferredFloat(&fixed, if (self.canon_zero) unsignedZero(floatValue(header)) else floatValue(header));
                         try self.key_bytes.appendSlice(self.allocator, fixed.buffered());
                     } else {
                         try self.key_bytes.append(self.allocator, 0xfb);
@@ -1416,6 +1424,40 @@ pub fn floatValue(header: Header) f64 {
     };
 }
 
+/// Whether a float head is -0.0, in any width.
+pub fn isNegativeZero(header: Header) bool {
+    if (header.major != 7) return false;
+    return switch (header.ai) {
+        25 => header.value == 0x8000,
+        26 => header.value == 0x8000_0000,
+        27 => header.value == 0x8000_0000_0000_0000,
+        else => false,
+    };
+}
+
+/// `value`, or +0 when it is a zero: the float a write that normalizes negative zero puts out.
+fn unsignedZero(value: anytype) @TypeOf(value) {
+    return if (value == 0) 0 else value;
+}
+
+/// What a read with `cfg` refuses in the float whose head is `header`: a NaN or an infinity with `refuse_non_finite`
+/// (the exponent field is all ones) and -0.0 with `refuse_negative_zero`. One check for every reader of CBOR.
+pub fn checkFloatHeader(comptime Config: type, cfg: Config, header: Header) !void {
+    if (header.major != 7) return;
+    if (comptime meta.hasField(Config, "refuse_non_finite")) {
+        const exponent_all_ones = switch (header.ai) {
+            25 => (header.value >> 10) & 0x1f == 0x1f,
+            26 => (header.value >> 23) & 0xff == 0xff,
+            27 => (header.value >> 52) & 0x7ff == 0x7ff,
+            else => false,
+        };
+        if (cfg.refuse_non_finite and exponent_all_ones) return error.NonFiniteFloat;
+    }
+    if (comptime meta.hasField(Config, "refuse_negative_zero")) {
+        if (cfg.refuse_negative_zero and isNegativeZero(header)) return error.NegativeZero;
+    }
+}
+
 fn keyFloatBits(ai: u8, value: u64) u64 {
     const sig_bits: u6 = switch (ai) {
         25 => 10,
@@ -1518,31 +1560,31 @@ fn skipTrusted(input: []const u8, index: *usize, depth: usize) !void {
 /// item a strict read accepts (RFC 8949 §4.2.1 and §4.2.2; no tag), which includes map keys that
 /// ascend strictly, so none repeats. Without it a repeated key is not looked for: that needs an
 /// allocation, which `validate` has.
-fn verifyItem(input: []const u8, deterministic: bool) !void {
-    try verifyAs(input, deterministic, .write);
+fn verifyItem(input: []const u8, deterministic: bool, refuse_zero: bool) !void {
+    try verifyAs(input, deterministic, refuse_zero, .write);
 }
 
 /// `verifyItem` as a strict read checks an item: a repeated key is `error.DuplicateField`, and with `check_text` false (a read
 /// under `trusted_text`) text is not checked as UTF-8. A resumable read of a `Raw` uses it on the item once it is whole.
 pub fn verifyStrict(input: []const u8, check_text: bool) !void {
-    try verifyAs(input, true, if (check_text) .read else .read_trusted);
+    try verifyAs(input, true, false, if (check_text) .read else .read_trusted);
 }
 
 /// Whose rules `checkItem` applies: a write's (a repeated key is `NonDeterministicEncoding`, text is checked) or a strict
 /// read's (a repeated key is `DuplicateField`, text is checked unless `trusted_text`).
 const Check = enum { write, read, read_trusted };
 
-fn verifyAs(input: []const u8, deterministic: bool, check: Check) !void {
+fn verifyAs(input: []const u8, deterministic: bool, refuse_zero: bool, check: Check) !void {
     var index: usize = 0;
     var zero = false;
-    try checkItem(input, &index, 0, deterministic, &zero, check);
+    try checkItem(input, &index, 0, deterministic, refuse_zero, &zero, check);
     if (index != input.len) return error.TrailingCharacters;
 }
 
 /// `zero` is set when the item holds a float zero, which a deterministic check needs for a key: 0.0 and -0.0
 /// are one key (RFC 8949 section 5.6.1), so a map may not have both, and a key that holds one is refused, as a
 /// strict read does (`CborDeserializer.recordKeyItem`).
-fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool, zero: *bool, check: Check) anyerror!void {
+fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool, refuse_zero: bool, zero: *bool, check: Check) anyerror!void {
     var header = try parseHeader(input, index);
     while (header.major == 6) {
         // A tag adds no nesting; a strict reader refuses it.
@@ -1554,6 +1596,7 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
         if (header.major == 7 and !isPreferredFloat(header)) return error.NonDeterministicEncoding;
         if (header.major == 7 and header.ai >= 25 and header.ai <= 27 and floatValue(header) == 0) zero.* = true;
     }
+    if (refuse_zero and isNegativeZero(header)) return error.NegativeZero;
     switch (header.major) {
         0, 1, 7 => {},
         2, 3 => if (header.indefinite) {
@@ -1579,7 +1622,7 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
                         break;
                     }
                     var step: u64 = 0;
-                    while (step < per) : (step += 1) try checkItem(input, index, depth + 1, deterministic, zero, check);
+                    while (step < per) : (step += 1) try checkItem(input, index, depth + 1, deterministic, refuse_zero, zero, check);
                 }
             } else {
                 var order: KeyOrder = .{};
@@ -1587,7 +1630,7 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
                 while (count < header.value) : (count += 1) {
                     const key_start = index.*;
                     var key_zero = false;
-                    try checkItem(input, index, depth + 1, deterministic, &key_zero, check);
+                    try checkItem(input, index, depth + 1, deterministic, refuse_zero, &key_zero, check);
                     zero.* = zero.* or key_zero;
                     if (per == 2) {
                         if (deterministic) {
@@ -1601,7 +1644,7 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
                             order.end = index.*;
                             if (key_zero) try noteZeroKey(&order, key);
                         }
-                        try checkItem(input, index, depth + 1, deterministic, zero, check);
+                        try checkItem(input, index, depth + 1, deterministic, refuse_zero, zero, check);
                     }
                 }
             }
@@ -1626,7 +1669,12 @@ fn checkString(input: []const u8, index: *usize, header: Header, check_text: boo
 
 /// Checks that `bytes` is exactly one well-formed CBOR item, and has no map with a repeated key.
 pub fn validate(allocator: Allocator, bytes: []const u8) !void {
-    var d = CborDeserializer(ReadConfig).initBorrowed(allocator, bytes, .{});
+    try validateItem(allocator, bytes, false);
+}
+
+/// `validate`, refusing -0.0 (`error.NegativeZero`) when `refuse_zero`.
+fn validateItem(allocator: Allocator, bytes: []const u8, refuse_zero: bool) !void {
+    var d = CborDeserializer(ReadConfig).initBorrowed(allocator, bytes, .{ .refuse_negative_zero = refuse_zero });
     defer d.deinit(allocator);
     try d.skipItem(0);
     if (d.index != bytes.len) return error.TrailingCharacters;
@@ -1639,12 +1687,23 @@ pub fn validate(allocator: Allocator, bytes: []const u8) !void {
 /// `error.UnexpectedTag`, as a strict read refuses it, and a repeated key `error.DuplicateField`.
 /// The caller owns the result.
 pub fn canonicalize(allocator: Allocator, bytes: []const u8) ![]u8 {
+    return canonicalizeItem(allocator, bytes, false);
+}
+
+/// `canonicalize` with the write options in `cfg` (a `WriteConfig`): with `normalize_negative_zero` a float zero is written as +0,
+/// -0.0 included (RFC 8949 §4.2.2 keeps it as `0xf98000`), so the form is that of an item written with the option.
+pub fn canonicalizeWith(allocator: Allocator, bytes: []const u8, comptime cfg: anytype) ![]u8 {
+    return canonicalizeItem(allocator, bytes, readOption(cfg, "normalize_negative_zero", false));
+}
+
+fn canonicalizeItem(allocator: Allocator, bytes: []const u8, unsigned_zero: bool) ![]u8 {
     var d = CborDeserializer(ReadConfig).initBorrowed(allocator, bytes, .{});
     defer d.deinit(allocator);
     try d.skipItem(0);
     if (d.index != bytes.len) return error.TrailingCharacters;
     d.index = 0;
     d.canon_det = true;
+    d.canon_zero = unsigned_zero;
     try d.canonicalItem();
     return allocator.dupe(u8, d.key_bytes.items);
 }
@@ -1671,11 +1730,17 @@ const MapEntry = struct { key: u32, value: u32 };
 /// would need its own canonical form kept, which has no bound. A tag is `error.UnexpectedTag` and a repeated key,
 /// including 0.0 and -0.0 (RFC 8949 section 5.6.1), is `error.DuplicateField`.
 pub fn canonicalizeInto(dst: []u8, scratch: []u8, bytes: []const u8) ![]u8 {
+    return canonicalizeIntoWith(dst, scratch, bytes, .{});
+}
+
+/// `canonicalizeInto` with the write options in `cfg` (a `WriteConfig`): with `normalize_negative_zero` a float zero is written as +0,
+/// -0.0 included, and the keys are ordered as written.
+pub fn canonicalizeIntoWith(dst: []u8, scratch: []u8, bytes: []const u8, comptime cfg: anytype) ![]u8 {
     if (bytes.len > std.math.maxInt(u32)) return error.InputTooLarge;
     const skip = std.mem.alignPointerOffset(scratch.ptr, @alignOf(MapEntry)) orelse scratch.len;
     const aligned = scratch[@min(skip, scratch.len)..];
     const entries: []MapEntry = @as([*]MapEntry, @ptrCast(@alignCast(aligned.ptr)))[0 .. aligned.len / @sizeOf(MapEntry)];
-    var writer: CanonicalWriter = .{ .input = bytes, .dst = dst, .entries = entries };
+    var writer: CanonicalWriter = .{ .input = bytes, .dst = dst, .entries = entries, .unsigned_zero = readOption(cfg, "normalize_negative_zero", false) };
     var index: usize = 0;
     try writer.item(&index, 0);
     if (index != bytes.len) return error.TrailingCharacters;
@@ -1689,6 +1754,13 @@ const CanonicalWriter = struct {
     entries: []MapEntry,
     /// Entries of the maps open now, which are `entries[0..top]`.
     top: usize = 0,
+    /// Write a float zero as +0 (`canonicalizeIntoWith`).
+    unsigned_zero: bool = false,
+
+    /// The value of the float whose head is `header`, as this writer puts it out.
+    fn float(self: *const CanonicalWriter, header: Header) f64 {
+        return if (self.unsigned_zero) unsignedZero(floatValue(header)) else floatValue(header);
+    }
 
     fn put(self: *CanonicalWriter, bytes: []const u8) !void {
         if (bytes.len > self.dst.len - self.out) return error.NoSpaceLeft;
@@ -1739,7 +1811,7 @@ const CanonicalWriter = struct {
                 25, 26, 27 => {
                     var buffer: [9]u8 = undefined;
                     var fixed = std.Io.Writer.fixed(&buffer);
-                    try writePreferredFloat(&fixed, floatValue(header));
+                    try writePreferredFloat(&fixed, self.float(header));
                     try self.put(fixed.buffered());
                 },
                 else => try self.putHead(7, header.value),
@@ -1772,9 +1844,9 @@ const CanonicalWriter = struct {
                 },
                 else => {},
             }
-            try checkItem(self.input, index, depth + 1, false, &zero, .write);
+            try checkItem(self.input, index, depth + 1, false, false, &zero, .write);
             const value = index.*;
-            try checkItem(self.input, index, depth + 1, false, &zero, .write);
+            try checkItem(self.input, index, depth + 1, false, false, &zero, .write);
             if (self.top == self.entries.len) return error.OutOfMemory;
             self.entries[self.top] = .{ .key = @intCast(key), .value = @intCast(value) };
             self.top += 1;
@@ -1836,7 +1908,7 @@ const CanonicalWriter = struct {
             7 => switch (header.ai) {
                 25, 26, 27 => {
                     var fixed = std.Io.Writer.fixed(&image.head);
-                    try writePreferredFloat(&fixed, floatValue(header));
+                    try writePreferredFloat(&fixed, self.float(header));
                     image.head_len = fixed.end;
                 },
                 else => image.head_len = writeHead(&image.head, 7, header.value),
@@ -2165,6 +2237,7 @@ pub fn PullReader(comptime Config: type) type {
 pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: anytype) ValueWriter {
     var result = ValueWriter.init(allocator, writer, effectiveDeterministic(cfg), readOption(cfg, "trusted_text", false));
     result.max_container_bytes = readOption(cfg, "max_container_bytes", std.math.maxInt(usize));
+    result.normalize_zero = readOption(cfg, "normalize_negative_zero", false);
     return result;
 }
 
@@ -2187,6 +2260,8 @@ pub const Encoder = struct {
     writer: *std.Io.Writer,
     deterministic: bool,
     trusted_text: bool = false,
+    /// Write a float zero as +0 (`WriteConfig.normalize_negative_zero`).
+    normalize_zero: bool = false,
     frames: [max_nesting]Frame = undefined,
     depth: usize = 0,
     root_done: bool = false,
@@ -2220,7 +2295,8 @@ pub const Encoder = struct {
     }
 
     pub fn writeFloat(self: *Encoder, value: f64) !void {
-        if (self.deterministic) try self.put(writePreferredFloat, .{value}) else try self.put(encodeFloat, .{value});
+        const written = if (self.normalize_zero) unsignedZero(value) else value;
+        if (self.deterministic) try self.put(writePreferredFloat, .{written}) else try self.put(encodeFloat, .{written});
     }
 
     pub fn writeText(self: *Encoder, value: []const u8) !void {
@@ -2234,7 +2310,7 @@ pub const Encoder = struct {
     /// An item that is already CBOR: one well-formed item, and in a deterministic write one that
     /// is deterministic (`error.NonDeterministicEncoding`, `error.UnexpectedTag`).
     pub fn writeRaw(self: *Encoder, bytes: []const u8) !void {
-        try verifyItem(bytes, self.deterministic);
+        try verifyItem(bytes, self.deterministic, self.normalize_zero);
         try self.put(writeBytesOf, .{bytes});
     }
 
@@ -2353,6 +2429,8 @@ pub const ValueWriter = struct {
     out: *std.Io.Writer,
     deterministic: bool,
     trusted_text: bool = false,
+    /// Write a float zero as +0 (`WriteConfig.normalize_negative_zero`).
+    normalize_zero: bool = false,
     max_container_bytes: usize = std.math.maxInt(usize),
     frames: [max_nesting]Frame = undefined,
     depth: usize = 0,
@@ -2420,7 +2498,8 @@ pub const ValueWriter = struct {
     pub fn writeFloat(self: *ValueWriter, value: f64) !void {
         try self.beforeItem();
         try self.room(9);
-        if (self.deterministic) try writePreferredFloat(self.sink(), value) else try encodeFloat(self.sink(), value);
+        const written = if (self.normalize_zero) unsignedZero(value) else value;
+        if (self.deterministic) try writePreferredFloat(self.sink(), written) else try encodeFloat(self.sink(), written);
         try self.afterItem();
     }
 
@@ -2448,11 +2527,11 @@ pub const ValueWriter = struct {
         // The canonical form is never longer than the item, so its length bounds both.
         try self.room(bytes.len);
         if (self.deterministic) {
-            const canonical = try canonicalize(self.allocator, bytes);
+            const canonical = try canonicalizeItem(self.allocator, bytes, self.normalize_zero);
             defer self.allocator.free(canonical);
             try self.sink().writeAll(canonical);
         } else {
-            try validate(self.allocator, bytes);
+            try validateItem(self.allocator, bytes, self.normalize_zero);
             try self.sink().writeAll(bytes);
         }
         try self.afterItem();
