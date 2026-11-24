@@ -890,6 +890,8 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         .optional => typedOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
         .pointer => @compileError("a pointer has no wire layout: " ++ @typeName(T)),
         .@"struct" => blk: {
+            // A sorted map is a list of its entries, bounded by its field's `max_len`.
+            if (comptime typed.isSortedMap(T)) break :blk typedOwned([]const T.Entry, bounds, cfg, limits, depth);
             if (!meta.effectiveDenyUnknownFields(T, cfg)) @compileError("a struct that accepts unknown members has no arena bound; set deny_unknown_fields: " ++ @typeName(T));
             var total: Cost = .{};
             for (reflect.fields(T, cfg)) |field| {

@@ -432,6 +432,11 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             return true;
         }
 
+        /// The key of an entry of a map whose keys are data (`SortedMap`): text, as a field name is.
+        pub fn beginMapKey(self: *Self, key: []const u8) !void {
+            try encodeText(self.writer, key, readOption(self.cfg, "trusted_text", false));
+        }
+
         pub fn beginStructFieldInteger(self: *Self, comptime Parent: type, comptime key: i128, comptime FieldType: type) !bool {
             _ = Parent;
             _ = FieldType;
@@ -734,6 +739,12 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// The next key of a map whose keys are text, which is what a dynamic `Value` and a union
         /// hold. A key of another type is `error.UnexpectedType`; a repeated key is `error.DuplicateField`
         /// when the map ends.
+        /// The entries the map just begun states it has, or null for an indefinite one.
+        pub fn objectLen(self: *Self) ?usize {
+            const frame = self.current();
+            return if (frame.indefinite) null else frame.remaining;
+        }
+
         pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {
             if (try self.beginObjectEntry()) return null;
 

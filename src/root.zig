@@ -42,6 +42,8 @@ pub const wire = @import("wire.zig");
 pub const resumable = @import("resumable.zig");
 /// A CBOR frame as a skeleton and references to the byte strings it leaves out; see `gather.zig`.
 pub const gather = @import("gather.zig");
+/// A map with data keys as a sorted slice of entries; see `sorted.zig`.
+pub const SortedMap = @import("sorted.zig").SortedMap;
 /// Word-at-a-time scans over strings, used by the JSON and CBOR backends.
 pub const bulk = @import("bulk.zig");
 pub const bin = bin_impl;

@@ -4956,6 +4956,175 @@ test "the declared order is checked against the encoded keys, text and integer, 
     try std.testing.expectEqualStrings("b", (comptime zerde.typed.declaredOrderFault(AscendingKeys, renamed, enc).?).field);
 }
 
+// ---- a sorted map, for keys that are data ---------------------------------------------------------------------
+
+const Labels = zerde.SortedMap([]const u8);
+const Limits = zerde.SortedMap(u32);
+const Maps = struct {
+    id: u8,
+    labels: Labels,
+    limits: Limits,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .labels = .{ .max_len = 4 }, .limits = .{ .max_len = 3, .elem = .{ .max = 100 } } } };
+};
+
+fn sampleMaps() Maps {
+    const labels = [_]Labels.Entry{ .{ .key = "a", .value = "x" }, .{ .key = "b", .value = "yy" }, .{ .key = "cc", .value = "" }, .{ .key = "ab", .value = "z" } };
+    const limits = [_]Limits.Entry{ .{ .key = "r", .value = 5 }, .{ .key = "w", .value = 100 } };
+    // The labels array above is not in order (`ab` after `cc`): the caller of a test sorts what it needs.
+    return .{ .id = 1, .labels = .{ .entries = labels[0..3] }, .limits = .{ .entries = &limits } };
+}
+
+test "a sorted map is found by binary search, over every key of a set, and says when it is not sorted" {
+    var storage: [40]Limits.Entry = undefined;
+    var keys: [40][3]u8 = undefined;
+    // Keys of one to three bytes, in encoded-key order: shorter first, then bytewise.
+    var count: usize = 0;
+    for (1..4) |length| {
+        var letter: u8 = 'a';
+        while (letter < 'a' + 13 and count < 40) : (letter += 1) {
+            keys[count] = .{ letter, 'z', letter + 1 };
+            storage[count] = .{ .key = keys[count][0..length], .value = @intCast(count) };
+            count += 1;
+        }
+    }
+    const map: Limits = .{ .entries = storage[0..count] };
+    try std.testing.expect(map.isSorted());
+    for (storage[0..count], 0..) |entry, at| {
+        try std.testing.expectEqual(@as(?usize, at), map.index(entry.key));
+        try std.testing.expectEqual(@as(?u32, @intCast(at)), map.get(entry.key));
+        try std.testing.expectEqual(@as(u32, @intCast(at)), map.getPtr(entry.key).?.*);
+    }
+    // Keys that are not there, before, between and after.
+    for ([_][]const u8{ "", "0", "aa", "b!", "zzzz", "q", "az!" }) |absent| try std.testing.expectEqual(@as(?u32, null), map.get(absent));
+    // Edges: empty, one, two.
+    const none: Limits = .{ .entries = &.{} };
+    try std.testing.expectEqual(@as(?u32, null), none.get("a"));
+    try std.testing.expect(none.isSorted());
+    try std.testing.expectEqual(@as(?u32, 1), (Limits{ .entries = &.{.{ .key = "a", .value = 1 }} }).get("a"));
+    // Not sorted, and a repeat.
+    try std.testing.expect(!(Limits{ .entries = &.{ .{ .key = "b", .value = 1 }, .{ .key = "a", .value = 1 } } }).isSorted());
+    try std.testing.expect(!(Limits{ .entries = &.{ .{ .key = "a", .value = 1 }, .{ .key = "a", .value = 1 } } }).isSorted());
+    // Length first: `b` before `aa`.
+    try std.testing.expect((Limits{ .entries = &.{ .{ .key = "b", .value = 1 }, .{ .key = "aa", .value = 1 } } }).isSorted());
+}
+
+test "a sorted map is written in key order, in both formats, and read back; what is not in order is refused both ways" {
+    const value = sampleMaps();
+    var cbor_out = try writeCbor(value, .{}, .{ .deterministic = true });
+    defer cbor_out.deinit();
+    // {"id": 1, "labels": {"a": "x", "b": "yy", "cc": ""}, "limits": {"r": 5, "w": 100}} in deterministic order.
+    try std.testing.expectEqualSlices(u8, &.{
+        0xa3, 0x62, 'i',  'd',  0x01,
+        0x66, 'l',  'a',  'b',  'e',
+        'l',  's',  0xa3, 0x61, 'a',
+        0x61, 'x',  0x61, 'b',  0x62,
+        'y',  'y',  0x62, 'c',  'c',
+        0x60, 0x66, 'l',  'i',  'm',
+        'i',  't',  's',  0xa2, 0x61,
+        'r',  0x05, 0x61, 'w',  0x18,
+        0x64,
+    }, cbor_out.written());
+    const back = try zerde.cbor.parseSliceWith(Maps, allocator, cbor_out.written(), .{}, strict);
+    defer zerde.free(allocator, back);
+    try std.testing.expectEqualStrings("yy", back.labels.get("b").?);
+    try std.testing.expectEqual(@as(?u32, 100), back.limits.get("w"));
+    try std.testing.expect(back.labels.isSorted());
+    var json_out = try writeJson(value, .{}, .{});
+    defer json_out.deinit();
+    try std.testing.expectEqualStrings("{\"id\":1,\"labels\":{\"a\":\"x\",\"b\":\"yy\",\"cc\":\"\"},\"limits\":{\"r\":5,\"w\":100}}", json_out.written());
+    const from_json = try zerde.json.parseSlice(Maps, allocator, json_out.written());
+    defer zerde.free(allocator, from_json);
+    try std.testing.expectEqualStrings("x", from_json.labels.get("a").?);
+    // The default CBOR write, with indefinite maps, reads back too.
+    var plain = try writeCbor(value, .{}, .{});
+    defer plain.deinit();
+    const again = try zerde.cbor.parseSlice(Maps, allocator, plain.written());
+    defer zerde.free(allocator, again);
+    try std.testing.expectEqual(@as(usize, 3), again.labels.entries.len);
+
+    // A write refuses entries out of order, and a repeat, in every format, with the errors of a strict read.
+    const unordered: Limits = .{ .entries = &.{ .{ .key = "b", .value = 1 }, .{ .key = "a", .value = 2 } } };
+    const repeated: Limits = .{ .entries = &.{ .{ .key = "a", .value = 1 }, .{ .key = "a", .value = 2 } } };
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.serializeWith(zerde.cbor, &sink.writer, unordered, .{}, .{ .deterministic = true }));
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.serializeWith(zerde.json, &sink.writer, unordered, .{}, .{}));
+    try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.cbor, &sink.writer, repeated, .{}, .{}));
+    try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.json, &sink.writer, repeated, .{}, .{}));
+}
+
+test "a sorted map read refuses an unsorted or repeated key in every mode, and a JSON key with an escape is the key it spells" {
+    const E = error.NonDeterministicEncoding;
+    const D = error.DuplicateField;
+    // CBOR, lenient and strict: {"limits": ...} is the field, with the keys of the map in the order given.
+    const prefix = [_]u8{ 0xa3, 0x62, 'i', 'd', 0x01, 0x66, 'l', 'a', 'b', 'e', 'l', 's', 0xa0, 0x66, 'l', 'i', 'm', 'i', 't', 's' };
+    const unsorted = prefix ++ [_]u8{ 0xa2, 0x61, 'w', 0x01, 0x61, 'r', 0x02 };
+    const repeat = prefix ++ [_]u8{ 0xa2, 0x61, 'r', 0x01, 0x61, 'r', 0x02 };
+    const long_first = prefix ++ [_]u8{ 0xa2, 0x62, 'a', 'a', 0x01, 0x61, 'b', 0x02 };
+    inline for (.{ false, true }) |is_strict| {
+        const read_cfg = if (is_strict) strict else .{ .mode = zerde.cbor.Mode.lenient };
+        try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &unsorted, .{}, read_cfg));
+        try std.testing.expectError(D, zerde.cbor.parseSliceWith(Maps, allocator, &repeat, .{}, read_cfg));
+        try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &long_first, .{}, read_cfg));
+    }
+    // JSON has no mode and keeps no order: a sorted map is where an order is demanded.
+    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"b\":\"x\",\"a\":\"y\"},\"limits\":{}}"));
+    try std.testing.expectError(D, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"a\":\"y\"},\"limits\":{}}"));
+    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"aa\":\"x\",\"b\":\"y\"},\"limits\":{}}"));
+    // `\u0061` is `a`: a repeat of it, and an order that only holds for the spelling.
+    try std.testing.expectError(D, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0061\":\"y\"},\"limits\":{}}"));
+    const spelled = try zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"\\u0061\":\"x\",\"b\\n\":\"y\"},\"limits\":{}}");
+    defer zerde.free(allocator, spelled);
+    try std.testing.expectEqualStrings("y", spelled.labels.get("b\n").?);
+    // The same with the values failing after keys were read: nothing is left allocated (the testing allocator checks).
+    try std.testing.expectError(error.ValueOutOfRange, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\"},\"limits\":{\"\\u0061\":5,\"b\":101}}"));
+    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0063\\u0063\":\"y\",\"\\u0062\":\"z\"},\"limits\":{}}"));
+}
+
+test "a sorted map's bounds are checked before it is allocated, and its values have their own" {
+    // Five labels where four are the most: refused from the map's head, with nothing allocated.
+    var counting = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const five = [_]u8{ 0xa3, 0x62, 'i', 'd', 0x01, 0x66, 'l', 'a', 'b', 'e', 'l', 's', 0xa5, 0x61, 'a', 0x60, 0x61, 'b', 0x60, 0x61, 'c', 0x60, 0x61, 'd', 0x60, 0x61, 'e', 0x60, 0x66, 'l', 'i', 'm', 'i', 't', 's', 0xa0 };
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSliceAliasedWith(Maps, counting.allocator(), &five, .{}, strict));
+    // An indefinite map is bounded as it is read.
+    const indefinite = [_]u8{ 0xbf, 0x62, 'i', 'd', 0x01, 0x66, 'l', 'a', 'b', 'e', 'l', 's', 0xbf, 0x61, 'a', 0x60, 0x61, 'b', 0x60, 0x61, 'c', 0x60, 0x61, 'd', 0x60, 0x61, 'e', 0x60, 0xff, 0x66, 'l', 'i', 'm', 'i', 't', 's', 0xa0, 0xff };
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Maps, allocator, &indefinite));
+    // The limits map allows three entries of at most 100.
+    try std.testing.expectError(error.ValueOutOfRange, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{},\"limits\":{\"a\":101}}"));
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{},\"limits\":{\"a\":1,\"b\":2,\"c\":3,\"d\":4}}"));
+    const ok = try zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{},\"limits\":{\"a\":1,\"b\":2,\"c\":100}}");
+    defer zerde.free(allocator, ok);
+    try std.testing.expectEqual(@as(?u32, 100), ok.limits.get("c"));
+}
+
+test "a sorted map decodes into the wire layout with its keys in the input, and its arena bound holds" {
+    var out = try writeCbor(sampleMaps(), .{}, .{ .deterministic = true });
+    defer out.deinit();
+    var region: Region = .{};
+    const len = out.written().len;
+    @memcpy(region.bytes[0..len], out.written());
+    const cfg = .{ .mode = zerde.cbor.Mode.strict, .max_items = 64, .max_string_len = 64, .max_input_bytes = 4096 };
+    const bound = comptime wire.maxArenaSize(zerde.cbor, Maps, .{}, cfg);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[len..][0..bound]);
+    const w = try wire.decode(zerde.cbor, Maps, &arena, region.base(), region.bytes[0..len], .{}, cfg);
+    const mem = region.memory();
+    const entries = try mem.listOf(wire.Wire(Labels.Entry), w.labels.entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    // A key is a span of the input and a value is its own layout: nothing was copied but the array of entries.
+    const key = try mem.bytesOf(entries[1].key);
+    try std.testing.expectEqualStrings("b", key);
+    try std.testing.expect(@intFromPtr(key.ptr) >= region.base() and @intFromPtr(key.ptr) < region.base() + len);
+    try std.testing.expectEqualStrings("yy", try mem.bytesOf(entries[1].value));
+    try std.testing.expect(arena.end_index <= bound);
+    // And back to the bytes it came from.
+    var again: std.Io.Writer.Allocating = .init(allocator);
+    defer again.deinit();
+    var scratch: [1024]u8 = undefined;
+    var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
+    try wire.encode(zerde.cbor, Maps, &scratch_arena, mem, w, &again.writer, .{}, .{ .deterministic = true });
+    try std.testing.expectEqualSlices(u8, out.written(), again.written());
+}
+
 test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
     var region: Region = .{};
     var other: [64]u8 align(16) = undefined;

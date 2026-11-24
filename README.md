@@ -498,6 +498,16 @@ or head and the longest field name escaped: `error.WindowTooSmall` below it). No
 encode hooks and `bin`'s sequence path. The value must be the same in every call. `zig build bench-wire` measures
 the windows against the whole write on real text (`bench/WIRE.md`).
 
+### Sorted maps
+
+`zerde.SortedMap(V)` is a map whose keys are data (labels, history, limits): a slice of `Entry { key, value }` sorted by
+encoded text key (shorter first, then bytewise), found with `get`, `getPtr` and `index` by binary search, with no hash table
+and no copy of a key (an aliased read keeps the input's bytes; in a decode into `wire.Wire` it is `{ entries: Span }` over
+`{ key: Span, value: Wire(V) }`). CBOR and JSON read and write it as a map of text keys. A read refuses a key that does
+not sort after the one before it in every mode (`error.NonDeterministicEncoding`, or `error.DuplicateField` when equal),
+a write refuses entries that are not in order (the same errors), a field's `max_len` bounds the entries (checked from the map's
+head when its length is stated) and `.elem` bounds each value. A resumable write of one is a compile error.
+
 ### Gather encode
 
 `zerde.gather.encode(T, skeleton, refs, base, min_len, value, serde_cfg, cbor_cfg)` writes a CBOR frame without copying

@@ -9,6 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const diagnostic_mod = @import("diagnostic.zig");
 const meta = @import("meta.zig");
+const sorted = @import("sorted.zig");
 
 pub const Error = Allocator.Error || error{
     UnsupportedType,
@@ -56,6 +57,9 @@ pub fn RawOf(comptime format: RawFormat) type {
         pub const zerde_raw_format = format;
     };
 }
+
+/// Whether `T` is a `SortedMap`; see `sorted.zig`.
+pub const isSortedMap = sorted.isSortedMap;
 
 /// Whether `T` is a `Raw` of some format.
 pub fn isRaw(comptime T: type) bool {
@@ -488,6 +492,30 @@ fn serializeValue(
                     @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
                 }
                 try emitText(serializer, rc, .raw, value.bytes);
+                return;
+            }
+            if (comptime isSortedMap(T)) {
+                if (comptime resumable) @compileError("a resumable write cannot write a sorted map: " ++ @typeName(T));
+                if (!@hasDecl(SerializerType, "beginMapKey")) @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a sorted map: " ++ @typeName(T));
+                // The entries are written as they are, in order, and refused if they are not: what goes out is in key order.
+                if (@hasDecl(SerializerType, "beginStructSized")) {
+                    try serializer.beginStructSized(T, value.entries.len);
+                } else {
+                    try serializer.beginStruct(T);
+                }
+                var previous: ?[]const u8 = null;
+                for (value.entries) |entry| {
+                    if (previous) |before| switch (sorted.order(before, entry.key)) {
+                        .lt => {},
+                        .eq => return error.DuplicateField,
+                        .gt => return error.NonDeterministicEncoding,
+                    };
+                    previous = entry.key;
+                    try serializer.beginMapKey(entry.key);
+                    try serializeValue(serializer, entry.value, cfg, Format, order_policy, rc);
+                    try serializer.endStructField(T, "entry", @TypeOf(entry.value));
+                }
+                try serializer.endStruct(T);
                 return;
             }
             if (info.is_tuple) @compileError("tuple structs are not supported: " ++ @typeName(T));
@@ -1422,6 +1450,59 @@ fn deserializeStruct(
     return result;
 }
 
+/// A `SortedMap`: the entries of a map of text keys, each key after the one before it, which is checked as it is read, so a
+/// map that is unsorted or repeats a key is refused in every mode. A key is the input's own bytes in an aliased read and a copy
+/// otherwise; the entries are one exact allocation when the format states their number. `bounds.max_len` is checked
+/// before that allocation, and `bounds.elem` bounds each value.
+fn deserializeSortedMap(
+    s: anytype,
+    comptime T: type,
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track_diagnostics: bool,
+    comptime bounds: meta.Bounds,
+) anyerror!@TypeOf(s).Of(T) {
+    const DeserializerType = @TypeOf(deserializer.*);
+    const Entry = T.Entry;
+    const Out = @TypeOf(s).Of;
+    const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
+    try deserializer.beginObject();
+    var items: std.ArrayList(Out(Entry)) = .empty;
+    errdefer {
+        for (items.items) |item| s.free(Entry, allocator, item, borrowed_strings);
+        items.deinit(allocator);
+    }
+    if (comptime @hasDecl(DeserializerType, "objectLen")) {
+        if (deserializer.objectLen()) |count| {
+            // Bounds are checked before the allocation they exist to limit.
+            try checkLength(bounds, count);
+            try items.ensureTotalCapacityPrecise(allocator, count);
+        }
+    }
+    var previous: ?[]const u8 = null;
+    while (try deserializer.nextObjectField(allocator)) |token| {
+        errdefer token.deinit(allocator);
+        const key: []const u8 = if (borrowed_strings or token.allocated) token.bytes else try allocator.dupe(u8, token.bytes);
+        // A key copied here is freed here on a failure; an escaped one is the token's, which is freed above.
+        var owned = !borrowed_strings and !token.allocated;
+        errdefer if (owned) allocator.free(@constCast(key));
+        if (previous) |before| switch (sorted.order(before, key)) {
+            .lt => {},
+            .eq => return error.DuplicateField,
+            .gt => return error.NonDeterministicEncoding,
+        };
+        previous = key;
+        const value = try deserializeElement(s, T.Value, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len, bounds);
+        errdefer s.free(T.Value, allocator, value, borrowed_strings);
+        try items.append(allocator, .{ .key = try s.text([]const u8, key), .value = value });
+        owned = false;
+    }
+    try checkLength(bounds, items.items.len);
+    return .{ .entries = try s.list([]const Entry, try items.toOwnedSlice(allocator)) };
+}
+
 /// A struct whose fields are declared in key order, read from a deserializer that guarantees its keys ascend (`keysAscend`):
 /// one walk over the fields and the input together. A key names field `f`, so every field before it that was not named is
 /// absent, and is resolved at once; there are no seen flags and no pass at the end for the fields after the last key.
@@ -1675,6 +1756,7 @@ fn deserializeBounded(
             if (comptime bounds.validate != null and !isRaw(T)) @compileError("validate applies to a Raw field: " ++ @typeName(T));
             if (T == ByteString) return try s.bytesOf(T, try readByteSlice(allocator, deserializer, bounds));
             if (comptime isRaw(T)) return try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, bounds));
+            if (comptime isSortedMap(T)) return try deserializeSortedMap(s, T, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds);
             @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T));
         },
         else => @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T)),

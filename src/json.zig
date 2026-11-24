@@ -274,6 +274,19 @@ pub fn JsonSerializer(comptime Config: type) type {
             return true;
         }
 
+        /// The key of an entry of a map whose keys are data (`SortedMap`): written as a field name is.
+        pub fn beginMapKey(self: *Self, key: []const u8) !void {
+            const container = self.current();
+            if (container.kind != .object) return error.InvalidJsonState;
+            if (!container.first) {
+                try self.writer.writeByte(',');
+            } else {
+                container.first = false;
+            }
+            try writeEscapedString(self.writer, key);
+            try self.writer.writeByte(':');
+        }
+
         pub fn endStructField(self: *Self, comptime Parent: type, comptime name: []const u8, comptime FieldType: type) !void {
             _ = self;
             _ = Parent;

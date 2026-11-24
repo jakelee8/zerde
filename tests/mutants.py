@@ -542,6 +542,13 @@ MUTANTS = [
     ("typed.zig", "if (!std.mem.lessThan(u8, before, key)) return .{ .field = name, .previous = previous_name };", "if (std.mem.lessThan(u8, key, before)) return .{ .field = name, .previous = previous_name };"),
     ("cbor.zig", "        pub fn keysAscend(self: *Self) bool {\n            return self.strict;", "        pub fn keysAscend(self: *Self) bool {\n            return true;"),
     ("meta.zig", "    if (comptime serdeHasField(T, \"declared_in_order\")) return @field(T.serde, \"declared_in_order\");\n", ""),
+    ("typed.zig", "            try checkLength(bounds, count);\n            try items.ensureTotalCapacityPrecise(allocator, count);", "            try items.ensureTotalCapacityPrecise(allocator, count);"),
+    ("typed.zig", "            .eq => return error.DuplicateField,\n            .gt => return error.NonDeterministicEncoding,\n        };\n        previous = key;", "            .eq => {},\n            .gt => {},\n        };\n        previous = key;"),
+    ("typed.zig", "        var owned = !borrowed_strings and !token.allocated;", "        var owned = false;"),
+    ("typed.zig", "                    if (previous) |before| switch (sorted.order(before, entry.key)) {\n                        .lt => {},\n                        .eq => return error.DuplicateField,\n                        .gt => return error.NonDeterministicEncoding,\n                    };", "                    _ = &previous;"),
+    ("sorted.zig", "    if (a.len != b.len) return std.math.order(a.len, b.len);\n", ""),
+    ("sorted.zig", "                    .lt => low = middle + 1,\n                    .gt => high = middle,", "                    .lt => low = middle + 1,\n                    .gt => high = middle + 1,"),
+    ("cbor.zig", "            return if (frame.indefinite) null else frame.remaining;", "            return null;"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

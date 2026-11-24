@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- added: `zerde.SortedMap(V)`: a map with text data keys as a slice of entries sorted by encoded key, binary-search `get`/`getPtr`/`index`, a typed read that refuses an unsorted or repeated key in every mode, a write that refuses the same, `max_len` and `.elem` bounds, the wire layout `{ entries: Span }`, and an arena bound; `beginMapKey` on the JSON and CBOR serializers, `objectLen` on the CBOR deserializer
 - added: `serde.declared_in_order`: the fields are declared in the CBOR encoded-key order, which is a compile error naming the first field out of order otherwise (`typed.declaredOrderFault`, `typed.assertDeclaredOrder`), and a strict read of the type is a merge walk over fields and keys (`typed.mergeStruct`: no seen flags, no fill pass; `fillMissingFields` shares `fillField` with it).
 - added: JSON `ReadConfig.integral_numbers` (default off): an integer field takes `1.0`, `1e2`, `12300e-2` when the number's exact decimal value, decided on its digits and never on a binary64 value, is an integer in the field's range; a fraction left is `error.UnexpectedType`, out of range `error.IntegerOverflow`; the default still refuses a float for an integer
 - added: `zerde.gather` (`encode`, `assemble`, `Ref`): a CBOR frame as a skeleton and `(skeleton_offset, offset, len)` references to the byte strings and `Raw` items of at least `min_len` bytes it leaves out, into caller regions with no allocator; `CborSerializer` has an optional `gather` state and `emitBytesInline` for a `[N]u8`; `typed.serializeInto` takes a serializer the caller made
