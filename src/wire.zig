@@ -69,6 +69,7 @@ pub fn Opt(comptime V: type) type {
 
 /// The fixed-layout type of schema type `T`.
 pub fn Wire(comptime T: type) type {
+    @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
         .bool => bool,
         .int => blk: {
@@ -223,6 +224,7 @@ fn isScalarList(comptime Elem: type) bool {
 /// Copies a typed value into its wire layout. Arrays are written into `allocator`, contiguously,
 /// and spans point at them; text and byte strings are spans of the memory `value` already has.
 pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Allocator.Error || Error)!Wire(T) {
+    @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
         .bool, .int, .float, .byte_array => value,
         .text => try spanOf(base, value),
@@ -284,6 +286,7 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
 /// name. Every span is checked against `memory` (`error.OffsetOutOfRange`), and an enum value, a
 /// union tag or a presence byte that means nothing is `error.InvalidTag`.
 pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error)!T {
+    @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
         .bool, .int, .float, .byte_array => wire,
         .text => try memory.bytesOf(wire),

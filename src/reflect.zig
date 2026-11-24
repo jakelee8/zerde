@@ -50,6 +50,7 @@ pub const Kind = enum {
 
 /// The kind of `T`.
 pub fn kindOf(comptime T: type) Kind {
+    @setEvalBranchQuota(1_000_000);
     if (comptime hasAnyHook(T)) return .hook;
     return switch (@typeInfo(T)) {
         .bool => .bool,

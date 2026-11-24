@@ -4088,3 +4088,43 @@ test "integer keys, a Raw and bounds in a wire type, and their keys in the descr
     try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, Frame, &arena, region.base(), &.{ 0xa3, 0x00, 0x01, 0x01, 0xa0, 0x02, 0x64, 'a', 'b', 'c', 'd' }, .{}, cfg));
     try std.testing.expect(wire.maxArenaSize(Frame, .{}, cfg) > 0);
 }
+
+// ---- a wide schema needs no help with the comptime branch quota --------------------------------------------------
+
+const QuotaKey = struct { name: []const u8, ver: u32, tags: []const u16 };
+const QuotaSpan = union(enum) { point: zerde.ByteString, range: struct { start: zerde.ByteString, end: ?zerde.ByteString } };
+const QuotaGuard = struct { span: QuotaSpan, shard: [16]u8, generation: u64, key: QuotaKey };
+const QuotaRecord = struct { key: QuotaKey, payload: zerde.ByteString, meta: []const u8, guards: []const QuotaGuard, rev: ?u64 };
+const QuotaEffect = union(enum) { put: QuotaRecord, delete: QuotaKey, touch: struct { key: QuotaKey, at: u64 } };
+const QuotaResponse = union(enum) {
+    v0: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v1: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v2: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v3: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v4: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v5: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v6: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v7: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v8: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v9: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v10: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    v11: struct { a: QuotaRecord, b: QuotaRecord, c: []const QuotaEffect, d: ?QuotaGuard, e: QuotaSpan },
+    failed: struct { code: u16, message: []const u8, at: QuotaKey },
+};
+
+test "a wire type of a wide schema needs no comptime branch quota from the caller" {
+    const W = wire.Wire(QuotaResponse);
+    try std.testing.expect(@sizeOf(W) > 0);
+    // The walk of both directions compiles and runs on it.
+    const input = "{\"failed\":{\"code\":9,\"message\":\"no\",\"at\":{\"name\":\"k\",\"ver\":1,\"tags\":[1,2]}}}";
+    var region: Region = .{};
+    @memcpy(region.bytes[0..input.len], input);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[input.len..]);
+    const w = try wire.decode(zerde.json, QuotaResponse, &arena, region.base(), region.bytes[0..input.len], .{}, .{});
+    try std.testing.expectEqual(@as(u8, 12), w.tag);
+    try std.testing.expectEqual(@as(u16, 9), w.payload.failed.code);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try wire.encode(zerde.json, QuotaResponse, &arena, region.memory(), w, &out.writer, .{}, .{});
+    try std.testing.expectEqualStrings(input, out.written());
+}
