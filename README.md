@@ -504,6 +504,51 @@ plus the longest field name escaped and 7: `error.WindowTooSmall` below it). Not
 encode hooks and `bin`'s sequence path. The value must be the same in every call. `zig build bench-wire` measures
 the windows against the whole write on real text (`bench/WIRE.md`).
 
+`zerde.resumable.Render(json_cfg)` renders stored CBOR as JSON in windows: `fill(stored, window)` writes the bytes that reading the item
+with `cbor.pullReader` (strict) into `json.valueWriter` gives, with nothing buffered or sorted (a deterministic item's keys are stored in the
+order the value writer sorts them into) and a long string or byte string going through the window a piece at a time. The first window decides
+everything that can fail for the whole item, so no window of an item that cannot be rendered is written: the item must be strict CBOR
+(`cbor.verifyStrict`), every map key text (`error.UnexpectedType`), every float finite (`error.NonFiniteFloat`) and, with bytes written as JSON
+strings (the default), every byte string UTF-8 (`error.InvalidUtf8`). Its state is a word or two for each open container, about 3.4 KB, and
+a window needs `Render.min_window` (64) bytes. `zig build bench-wire` measures it against the whole render.
+
+### Resumable reads
+
+`zerde.resumable.Decoder(T, serde_cfg, cbor_cfg).init(.{}, allocator)` reads a `T` from strict CBOR that arrives in pieces, as a
+request body does. `feed(chunk)` takes a whole chunk and says whether the value is complete (`true`) or more is due (`false`);
+`finish()` gives the value, or `error.UnexpectedEndOfInput` if the input ended first. The chunks may be cut anywhere, a head
+and a string included, and a one-byte chunk is as good as a large one: the value, or the error, is the whole-input strict read's
+(`mode = .strict`, which `cbor_cfg` must say), for every way the input is cut. Bytes after the value are `error.TrailingCharacters`,
+and an error is the same for every later call. `zerde.chunk.Reader(Config)` is the reader under it: it keeps no input, only a head
+cut by the end of a chunk (8 bytes), the limits and three counters.
+
+What it keeps is bounded by the config: the typed walk is the one of `parseSlice` (every rule of the schema, bound, optional policy
+and key is applied by the same functions) written into a destination (`typed.deserializeValue` takes a `*Of(T)`), so what a
+container has read so far is in the value and a frame of the cursor keeps where it is, a few words per open container, optional
+or pointer. The cursor is sized at compile time from `max_depth` and from the type (`resumable.zig`), and the whole stream is
+bounded by `max_input_bytes` and `max_items` however it is cut. Each call goes down the same path of containers again and each
+level goes on from where it was, as in the resumable write.
+
+The differences from a whole read, each a deliberate one:
+
+- **Every string, byte string and `Raw` is copied**, once, into an allocation of exactly its length (a `Raw` grows as it arrives, within
+  its bound, and is cut to its length), since the chunk is gone when the read goes on. A length is checked against `max_len`,
+  `max_string_len` and what the stream may still hold before anything is allocated for it. A `Raw` is bounded as a string is: by its
+  `max_len` and by `max_string_len`. Nothing is freed on an error, so the allocator must be an arena or a fixed buffer.
+- **A struct is read as a merge over its fields in the order of their encoded keys**, with no flag for a field, whatever order it is
+  declared in: a key that does not rise is `error.DuplicateField` or `error.NonDeterministicEncoding`, and a required field with no key is
+  `error.MissingField`, said after the last key. A struct must `deny_unknown_fields` and have no extras (a key no field declares is
+  `error.UnknownField`); a struct key that is neither text nor an integer is refused where it is met, without being read to its end,
+  which is the one case where the whole read may report a malformed key before it reports the unknown one.
+- A decode hook is a compile error; `max_depth` above 128 is one.
+
+`wire.Resumable(T, serde_cfg, cbor_cfg)` is the same into `wire.Wire(T)` in a caller region: `init(&self, output, base)` sets it up in
+place (it points into itself), `feed` and `finish` as above, `finish` giving the value and the bytes of `output` it used.
+`wire.resumableRegionSizes(T, serde_cfg, cbor_cfg)` (and `maxResumableArenaSize`) is its bound at compile time, as `regionSizes` is
+for `decodeInto`, with the strings and `Raw` items charged, since they are copied (a whole-input strict read charges none): a
+region of exactly that size holds any input the config allows, and `scratch` is empty. Every string needs a bound (`max_len` or
+`max_string_len`), and a `SortedMap`'s keys need `max_string_len`.
+
 ### Sorted maps
 
 `zerde.SortedMap(V)` is a map whose keys are data (labels, history, limits): a slice of `Entry { key, value }` sorted by
@@ -512,7 +557,9 @@ and no copy of a key (an aliased read keeps the input's bytes; in a decode into 
 `{ key: Span, value: Wire(V) }`). CBOR and JSON read and write it as a map of text keys. A read refuses a key that does
 not sort after the one before it in every mode (`error.NonDeterministicEncoding`, or `error.DuplicateField` when equal),
 a write refuses entries that are not in order (the same errors), a field's `max_len` bounds the entries (checked from the map's
-head when its length is stated, and at each entry otherwise) and `.elem` bounds each value. A resumable write of one is a compile error.
+head when its length is stated, and at each entry otherwise) and `.elem` bounds each value. A resumable write of one goes entry by entry
+(a key longer than the window goes through it a piece at a time, and a key follows `trusted_text` as any text does), refusing an entry out of
+order when it reaches it.
 
 ### Gather encode
 
@@ -575,6 +622,7 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   (the key records of a lenient CBOR read of a `Raw`; nothing for a strict CBOR read or for JSON), which together are
   `maxArenaSize` and are each an upper bound of their own. The scratch is free again when the call returns, so one
   region serves every decode and the output region stays as small as the value. A region too small is `error.OutOfMemory`.
+  A resumable decode into a region (`wire.Resumable`, see Resumable reads) has its own `wire.resumableRegionSizes`.
 - `wire.encode(Format, T, arena, memory, wire, writer, serde_cfg, format_cfg)` writes a wire value as the typed value would be
   written (same order, keys, optional policy, determinism). It rebuilds the typed value first, in `arena` (put back after), because
   the writers stream and keep no memory of their own. A wire value that came from outside is not trusted: `memory` is a

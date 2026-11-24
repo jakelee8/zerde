@@ -79,6 +79,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
     try measure(io, out, allocator, zerde.json, "json escaped", true, commit, .{ .bytes = zerde.json.BytesEncoding.base64 }, read_json);
     try measureWindows(io, out, allocator, zerde.cbor, "cbor", commit, .{ .deterministic = true });
     try measureWindows(io, out, allocator, zerde.json, "json", commit, .{ .bytes = zerde.json.BytesEncoding.base64 });
+    try measureStreams(io, out, allocator, commit);
     try out.flush();
 }
 
@@ -133,6 +134,105 @@ fn measureWindows(
             @sizeOf(zerde.resumable.Writer(Format, Commit, .{}, write_cfg)),
             @as(f64, @floatFromInt(elapsed)) / iterations,
             @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(whole_ns)),
+        });
+    }
+}
+
+/// The decode of the deterministic CBOR of the commit whole (`wire.decode`, spans into the input) against the same in chunks of 4, 16 and
+/// 64 KiB (`wire.Resumable`, every string copied into the region), and the render of it as JSON whole (the strict pull reader into the value
+/// writer) against `zerde.resumable.Render` in windows of the same sizes. Each says what its memory is and what it costs against the whole.
+fn measureStreams(io: std.Io, out: *std.Io.Writer, allocator: std.mem.Allocator, commit: Commit) !void {
+    var encoded: std.Io.Writer.Allocating = .init(allocator);
+    defer encoded.deinit();
+    try zerde.serializeWith(zerde.cbor, &encoded.writer, commit, .{}, .{ .deterministic = true });
+    const stored = encoded.written();
+
+    const whole_bound = comptime wire.maxArenaSize(zerde.cbor, Commit, .{}, read_cbor);
+    const block = try allocator.alignedAlloc(u8, .@"16", stored.len + whole_bound);
+    defer allocator.free(block);
+    @memcpy(block[0..stored.len], stored);
+    var arena = std.heap.FixedBufferAllocator.init(block[stored.len..]);
+    var start = std.Io.Clock.Timestamp.now(io, .awake);
+    for (0..iterations) |_| {
+        arena.reset();
+        _ = try wire.decode(zerde.cbor, Commit, &arena, @intFromPtr(block.ptr), block[0..stored.len], .{}, read_cbor);
+    }
+    const decode_whole: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+    try out.print("  cbor  decode whole   input {d:>8} B in memory, arena {d:>8} B                           {d:>9.0} ns\n", .{ stored.len, arena.end_index, @as(f64, @floatFromInt(decode_whole)) / iterations });
+
+    const sizes = comptime wire.resumableRegionSizes(Commit, .{}, read_cbor);
+    const region = try allocator.alignedAlloc(u8, .@"16", sizes.output);
+    defer allocator.free(region);
+    inline for (.{ 4096, 16384, 65536 }) |chunk_len| {
+        var used: usize = 0;
+        var chunks: usize = 0;
+        start = std.Io.Clock.Timestamp.now(io, .awake);
+        for (0..iterations) |_| {
+            var decoder: wire.Resumable(Commit, .{}, read_cbor) = undefined;
+            decoder.init(region, @intFromPtr(region.ptr));
+            var at: usize = 0;
+            chunks = 0;
+            while (at < stored.len) {
+                const end = @min(at + chunk_len, stored.len);
+                _ = try decoder.feed(stored[at..end]);
+                at = end;
+                chunks += 1;
+            }
+            used = (try decoder.finish()).used;
+        }
+        const elapsed: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+        try out.print("  cbor  decode chunks {d:>6} B  {d:>4} chunks, region {d:>8} B (bound {d:>8} B), state {d} B  {d:>9.0} ns ({d:.2}x)\n", .{
+            chunk_len,
+            chunks,
+            used,
+            sizes.output,
+            @sizeOf(wire.Resumable(Commit, .{}, read_cbor)),
+            @as(f64, @floatFromInt(elapsed)) / iterations,
+            @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(decode_whole)),
+        });
+    }
+
+    const json_cfg = .{ .bytes = zerde.json.BytesEncoding.base64 };
+    var rendered_len: usize = 0;
+    start = std.Io.Clock.Timestamp.now(io, .awake);
+    for (0..iterations) |_| {
+        var reader = try zerde.cbor.pullReader(allocator, stored, .{ .mode = zerde.cbor.Mode.strict });
+        defer reader.deinit();
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        var writer = zerde.json.valueWriter(allocator, &sink.writer, json_cfg);
+        defer writer.deinit();
+        while (try reader.next()) |event| try writer.writeEvent(event);
+        try writer.finish();
+        rendered_len = sink.written().len;
+    }
+    const render_whole: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+    try out.print("  json  render whole   output {d:>8} B in one buffer, pull reader into the value writer     {d:>9.0} ns\n", .{ rendered_len, @as(f64, @floatFromInt(render_whole)) / iterations });
+    inline for (.{ 4096, 16384, 65536 }) |window_len| {
+        const window = try allocator.alloc(u8, window_len);
+        defer allocator.free(window);
+        var windows: usize = 0;
+        var total: usize = 0;
+        start = std.Io.Clock.Timestamp.now(io, .awake);
+        for (0..iterations) |_| {
+            var render = zerde.resumable.Render(json_cfg).init();
+            windows = 0;
+            total = 0;
+            while (true) {
+                const filled = try render.fill(stored, window);
+                windows += 1;
+                total += filled.len;
+                if (filled.done) break;
+            }
+        }
+        const elapsed: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+        std.debug.assert(total == rendered_len);
+        try out.print("  json  render window {d:>6} B  {d:>4} windows, state {d} B                              {d:>9.0} ns ({d:.2}x)\n", .{
+            window_len,
+            windows,
+            @sizeOf(zerde.resumable.Render(json_cfg)),
+            @as(f64, @floatFromInt(elapsed)) / iterations,
+            @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(render_whole)),
         });
     }
 }

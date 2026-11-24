@@ -6641,3 +6641,1195 @@ test "every JSON writer writes a float alike, and a window of min_window holds t
     try std.testing.expectEqual(zerde.resumable.Writer(zerde.json, Reals, .{}, .{}).min_window, zerde.resumable.Writer(zerde.cbor, Reals, .{}, .{}).min_window);
     try std.testing.expectEqual(zerde.typed.atomic_room + 6 * 1 + 7, zerde.resumable.Writer(zerde.json, Reals, .{}, .{}).min_window);
 }
+
+// ---- strict CBOR read in chunks, resumably ---------------------------------------------------------------------
+
+const chunk_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 256 };
+
+/// The value `input` reads as when it arrives in pieces cut at `cuts` (ascending offsets), from an arena.
+fn readInChunks(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, arena: std.mem.Allocator, input: []const u8, cuts: []const usize) !T {
+    var decoder = zerde.resumable.Decoder(T, serde_cfg, read_cfg).init(.{}, arena);
+    var start: usize = 0;
+    for (cuts) |cut| {
+        _ = try decoder.feed(input[start..cut]);
+        start = cut;
+    }
+    _ = try decoder.feed(input[start..]);
+    return decoder.finish();
+}
+
+/// The deterministic CBOR of `value`, owned by the caller.
+fn deterministicBytes(comptime T: type, comptime serde_cfg: anytype, value: T) ![]u8 {
+    var out = try writeCbor(value, serde_cfg, .{ .deterministic = true });
+    return out.toOwnedSlice();
+}
+
+/// What a resumable read gives of the encoding of `value` is what the whole-input strict read gives, which is `value`, for
+/// the input cut at every offset, at every pair of offsets (a head and a string cut in two places), and in pieces of
+/// every size from 1 to 17 bytes.
+fn expectChunked(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, value: T) !void {
+    const input = try deterministicBytes(T, serde_cfg, value);
+    defer allocator.free(input);
+    const whole = try zerde.cbor.parseSliceWith(T, allocator, input, serde_cfg, read_cfg);
+    defer zerde.free(allocator, whole);
+    try std.testing.expectEqualDeep(value, whole);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (0..input.len + 1) |cut| {
+        _ = arena_state.reset(.retain_capacity);
+        const got = try readInChunks(T, serde_cfg, read_cfg, arena, input, &.{cut});
+        try std.testing.expectEqualDeep(whole, got);
+        const again = try deterministicBytes(T, serde_cfg, got);
+        defer allocator.free(again);
+        try std.testing.expectEqualSlices(u8, input, again);
+    }
+    if (input.len <= 160) {
+        for (0..input.len + 1) |first| {
+            for (first..input.len + 1) |second| {
+                _ = arena_state.reset(.retain_capacity);
+                const got = try readInChunks(T, serde_cfg, read_cfg, arena, input, &.{ first, second });
+                try std.testing.expectEqualDeep(whole, got);
+            }
+        }
+    }
+    var size: usize = 1;
+    while (size <= 17) : (size += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        var cuts: std.ArrayList(usize) = .empty;
+        defer cuts.deinit(allocator);
+        var at = size;
+        while (at < input.len) : (at += size) try cuts.append(allocator, at);
+        const got = try readInChunks(T, serde_cfg, read_cfg, arena, input, cuts.items);
+        try std.testing.expectEqualDeep(whole, got);
+    }
+}
+
+test "a resumable read gives the value of the whole strict read, for every way the input is cut" {
+    try expectChunked(WireMsg, .{}, chunk_read, sampleMsg());
+    try expectChunked(WireMsg, .{}, chunk_read, .{ .id = .{ 0, 0, 0, 0 }, .effects = &.{}, .grid = &.{}, .pair = .{ 0, 65535 } });
+}
+
+const ChunkInner = struct {
+    a: u8,
+    b: ?[]const u8 = null,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .b = .{ .optional = .absent } } };
+};
+
+const ChunkKind = enum { alpha, beta, gamma_long_name };
+const ChunkLevel = enum(u8) { low = 1, high = 200 };
+
+const ChunkChoice = union(enum) {
+    bare,
+    num: u32,
+    text: []const u8,
+    inner: ChunkInner,
+    list: []const u16,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+
+const ChunkInts = union(enum) {
+    zero,
+    one: u8,
+    two: []const u8,
+    three: ChunkInner,
+    pub const serde = .{ .fields = .{ .zero = .{ .key = 0 }, .one = .{ .key = 1 }, .two = .{ .key = 2 }, .three = .{ .key = 300 } } };
+};
+
+const ChunkMeta = struct {
+    name: []const u8,
+    kind: ChunkKind,
+    level: ChunkLevel,
+    ratio: f64,
+    small: f32,
+    flag: bool,
+    count: i64,
+    digest: [8]u8,
+    blob: zerde.ByteString,
+    raw: zerde.cbor.Raw,
+    opt_raw: ?zerde.cbor.Raw = null,
+    maybe: ?ChunkInner = null,
+    labels: zerde.SortedMap(u32) = .{ .entries = &.{} },
+    choices: []const ChunkChoice,
+    ints: []const ChunkInts,
+    nested: []const []const ChunkInner,
+    fixed: [3]ChunkInner,
+    boxed: *const ChunkInner,
+    pub const serde = .{ .deny_unknown_fields = true, .enum_repr = .name, .fields = .{
+        .name = .{ .min_len = 1, .max_len = 40 },
+        .level = .{},
+        .raw = .{ .max_len = 60 },
+        .opt_raw = .{ .max_len = 60, .optional = .absent },
+        .maybe = .{ .optional = .absent },
+        .labels = .{ .max_len = 8 },
+        .choices = .{ .max_len = 8 },
+        .nested = .{ .max_len = 4, .elem = .{ .max_len = 4 } },
+        .count = .{ .min = -1000, .max = 1000 },
+    } };
+};
+
+const chunk_choices = [_]ChunkChoice{ .bare, .{ .num = 70000 }, .{ .text = "a longer text than a head holds, over twenty-four bytes" }, .{ .inner = .{ .a = 1, .b = "bee" } }, .{ .list = &.{ 1, 300, 70 } } };
+const chunk_ints = [_]ChunkInts{ .zero, .{ .one = 9 }, .{ .two = "ii" }, .{ .three = .{ .a = 3 } } };
+const chunk_row = [_]ChunkInner{ .{ .a = 1 }, .{ .a = 2, .b = "x" } };
+const chunk_nested = [_][]const ChunkInner{ &chunk_row, &.{}, &chunk_row };
+const chunk_entries = [_]zerde.SortedMap(u32).Entry{
+    .{ .key = "b", .value = 2 },
+    .{ .key = "cc", .value = 70000 },
+    .{ .key = "aaa", .value = 0 },
+};
+
+fn sampleChunkMeta() ChunkMeta {
+    return .{
+        .name = "chunked meta",
+        .kind = .gamma_long_name,
+        .level = .high,
+        .ratio = 0.1,
+        .small = 2.5,
+        .flag = true,
+        .count = -300,
+        .digest = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .blob = .{ .bytes = "a byte string of more than twenty-four bytes" },
+        // {"a": 1, "c": {"x": h'0102'}, "bb": [1, 2, 3]}
+        .raw = .{ .bytes = &.{ 0xa3, 0x61, 'a', 0x01, 0x61, 'c', 0xa1, 0x61, 'x', 0x42, 0x01, 0x02, 0x62, 'b', 'b', 0x83, 0x01, 0x02, 0x03 } },
+        .opt_raw = .{ .bytes = &.{ 0x82, 0xf9, 0x3e, 0x00, 0x20 } },
+        .maybe = .{ .a = 7, .b = "present" },
+        .labels = .{ .entries = &chunk_entries },
+        .choices = &chunk_choices,
+        .ints = &chunk_ints,
+        .nested = &chunk_nested,
+        .fixed = .{ .{ .a = 1 }, .{ .a = 2, .b = "two" }, .{ .a = 3 } },
+        .boxed = &.{ .a = 4, .b = "boxed" },
+    };
+}
+
+test "a resumable read of every kind of field gives the whole read's value, for every way the input is cut" {
+    var value = sampleChunkMeta();
+    try expectChunked(ChunkMeta, .{}, chunk_read, value);
+    // The optional fields absent, a sorted map empty.
+    value.opt_raw = null;
+    value.maybe = null;
+    value.labels = .{ .entries = &.{} };
+    try expectChunked(ChunkMeta, .{}, chunk_read, value);
+}
+
+/// The result of a read, as a value or as its error, to compare the two reads.
+fn Outcome(comptime T: type) type {
+    return union(enum) { value: T, err: anyerror };
+}
+
+fn wholeOutcome(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, arena: std.mem.Allocator, input: []const u8) Outcome(T) {
+    const value = zerde.cbor.parseSliceWith(T, arena, input, serde_cfg, read_cfg) catch |err| return .{ .err = err };
+    return .{ .value = value };
+}
+
+fn chunkedOutcome(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, arena: std.mem.Allocator, input: []const u8, cuts: []const usize) Outcome(T) {
+    const value = readInChunks(T, serde_cfg, read_cfg, arena, input, cuts) catch |err| return .{ .err = err };
+    return .{ .value = value };
+}
+
+const MutationTally = struct { reads: usize = 0, refused: usize = 0, key_shape: usize = 0 };
+
+/// Every input that differs from `input` in one byte (set to each of `changes`) reads in pieces as it reads whole: the same
+/// value or the same error, for the input cut at a few offsets. The one difference allowed is the documented one: a key of a
+/// struct that is neither text nor an integer is refused as `UnknownField` where it is met (`typed_resume.zig`), where the
+/// whole read reads the key first and so may find it malformed; those are counted in `key_shape`.
+fn expectSameOnMutations(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, input: []const u8) !MutationTally {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mutable = try allocator.dupe(u8, input);
+    defer allocator.free(mutable);
+    var tally: MutationTally = .{};
+    const changes = [_]u8{ 0x00, 0x01, 0x18, 0x1f, 0x20, 0x61, 0x7f, 0x80, 0xa0, 0xc0, 0xf4, 0xf6, 0xf9, 0xff };
+    for (0..input.len) |at| {
+        for (changes) |change| {
+            if (change == input[at]) continue;
+            mutable[at] = change;
+            defer mutable[at] = input[at];
+            _ = arena_state.reset(.retain_capacity);
+            const whole = wholeOutcome(T, serde_cfg, read_cfg, arena, mutable);
+            if (whole == .err) tally.refused += 1;
+            // Cuts at a few offsets around the changed byte and at both ends.
+            for ([_]usize{ 0, 1, at, at + 1, mutable.len / 2, mutable.len }) |cut| {
+                if (cut > mutable.len) continue;
+                tally.reads += 1;
+                const got = chunkedOutcome(T, serde_cfg, read_cfg, arena, mutable, &.{cut});
+                switch (whole) {
+                    .value => |value| {
+                        if (got != .value) {
+                            std.debug.print("byte {d} to {x:0>2}, cut {d}: whole read a value, chunks gave {s}\n", .{ at, change, cut, @errorName(got.err) });
+                            return error.TestUnexpectedResult;
+                        }
+                        try std.testing.expectEqualDeep(value, got.value);
+                    },
+                    .err => |err| {
+                        if (got == .err and got.err == err) continue;
+                        if (got == .err and got.err == error.UnknownField) {
+                            tally.key_shape += 1;
+                            continue;
+                        }
+                        std.debug.print("byte {d} to {x:0>2}, cut {d}: whole gave {s}, chunks gave {s}\n{x}\n", .{ at, change, cut, @errorName(err), if (got == .err) @errorName(got.err) else "a value", mutable });
+                        return error.TestUnexpectedResult;
+                    },
+                }
+            }
+        }
+    }
+    return tally;
+}
+
+test "mutated inputs read in pieces as they read whole: the same value, or the same error" {
+    const msg = try deterministicBytes(WireMsg, .{}, sampleMsg());
+    defer allocator.free(msg);
+    const msg_tally = try expectSameOnMutations(WireMsg, .{}, chunk_read, msg);
+    try std.testing.expect(msg_tally.refused > msg.len);
+    try std.testing.expect(msg_tally.key_shape * 20 < msg_tally.reads);
+    const meta = try deterministicBytes(ChunkMeta, .{}, sampleChunkMeta());
+    defer allocator.free(meta);
+    const meta_tally = try expectSameOnMutations(ChunkMeta, .{}, chunk_read, meta);
+    try std.testing.expect(meta_tally.refused > meta.len);
+    try std.testing.expect(meta_tally.key_shape * 20 < meta_tally.reads);
+}
+
+/// A resumable decode into the wire layout, in a region of exactly `resumableRegionSizes`, gives `expected` when the input is cut
+/// at every offset; returns the bytes of the region it used.
+fn expectWireChunks(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, expected: T) !usize {
+    const sizes = comptime wire.resumableRegionSizes(T, serde_cfg, read_cfg);
+    try std.testing.expectEqual(@as(usize, 0), sizes.scratch);
+    const input = try deterministicBytes(T, serde_cfg, expected);
+    defer allocator.free(input);
+    var region: Region = .{};
+    var used: usize = 0;
+    for (0..input.len + 1) |cut| {
+        var decoder: wire.Resumable(T, serde_cfg, read_cfg) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        const early = try decoder.feed(input[0..cut]);
+        try std.testing.expectEqual(cut == input.len, early);
+        _ = try decoder.feed(input[cut..]);
+        const decoded = try decoder.finish();
+        try std.testing.expect(decoded.used <= sizes.output);
+        used = decoded.used;
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const back = try wire.fromWire(T, arena_state.allocator(), region.memory(), decoded.value);
+        try std.testing.expectEqualDeep(expected, back);
+    }
+    return used;
+}
+
+test "a resumable decode into the wire layout is the value of the whole decode, in a region of exactly its bound" {
+    const used = try expectWireChunks(WireMsg, .{}, chunk_read, sampleMsg());
+    try std.testing.expect(used > 0);
+    // Every string and list at its bound: the most the config lets the schema take.
+    const long_put: WireEffect = .{ .put = .{ .key = .{ .bytes = "kkkkkkkk" }, .kind = "tttttttttttttttt", .revision = std.math.maxInt(u64), .meta = "mmmmmmmmmmmmmmmm", .note = .{ .bytes = "nnnnnnnn" }, .level = .high, .ratio = 1.5, .flag = true } };
+    const effects = [_]WireEffect{ long_put, long_put, long_put, long_put };
+    const row = [_]u16{ 1, 2, 3, 4 };
+    const grid = [_][]const u16{ &row, &row, &row };
+    const biggest: WireMsg = .{ .id = .{ 255, 255, 255, 255 }, .effects = &effects, .grid = &grid, .pair = .{ 1, 2 }, .first = long_put };
+    const biggest_used = try expectWireChunks(WireMsg, .{}, chunk_read, biggest);
+    try std.testing.expect(biggest_used <= wire.resumableRegionSizes(WireMsg, .{}, chunk_read).output);
+    // A region one byte short of what this input takes is refused, and nothing is written past it.
+    const input = try deterministicBytes(WireMsg, .{}, biggest);
+    defer allocator.free(input);
+    var region: Region = .{};
+    var decoder: wire.Resumable(WireMsg, .{}, chunk_read) = undefined;
+    decoder.init(region.bytes[0 .. biggest_used - 1], region.base());
+    try std.testing.expectError(error.OutOfMemory, decoder.feed(input));
+    // The input of a whole-input decode is in the region; the resumable decode keeps none of it.
+    try std.testing.expect(wire.resumableRegionSizes(WireMsg, .{}, chunk_read).output < wire.regionSizes(zerde.cbor, WireMsg, .{}, chunk_read).output + 4096);
+}
+
+/// `ChunkMeta` without the pointer, which has no wire layout.
+const ChunkWire = struct {
+    name: []const u8,
+    kind: ChunkKind,
+    level: ChunkLevel,
+    ratio: f64,
+    small: f32,
+    flag: bool,
+    count: i64,
+    digest: [8]u8,
+    blob: zerde.ByteString,
+    raw: zerde.cbor.Raw,
+    opt_raw: ?zerde.cbor.Raw = null,
+    maybe: ?ChunkInner = null,
+    labels: zerde.SortedMap(u32) = .{ .entries = &.{} },
+    choices: []const ChunkChoice,
+    ints: []const ChunkInts,
+    nested: []const []const ChunkInner,
+    fixed: [3]ChunkInner,
+    pub const serde = ChunkMeta.serde;
+};
+
+test "a resumable decode into the wire layout holds a Raw, a sorted map and its keys in the bound of the region" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 200, .max_input_bytes = 4096 };
+    const meta = sampleChunkMeta();
+    var value: ChunkWire = undefined;
+    inline for (@typeInfo(ChunkWire).@"struct".field_names) |name| @field(value, name) = @field(meta, name);
+    const used = try expectWireChunks(ChunkWire, .{}, read, value);
+    try std.testing.expect(used > value.raw.bytes.len);
+    // The Raw and the keys are charged: without a bound for the Raw's string the type has none, and the bound follows the config.
+    const sizes = comptime wire.resumableRegionSizes(ChunkWire, .{}, read);
+    const lenient = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 200, .max_input_bytes = 1024 };
+    try std.testing.expect(wire.resumableRegionSizes(ChunkWire, .{}, lenient).output <= sizes.output);
+    try std.testing.expect(sizes.output > wire.regionSizes(zerde.cbor, ChunkWire, .{}, read).output);
+}
+
+/// `input` is refused with `expected` by the whole strict read and by the resumable read for the input cut at every offset.
+fn expectRefusedInChunks(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, expected: anyerror, input: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const whole = wholeOutcome(T, serde_cfg, read_cfg, arena, input);
+    if (whole != .err or whole.err != expected) {
+        std.debug.print("whole read: {s}, expected {s}\n", .{ if (whole == .err) @errorName(whole.err) else "a value", @errorName(expected) });
+        return error.TestUnexpectedResult;
+    }
+    for (0..input.len + 1) |cut| {
+        const got = chunkedOutcome(T, serde_cfg, read_cfg, arena, input, &.{cut});
+        if (got != .err or got.err != expected) {
+            std.debug.print("cut {d}: chunks gave {s}, expected {s}\n", .{ cut, if (got == .err) @errorName(got.err) else "a value", @errorName(expected) });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+const ChunkStrict = struct {
+    a: u8,
+    b: ?[]const u8 = null,
+    c: []const u8,
+    d: ChunkKind,
+    e: [2]u8,
+    f: ?ChunkInner = null,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+        .a = .{ .min = 1, .max = 200 },
+        .b = .{ .optional = .absent, .max_len = 4 },
+        .c = .{ .min_len = 1, .max_len = 6 },
+        .f = .{ .optional = .absent },
+    } };
+};
+
+test "a resumable read refuses what the strict read refuses, with the same error, however the input is cut" {
+    const valid = [_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ok = try readInChunks(ChunkStrict, .{}, chunk_read, arena, &valid, &.{ 3, 9 });
+    try std.testing.expectEqual(@as(u8, 5), ok.a);
+    try std.testing.expectEqualStrings("hi", ok.c);
+    try std.testing.expectEqual(ChunkKind.alpha, ok.d);
+    try std.testing.expectEqual([2]u8{ 1, 2 }, ok.e);
+    try std.testing.expect(ok.b == null and ok.f == null);
+
+    const head = [_]u8{ 0xa4, 0x61, 'a' };
+    const c_d_e = [_]u8{ 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 };
+    const Case = struct { err: anyerror, input: []const u8 };
+    const cases = [_]Case{
+        .{ .err = error.NonDeterministicEncoding, .input = &(head ++ [_]u8{ 0x18, 0x05 } ++ c_d_e) }, // a head longer than it needs to be
+        .{ .err = error.NonDeterministicEncoding, .input = &[_]u8{ 0xa4, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'a', 0x05, 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // keys out of order
+        .{ .err = error.DuplicateField, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'a', 0x06, 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // a key twice
+        .{ .err = error.UnknownField, .input = &(valid ++ [_]u8{ 0x61, 'z', 0x01 }) }, // not counted in the head, so see below
+        .{ .err = error.UnknownField, .input = &[_]u8{ 0xa5, 0x61, 'a', 0x05, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02, 0x61, 'z', 0x01 } }, // a key no field has
+        .{ .err = error.MissingField, .input = &[_]u8{ 0xa3, 0x61, 'a', 0x05, 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // c is required
+        .{ .err = error.UnexpectedTag, .input = &(head ++ [_]u8{ 0xc1, 0x05 } ++ c_d_e) },
+        .{ .err = error.NonDeterministicEncoding, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x7f, 0x62, 'h', 'i', 0xff, 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // an indefinite string
+        .{ .err = error.InvalidUtf8, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x62, 0xff, 0xff, 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } },
+        .{ .err = error.ValueOutOfRange, .input = &(head ++ [_]u8{0x00} ++ c_d_e) }, // below min
+        .{ .err = error.ValueOutOfRange, .input = &(head ++ [_]u8{ 0x18, 0xc9 } ++ c_d_e) }, // above max
+        .{ .err = error.IntegerOverflow, .input = &(head ++ [_]u8{ 0x19, 0x03, 0xe8 } ++ c_d_e) }, // does not fit u8
+        .{ .err = error.UnexpectedType, .input = &(head ++ [_]u8{ 0x61, 'x' } ++ c_d_e) }, // text for an integer
+        .{ .err = error.UnexpectedType, .input = &(head ++ [_]u8{ 0xf9, 0x3c, 0x00 } ++ c_d_e) }, // a float for an integer
+        .{ .err = error.LengthOutOfBounds, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x67, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // over max_len
+        .{ .err = error.LengthOutOfBounds, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x60, 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // under min_len
+        .{ .err = error.InvalidEnumTag, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x64, 'z', 'e', 't', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } },
+        .{ .err = error.LengthMismatch, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x41, 0x01 } }, // a byte array of the wrong length
+        .{ .err = error.UnexpectedType, .input = &[_]u8{ 0xa5, 0x61, 'a', 0x05, 0x61, 'b', 0xf6, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // null where only absence is allowed
+        .{ .err = error.LengthOutOfBounds, .input = &[_]u8{ 0xa5, 0x61, 'a', 0x05, 0x61, 'b', 0x65, 'a', 'b', 'c', 'd', 'e', 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } }, // an optional's text over max_len
+        .{ .err = error.UnexpectedType, .input = &[_]u8{0x05} }, // not a map
+        .{ .err = error.TrailingCharacters, .input = &(valid ++ [_]u8{0x00}) },
+        .{ .err = error.UnexpectedEndOfInput, .input = &.{} },
+        .{ .err = error.UnexpectedEndOfInput, .input = valid[0 .. valid.len - 1] },
+        .{ .err = error.UnexpectedEndOfInput, .input = &[_]u8{ 0xa4, 0x61, 'a' } },
+    };
+    for (cases, 0..) |case, number| {
+        // The fourth case has the map's head of four entries and a fifth: after the four, the value is complete and the rest is trailing.
+        const expected = if (number == 3) error.TrailingCharacters else case.err;
+        expectRefusedInChunks(ChunkStrict, .{}, chunk_read, expected, case.input) catch |err| {
+            std.debug.print("case {d}\n", .{number});
+            return err;
+        };
+    }
+}
+
+test "a resumable read keeps to the limits of the config across chunks" {
+    const Nested = struct {
+        v: []const []const u16,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // {"v": [[1, 2], [3]]}: the heads are the map, its key, the array, two arrays inside it and three numbers: eight items, three containers deep.
+    const nested = [_]u8{ 0xa1, 0x61, 'v', 0x82, 0x82, 0x01, 0x02, 0x81, 0x03 };
+    const items_ok = .{ .mode = zerde.cbor.Mode.strict, .max_items = 8 };
+    const items_short = .{ .mode = zerde.cbor.Mode.strict, .max_items = 7 };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    _ = try readInChunks(Nested, .{}, items_ok, arena, &nested, &.{4});
+    try expectRefusedInChunks(Nested, .{}, items_short, error.TooManyItems, &nested);
+    // The count is of the whole stream, not of each chunk.
+    var one_by_one: std.ArrayList(usize) = .empty;
+    defer one_by_one.deinit(allocator);
+    for (1..nested.len) |cut| try one_by_one.append(allocator, cut);
+    try std.testing.expectError(error.TooManyItems, readInChunks(Nested, .{}, items_short, arena, &nested, one_by_one.items));
+    // Depth: the map, the array and the arrays inside it are three containers.
+    _ = try readInChunks(Nested, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_depth = 3 }, arena, &nested, &.{5});
+    try expectRefusedInChunks(Nested, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_depth = 2 }, error.CborNestingTooDeep, &nested);
+
+    // A string over max_string_len, and over a field's own max_len, which says which.
+    const Texts = struct {
+        plain: []const u8,
+        capped: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .capped = .{ .max_len = 2 } } };
+    };
+    // Keys of a map are in order of their encoded form: "plain" (5) before "capped" (6).
+    const texts = [_]u8{ 0xa2, 0x65, 'p', 'l', 'a', 'i', 'n', 0x64, 'a', 'b', 'c', 'd', 0x66, 'c', 'a', 'p', 'p', 'e', 'd', 0x60 };
+    try expectRefusedInChunks(Texts, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 3 }, error.StringTooLong, &texts);
+    const capped_long = [_]u8{ 0xa2, 0x65, 'p', 'l', 'a', 'i', 'n', 0x60, 0x66, 'c', 'a', 'p', 'p', 'e', 'd', 0x63, 'a', 'b', 'c' };
+    try expectRefusedInChunks(Texts, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8 }, error.LengthOutOfBounds, &capped_long);
+    // max_len under max_string_len is the field's error; over it, the config's.
+    try expectRefusedInChunks(Texts, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 2 }, error.StringTooLong, &capped_long);
+
+    // The stream is bounded by max_input_bytes whatever the chunks are, and exactly that much is accepted.
+    const Scalar = struct {
+        n: u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const scalar = [_]u8{ 0xa1, 0x61, 'n', 0x05 };
+    _ = try readInChunks(Scalar, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_input_bytes = scalar.len }, arena, &scalar, &.{ 1, 2, 3 });
+    try std.testing.expectError(error.InputTooLarge, readInChunks(Scalar, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_input_bytes = scalar.len - 1 }, arena, &scalar, &.{ 1, 2, 3 }));
+    var decoder = zerde.resumable.Decoder(Scalar, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_input_bytes = scalar.len }).init(.{}, arena);
+    try std.testing.expect(!(try decoder.feed(scalar[0..3])));
+    try std.testing.expectError(error.InputTooLarge, decoder.feed(&[_]u8{ 0x05, 0x00 }));
+    // A container that claims more than the stream may still hold is refused at its head, as the whole read refuses one that
+    // claims more than the input has.
+    try std.testing.expectError(error.UnexpectedEndOfInput, readInChunks(Nested, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_input_bytes = nested.len - 1 }, arena, &nested, one_by_one.items));
+}
+
+test "a resumable read refuses a length the stream cannot hold before it allocates for it" {
+    const Big = struct {
+        list: []const u64,
+        text: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // A list of a million items, and a string of a million bytes, in a stream that may be 4 KiB.
+    const list_claim = [_]u8{ 0xa1, 0x64, 'l', 'i', 's', 't', 0x9a, 0x00, 0x0f, 0x42, 0x40 };
+    const small = .{ .mode = zerde.cbor.Mode.strict, .max_input_bytes = 4096 };
+    const text_claim = [_]u8{ 0xa1, 0x64, 't', 'e', 'x', 't', 0x7a, 0x00, 0x0f, 0x42, 0x40 };
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    for ([_][]const u8{ &list_claim, &text_claim }) |input| {
+        for (0..input.len + 1) |cut| {
+            const got = chunkedOutcome(Big, .{}, small, failing.allocator(), input, &.{cut});
+            try std.testing.expect(got == .err);
+            // Not "out of memory": the claim is refused first, with what the whole-input read says of it.
+            try std.testing.expectEqual(error.UnexpectedEndOfInput, got.err);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+
+    // A bound of the field is checked before the allocation too, and a Raw holds no more than its bound, whatever it says it is.
+    const Held = struct {
+        text: []const u8,
+        raw: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .text = .{ .max_len = 8 }, .raw = .{ .max_len = 64 } } };
+    };
+    const claim_over_bound = [_]u8{ 0xa1, 0x64, 't', 'e', 'x', 't', 0x78, 0xff };
+    var backing = std.heap.ArenaAllocator.init(allocator);
+    defer backing.deinit();
+    var counting = std.testing.FailingAllocator.init(backing.allocator(), .{});
+    for (0..claim_over_bound.len + 1) |cut| {
+        const got = chunkedOutcome(Held, .{}, .{ .mode = zerde.cbor.Mode.strict }, counting.allocator(), &claim_over_bound, &.{cut});
+        try std.testing.expectEqual(error.LengthOutOfBounds, got.err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.allocated_bytes);
+    // A Raw of 4000 bytes (an array of zeros) is refused when it passes 64, having held at most a little more than that.
+    var big_raw: std.ArrayList(u8) = .empty;
+    defer big_raw.deinit(allocator);
+    try big_raw.appendSlice(allocator, &.{ 0xa2, 0x63, 'r', 'a', 'w', 0x99, 0x0f, 0xa0 });
+    try big_raw.appendNTimes(allocator, 0x00, 4000);
+    counting = std.testing.FailingAllocator.init(backing.allocator(), .{});
+    for ([_]usize{ 0, 8, 100, 2000 }) |cut| {
+        const got = chunkedOutcome(Held, .{}, .{ .mode = zerde.cbor.Mode.strict }, counting.allocator(), big_raw.items, &.{cut});
+        try std.testing.expect(got == .err);
+    }
+    try std.testing.expect(counting.allocated_bytes < 4 * 4 * 200);
+}
+
+test "a resumable read honours trusted_text and refuse_non_finite as the whole read does" {
+    const Holder = struct {
+        t: []const u8,
+        raw: zerde.cbor.Raw,
+        f: f64,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 16 } } };
+    };
+    // Keys in encoded order: "f", "t", "raw".
+    const bad_text = [_]u8{ 0xa3, 0x61, 'f', 0xf9, 0x3c, 0x00, 0x61, 't', 0x62, 0xff, 0xff, 0x63, 'r', 'a', 'w', 0x01 };
+    const bad_raw = [_]u8{ 0xa3, 0x61, 'f', 0xf9, 0x3c, 0x00, 0x61, 't', 0x61, 'x', 0x63, 'r', 'a', 'w', 0x62, 0xff, 0xff };
+    const nan_field = [_]u8{ 0xa3, 0x61, 'f', 0xf9, 0x7e, 0x00, 0x61, 't', 0x61, 'x', 0x63, 'r', 'a', 'w', 0x01 };
+    const nan_raw = [_]u8{ 0xa3, 0x61, 'f', 0xf9, 0x3c, 0x00, 0x61, 't', 0x61, 'x', 0x63, 'r', 'a', 'w', 0xf9, 0x7e, 0x00 };
+    try expectRefusedInChunks(Holder, .{}, strict, error.InvalidUtf8, &bad_text);
+    try expectRefusedInChunks(Holder, .{}, strict, error.InvalidUtf8, &bad_raw);
+    const trusted = .{ .mode = zerde.cbor.Mode.strict, .trusted_text = true };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ &bad_text, &bad_raw }) |input| {
+        const whole = try zerde.cbor.parseSliceWith(Holder, arena, input, .{}, trusted);
+        for (0..input.len + 1) |cut| {
+            const got = try readInChunks(Holder, .{}, trusted, arena, input, &.{cut});
+            try std.testing.expectEqualDeep(whole, got);
+        }
+    }
+    // A float that is not finite is a value by default, and refused when the config says so, in a field and inside a Raw.
+    for ([_][]const u8{ &nan_field, &nan_raw }) |input| {
+        try expectRefusedInChunks(Holder, .{}, .{ .mode = zerde.cbor.Mode.strict, .refuse_non_finite = true }, error.NonFiniteFloat, input);
+        const whole = try zerde.cbor.parseSliceWith(Holder, arena, input, .{}, strict);
+        for (0..input.len + 1) |cut| {
+            const got = try readInChunks(Holder, .{}, strict, arena, input, &.{cut});
+            // A NaN is not equal to itself, so the parts are compared.
+            try std.testing.expectEqual(std.math.isNan(whole.f), std.math.isNan(got.f));
+            try std.testing.expectEqualStrings(whole.t, got.t);
+            try std.testing.expectEqualSlices(u8, whole.raw.bytes, got.raw.bytes);
+        }
+    }
+}
+
+const ChunkKeyed = struct {
+    a: ?u8 = null,
+    b: ??u8 = null,
+    c: u8,
+    d: ?u16,
+    e: ?[]const u8 = null,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+        .a = .{ .key = 1, .optional = .absent },
+        .b = .{ .key = 2 },
+        .c = .{ .key = 3 },
+        .d = .{ .key = -4, .optional = .nullable },
+        .e = .{ .key = 5 },
+    } };
+};
+
+test "a resumable read of integer keys, absent, null and nested optionals is the whole read's, for every cut" {
+    try expectChunked(ChunkKeyed, .{}, chunk_read, .{ .c = 1, .d = null });
+    try expectChunked(ChunkKeyed, .{}, chunk_read, .{ .a = 7, .b = @as(?u8, null), .c = 1, .d = 300, .e = "tail text over twenty-four bytes long" });
+    try expectChunked(ChunkKeyed, .{}, chunk_read, .{ .a = 7, .b = @as(?u8, 9), .c = 255, .d = 65535, .e = null });
+    // `d` is nullable: it must be present, and a read with no key for it says so.
+    try expectRefusedInChunks(ChunkKeyed, .{}, chunk_read, error.MissingField, &[_]u8{ 0xa1, 0x03, 0x01 });
+    // `a` is absent-only: a null is refused, where `e` takes it.
+    try expectRefusedInChunks(ChunkKeyed, .{}, chunk_read, error.UnexpectedType, &[_]u8{ 0xa3, 0x01, 0xf6, 0x03, 0x01, 0x23, 0x00 });
+}
+
+test "a fixed array of owning elements frees the elements it read when a later one is refused" {
+    const Pair = struct {
+        v: [2][]const u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // {"v": ["a", h'ffff']}: the second element is not text, after the first was copied. The testing allocator reports a leak.
+    try std.testing.expectError(error.UnexpectedType, zerde.cbor.parseSlice(Pair, allocator, &.{ 0xa1, 0x61, 'v', 0x82, 0x61, 'a', 0x42, 0xff, 0xff }));
+    try std.testing.expectError(error.InvalidUtf8, zerde.cbor.parseSlice(Pair, allocator, &.{ 0xa1, 0x61, 'v', 0x82, 0x61, 'a', 0x62, 0xff, 0xff }));
+    try std.testing.expectError(error.UnexpectedToken, zerde.json.parseSlice(Pair, allocator, "{\"v\":[\"a\",1]}"));
+    // An array that is too long for the type, which is found after the elements.
+    try std.testing.expectError(error.LengthMismatch, zerde.cbor.parseSlice(Pair, allocator, &.{ 0xa1, 0x61, 'v', 0x83, 0x61, 'a', 0x61, 'b', 0x61, 'c' }));
+}
+
+const Wrapped = struct {
+    inner: ?*const *const Wrapped = null,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .inner = .{ .optional = .absent } } };
+};
+
+test "a resumable read of a type that wraps each container in an optional and two pointers has room for it at the deepest nesting" {
+    // Each level is an absent-only optional field, an optional, and two pointers around the struct that is the container: five
+    // frames a level, which the state is sized for from the type, and the nesting is that of max_depth.
+    inline for (.{ 1, 2, 5, 9 }) |depth| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        for (0..depth - 1) |_| try input.appendSlice(allocator, &.{ 0xa1, 0x65, 'i', 'n', 'n', 'e', 'r' });
+        try input.append(allocator, 0xa0);
+        const read = .{ .mode = zerde.cbor.Mode.strict, .max_depth = depth };
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        for ([_]usize{ 0, input.items.len / 2, input.items.len - 1 }) |cut| {
+            const got = try readInChunks(Wrapped, .{}, read, arena, input.items, &.{cut});
+            const again = try deterministicBytes(Wrapped, .{}, got);
+            defer allocator.free(again);
+            try std.testing.expectEqualSlices(u8, input.items, again);
+        }
+        // One more is too deep, as it is for the whole read.
+        try input.insertSlice(allocator, 0, &.{ 0xa1, 0x65, 'i', 'n', 'n', 'e', 'r' });
+        try expectRefusedInChunks(Wrapped, .{}, read, error.CborNestingTooDeep, input.items);
+    }
+}
+
+/// The value `input` reads as in pieces, for every cut, which must be `expected`.
+fn expectValueInChunks(comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype, expected: T, input: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (0..input.len + 1) |cut| {
+        const got = try readInChunks(T, serde_cfg, read_cfg, arena, input, &.{cut});
+        try std.testing.expectEqualDeep(expected, got);
+    }
+}
+
+test "a resumable read of unions reads each form, and refuses the others as the whole read does" {
+    // Bare name, and a map of one entry; a variant with a payload cannot be a bare name, nor one without a map entry.
+    try expectValueInChunks(ChunkChoice, .{}, chunk_read, .bare, &[_]u8{ 0x64, 'b', 'a', 'r', 'e' });
+    try expectValueInChunks(ChunkChoice, .{}, chunk_read, .{ .num = 5 }, &[_]u8{ 0xa1, 0x63, 'n', 'u', 'm', 0x05 });
+    try expectValueInChunks(ChunkChoice, .{}, chunk_read, .{ .inner = .{ .a = 3 } }, &[_]u8{ 0xa1, 0x65, 'i', 'n', 'n', 'e', 'r', 0xa1, 0x61, 'a', 0x03 });
+    const choice_errors = [_]struct { err: anyerror, input: []const u8 }{
+        .{ .err = error.LengthMismatch, .input = &[_]u8{0xa0} }, // a map of no entry
+        .{ .err = error.LengthMismatch, .input = &[_]u8{ 0xa2, 0x63, 'n', 'u', 'm', 0x05, 0x64, 't', 'e', 'x', 't', 0x61, 'x' } }, // two
+        .{ .err = error.UnexpectedType, .input = &[_]u8{0x05} }, // a number where no variant has an integer key
+        .{ .err = error.UnexpectedType, .input = &[_]u8{ 0xa1, 0x80, 0x00 } }, // a key that is not text or an integer
+        .{ .err = error.UnexpectedType, .input = &[_]u8{0xf5} },
+        .{ .err = error.InvalidEnumTag, .input = &[_]u8{ 0xa1, 0x63, 'z', 'z', 'z', 0x00 } }, // no variant of that name
+        .{ .err = error.InvalidEnumTag, .input = &[_]u8{ 0x63, 'n', 'u', 'm' } }, // a variant with a payload, as a bare name
+        .{ .err = error.InvalidEnumTag, .input = &[_]u8{ 0xa1, 0x64, 'b', 'a', 'r', 'e', 0x00 } }, // one without, as a map entry
+        .{ .err = error.InvalidUtf8, .input = &[_]u8{ 0x62, 0xff, 0xff } },
+        .{ .err = error.UnexpectedEndOfInput, .input = &[_]u8{ 0xa1, 0x63, 'n', 'u' } },
+    };
+    for (choice_errors, 0..) |case, number| {
+        expectRefusedInChunks(ChunkChoice, .{}, chunk_read, case.err, case.input) catch |err| {
+            std.debug.print("choice case {d}\n", .{number});
+            return err;
+        };
+    }
+    // Variants keyed by integers have no text name at all, so any text is longer than every name.
+    try expectValueInChunks(ChunkInts, .{}, chunk_read, .zero, &[_]u8{0x00});
+    try expectValueInChunks(ChunkInts, .{}, chunk_read, .{ .one = 9 }, &[_]u8{ 0xa1, 0x01, 0x09 });
+    try expectValueInChunks(ChunkInts, .{}, chunk_read, .{ .three = .{ .a = 3 } }, &[_]u8{ 0xa1, 0x19, 0x01, 0x2c, 0xa1, 0x61, 'a', 0x03 });
+    const ints_errors = [_]struct { err: anyerror, input: []const u8 }{
+        .{ .err = error.InvalidUtf8, .input = &[_]u8{ 0x61, 0xc3 } }, // a text longer than any name, whose last sequence is cut
+        .{ .err = error.InvalidUtf8, .input = &[_]u8{ 0x62, 0xff, 0x41 } },
+        .{ .err = error.InvalidEnumTag, .input = &[_]u8{ 0x62, 0xc3, 0xa9 } },
+        .{ .err = error.InvalidEnumTag, .input = &[_]u8{0x01} }, // a variant with a payload, as a bare integer
+        .{ .err = error.InvalidEnumTag, .input = &[_]u8{ 0xa1, 0x07, 0x00 } },
+        .{ .err = error.UnexpectedType, .input = &[_]u8{ 0xa1, 0xf9, 0x3c, 0x00, 0x00 } },
+    };
+    for (ints_errors, 0..) |case, number| {
+        expectRefusedInChunks(ChunkInts, .{}, chunk_read, case.err, case.input) catch |err| {
+            std.debug.print("ints case {d}\n", .{number});
+            return err;
+        };
+    }
+}
+
+test "a resumable read of enums takes a name or a number, and an enum written as its number only the number" {
+    const ByNumber = struct {
+        l: ChunkLevel,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const ByName = struct {
+        k: ChunkKind,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const integers = .{ .enum_repr = .integer };
+    try expectValueInChunks(ByNumber, integers, chunk_read, .{ .l = .low }, &[_]u8{ 0xa1, 0x61, 'l', 0x01 });
+    try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .beta }, &[_]u8{ 0xa1, 0x61, 'k', 0x64, 'b', 'e', 't', 'a' });
+    try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .gamma_long_name }, &[_]u8{ 0xa1, 0x61, 'k', 0x6f, 'g', 'a', 'm', 'm', 'a', '_', 'l', 'o', 'n', 'g', '_', 'n', 'a', 'm', 'e' });
+    try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .beta }, &[_]u8{ 0xa1, 0x61, 'k', 0x01 });
+    try expectRefusedInChunks(ByNumber, integers, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'l', 0x63, 'l', 'o', 'w' });
+    try expectRefusedInChunks(ByNumber, integers, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'l', 0x05 });
+    try expectRefusedInChunks(ByNumber, integers, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'l', 0x19, 0x01, 0x2c });
+    try expectRefusedInChunks(ByNumber, integers, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'l', 0xf9, 0x3c, 0x00 });
+    try expectRefusedInChunks(ByNumber, integers, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'l', 0xf5 });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x64, 'z', 'e', 't', 'a' });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x78, 0x1e, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'a', 'b', 'c', 'd' });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x09 });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'k', 0x41, 0x00 });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidUtf8, &[_]u8{ 0xa1, 0x61, 'k', 0x62, 0xc3, 0x28 });
+}
+
+test "a resumable read keys a struct by its encoded key, and orders a key that is none of its fields as the whole read does" {
+    const input = [_]u8{ 0xa5, 0x61, 'a', 0x05, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02, 0x61, 'f' };
+    // A tag, a text where bytes are due and bytes where text is due.
+    const Case = struct { err: anyerror, input: []const u8 };
+    const cases = [_]Case{
+        .{ .err = error.UnexpectedTag, .input = &(input ++ [_]u8{ 0xc1, 0xa0 }) }, // before the value of an optional
+        .{ .err = error.UnexpectedType, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x62, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x62, 'a', 'b' } },
+        .{ .err = error.UnexpectedType, .input = &[_]u8{ 0xa4, 0x61, 'a', 0x05, 0x61, 'c', 0x42, 'h', 'i', 0x61, 'd', 0x65, 'a', 'l', 'p', 'h', 'a', 0x61, 'e', 0x42, 0x01, 0x02 } },
+        // A key that no field has: its place among the keys decides the error.
+        .{ .err = error.UnknownField, .input = &[_]u8{ 0xa1, 0x01, 0x05 } }, // first
+        .{ .err = error.NonDeterministicEncoding, .input = &[_]u8{ 0xa2, 0x61, 'a', 0x05, 0x61, '0', 0x05 } }, // text before the key before it
+        .{ .err = error.NonDeterministicEncoding, .input = &[_]u8{ 0xa2, 0x61, 'a', 0x05, 0x01, 0x05 } }, // an integer after a text
+        .{ .err = error.NonDeterministicEncoding, .input = &[_]u8{ 0xa2, 0x61, 'a', 0x05, 0x41, 0x00, 0x05 } }, // bytes after text
+        .{ .err = error.UnknownField, .input = &[_]u8{ 0xa2, 0x61, 'a', 0x05, 0x80, 0x05 } }, // an array after text
+        .{ .err = error.UnknownField, .input = &[_]u8{ 0xa2, 0x61, 'a', 0x05, 0xf9, 0x3c, 0x00, 0x05 } }, // a float after text
+        .{ .err = error.UnknownField, .input = &[_]u8{ 0xa2, 0x61, 'a', 0x05, 0x78, 0x1f, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'a', 'b', 'c', 'd', 'e', 0x05 } }, // a text longer than every field's name
+    };
+    for (cases, 0..) |case, number| {
+        expectRefusedInChunks(ChunkStrict, .{}, chunk_read, case.err, case.input) catch |err| {
+            std.debug.print("key case {d}\n", .{number});
+            return err;
+        };
+    }
+}
+
+test "a resumable read checks a list's length against its bounds before it allocates, and a fixed array's against its size" {
+    const Caps = struct {
+        v: []const u16,
+        w: [2]u16,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .v = .{ .min_len = 1, .max_len = 2 } } };
+    };
+    const valid = [_]u8{ 0xa2, 0x61, 'v', 0x82, 0x01, 0x02, 0x61, 'w', 0x82, 0x01, 0x02 };
+    try expectValueInChunks(Caps, .{}, chunk_read, .{ .v = &.{ 1, 2 }, .w = .{ 1, 2 } }, &valid);
+    try expectRefusedInChunks(Caps, .{}, chunk_read, error.LengthOutOfBounds, &[_]u8{ 0xa2, 0x61, 'v', 0x83, 0x01, 0x02, 0x03, 0x61, 'w', 0x82, 0x01, 0x02 });
+    try expectRefusedInChunks(Caps, .{}, chunk_read, error.LengthOutOfBounds, &[_]u8{ 0xa2, 0x61, 'v', 0x80, 0x61, 'w', 0x82, 0x01, 0x02 });
+    try expectRefusedInChunks(Caps, .{}, chunk_read, error.LengthMismatch, &[_]u8{ 0xa2, 0x61, 'v', 0x82, 0x01, 0x02, 0x61, 'w', 0x83, 0x01, 0x02, 0x03 });
+    try expectRefusedInChunks(Caps, .{}, chunk_read, error.LengthMismatch, &[_]u8{ 0xa2, 0x61, 'v', 0x82, 0x01, 0x02, 0x61, 'w', 0x81, 0x01 });
+    // Over the bound: refused at the head, with nothing allocated.
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
+    for (0..12) |cut| {
+        const got = chunkedOutcome(Caps, .{}, chunk_read, counting.allocator(), &[_]u8{ 0xa2, 0x61, 'v', 0x83, 0x01, 0x02, 0x03, 0x61, 'w', 0x82, 0x01, 0x02 }, &.{cut});
+        try std.testing.expectEqual(error.LengthOutOfBounds, got.err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.allocated_bytes);
+
+    // The same of a sorted map's entries, and its keys must ascend and be text.
+    const ChunkLabeled = struct {
+        m: zerde.SortedMap(u8),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .m = .{ .max_len = 2 } } };
+    };
+    const entries = [_]zerde.SortedMap(u8).Entry{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 2 } };
+    try expectValueInChunks(ChunkLabeled, .{}, chunk_read, .{ .m = .{ .entries = &entries } }, &[_]u8{ 0xa1, 0x61, 'm', 0xa2, 0x61, 'a', 0x01, 0x61, 'b', 0x02 });
+    try expectRefusedInChunks(ChunkLabeled, .{}, chunk_read, error.NonDeterministicEncoding, &[_]u8{ 0xa1, 0x61, 'm', 0xa2, 0x61, 'b', 0x01, 0x61, 'a', 0x02 });
+    try expectRefusedInChunks(ChunkLabeled, .{}, chunk_read, error.DuplicateField, &[_]u8{ 0xa1, 0x61, 'm', 0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02 });
+    try expectRefusedInChunks(ChunkLabeled, .{}, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'm', 0xa1, 0x01, 0x01 });
+    try expectRefusedInChunks(ChunkLabeled, .{}, chunk_read, error.LengthOutOfBounds, &[_]u8{ 0xa1, 0x61, 'm', 0xa3, 0x61, 'a', 0x01, 0x61, 'b', 0x02, 0x61, 'c', 0x03 });
+    counting = std.testing.FailingAllocator.init(allocator, .{});
+    for (0..13) |cut| {
+        const got = chunkedOutcome(ChunkLabeled, .{}, chunk_read, counting.allocator(), &[_]u8{ 0xa1, 0x61, 'm', 0xa3, 0x61, 'a', 0x01, 0x61, 'b', 0x02, 0x61, 'c', 0x03 }, &.{cut});
+        try std.testing.expectEqual(error.LengthOutOfBounds, got.err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.allocated_bytes);
+}
+
+test "a resumable read of a Raw keeps to its bounds, and the containers of one are closed when it ends" {
+    const Held = struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .min_len = 3, .max_len = 8 } } };
+    };
+    try expectValueInChunks(Held, .{}, chunk_read, .{ .raw = .{ .bytes = &.{ 0x82, 0x01, 0x02 } } }, &[_]u8{ 0xa1, 0x63, 'r', 'a', 'w', 0x82, 0x01, 0x02 });
+    try expectRefusedInChunks(Held, .{}, chunk_read, error.LengthOutOfBounds, &[_]u8{ 0xa1, 0x63, 'r', 'a', 'w', 0x01 });
+    try expectRefusedInChunks(Held, .{}, chunk_read, error.LengthOutOfBounds, &[_]u8{ 0xa1, 0x63, 'r', 'a', 'w', 0x89, 1, 2, 3, 4, 5, 6, 7, 8, 9 });
+    // A Raw that is itself deeper than the rest: closing it gives its levels back, or the list after it would be too deep.
+    const Both = struct {
+        a: zerde.cbor.Raw,
+        b: []const []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .a = .{ .max_len = 16 } } };
+    };
+    const both = [_]u8{ 0xa2, 0x61, 'a', 0x81, 0x81, 0x80, 0x61, 'b', 0x81, 0x81, 0x60 };
+    const four = .{ .mode = zerde.cbor.Mode.strict, .max_depth = 4 };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    for (0..both.len + 1) |cut| _ = try readInChunks(Both, .{}, four, arena_state.allocator(), &both, &.{cut});
+    try expectRefusedInChunks(Both, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_depth = 3 }, error.CborNestingTooDeep, &both);
+}
+
+test "a resumable decoder says when the value is complete, refuses what follows it, and repeats an error" {
+    const Scalar = struct {
+        n: u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Decoder = zerde.resumable.Decoder(Scalar, .{}, chunk_read);
+    // Input that ends before the value is complete is refused, and stays refused.
+    var short = Decoder.init(.{}, arena);
+    try std.testing.expect(!(try short.feed(&[_]u8{ 0xa1, 0x61 })));
+    try std.testing.expectError(error.UnexpectedEndOfInput, short.finish());
+    try std.testing.expectError(error.UnexpectedEndOfInput, short.feed(&[_]u8{ 'n', 0x05 }));
+    var decoder = Decoder.init(.{}, arena);
+    try std.testing.expect(!(try decoder.feed(&.{})));
+    try std.testing.expect(!(try decoder.feed(&[_]u8{ 0xa1, 0x61 })));
+    try std.testing.expect(try decoder.feed(&[_]u8{ 'n', 0x05 }));
+    // Complete: nothing more is welcome, and nothing is the same.
+    try std.testing.expect(try decoder.feed(&.{}));
+    try std.testing.expectEqual(@as(u8, 5), (try decoder.finish()).n);
+    try std.testing.expectError(error.TrailingCharacters, decoder.feed(&[_]u8{0x00}));
+    try std.testing.expectError(error.TrailingCharacters, decoder.feed(&.{}));
+    try std.testing.expectError(error.TrailingCharacters, decoder.finish());
+    // Trailing bytes in the chunk that completes it.
+    var second = Decoder.init(.{}, arena);
+    try std.testing.expectError(error.TrailingCharacters, second.feed(&[_]u8{ 0xa1, 0x61, 'n', 0x05, 0x00 }));
+    // A refused value is refused again, whatever is fed.
+    var third = Decoder.init(.{}, arena);
+    try std.testing.expectError(error.UnexpectedType, third.feed(&[_]u8{0x05}));
+    try std.testing.expectError(error.UnexpectedType, third.feed(&[_]u8{ 0xa1, 0x61, 'n', 0x05 }));
+    try std.testing.expectError(error.UnexpectedType, third.finish());
+}
+
+test "a resumable decode charges the strings and the Raw it copies, and its region holds the largest the schema allows" {
+    const CopiedRaw = struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 1000 } } };
+    };
+    const CopiedText = struct {
+        s: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 500 } } };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 1000 };
+    // The whole-input strict read keeps nothing in the output for either; the resumable one copies them.
+    try std.testing.expect(wire.regionSizes(zerde.cbor, CopiedRaw, .{}, read).output < 1000);
+    try std.testing.expect(wire.resumableRegionSizes(CopiedRaw, .{}, read).output >= 1000);
+    try std.testing.expect(wire.resumableRegionSizes(CopiedText, .{}, read).output >= 500);
+    try std.testing.expectEqual(wire.resumableRegionSizes(CopiedText, .{}, read).output, wire.maxResumableArenaSize(CopiedText, .{}, read));
+
+    // A Raw of exactly its bound (an array of 997 zeros, 1000 bytes), in a region of exactly the bound, cut in sevens.
+    var raw_item: std.ArrayList(u8) = .empty;
+    defer raw_item.deinit(allocator);
+    try raw_item.appendSlice(allocator, &.{ 0x99, 0x03, 0xe5 });
+    try raw_item.appendNTimes(allocator, 0x00, 997);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x63, 'r', 'a', 'w' });
+    try input.appendSlice(allocator, raw_item.items);
+    const sizes = comptime wire.resumableRegionSizes(CopiedRaw, .{}, read);
+    var region: Region = .{};
+    var decoder: wire.Resumable(CopiedRaw, .{}, read) = undefined;
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    var at: usize = 0;
+    while (at < input.items.len) : (at += 7) _ = try decoder.feed(input.items[at..@min(at + 7, input.items.len)]);
+    const decoded = try decoder.finish();
+    try std.testing.expectEqualSlices(u8, raw_item.items, try region.memory().bytesOf(decoded.value.raw));
+    try std.testing.expect(decoded.used <= sizes.output);
+    // One byte more is over the bound of the field.
+    try raw_item.appendSlice(allocator, &.{0x00});
+    raw_item.items[2] = 0xe6;
+    input.items.len = 5;
+    try input.appendSlice(allocator, raw_item.items);
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    try std.testing.expectError(error.LengthOutOfBounds, decoder.feed(input.items));
+    // The same for a text, which has no room beyond its bound.
+    const text_sizes = comptime wire.resumableRegionSizes(CopiedText, .{}, read);
+    var text_decoder: wire.Resumable(CopiedText, .{}, read) = undefined;
+    text_decoder.init(region.bytes[0..text_sizes.output], region.base());
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, &.{ 0xa1, 0x61, 's', 0x79, 0x01, 0xf4 });
+    try text.appendNTimes(allocator, 'x', 500);
+    _ = try text_decoder.feed(text.items);
+    try std.testing.expectEqual(@as(usize, 500), (try text_decoder.finish()).value.s.len);
+}
+
+test "a resumable read decides absent, null and nested optionals once, at the head of the value, and not again where it goes on" {
+    // The first item of the list is a null: a read that looked again after the head would take it for the field's own null.
+    const Nulls = struct {
+        v: ?[]const ?u8 = null,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .v = .{ .optional = .absent } } };
+    };
+    try expectChunked(Nulls, .{}, chunk_read, .{ .v = &.{ null, 5, null } });
+    try expectChunked(Nulls, .{}, chunk_read, .{});
+    // A nested optional field holding a struct: the part of it read before the cut is kept, and not made again.
+    const Nested = struct {
+        n: ??ChunkInner = null,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    try expectChunked(Nested, .{}, chunk_read, .{ .n = @as(?ChunkInner, .{ .a = 1, .b = "xy" }) });
+    try expectChunked(Nested, .{}, chunk_read, .{ .n = @as(?ChunkInner, null) });
+    try expectChunked(Nested, .{}, chunk_read, .{});
+}
+
+test "a resumable read refuses a Raw whose keys repeat or do not ascend, as the whole read does" {
+    const Held = struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 16 } } };
+    };
+    try expectRefusedInChunks(Held, .{}, chunk_read, error.DuplicateField, &[_]u8{ 0xa1, 0x63, 'r', 'a', 'w', 0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02 });
+    try expectRefusedInChunks(Held, .{}, chunk_read, error.NonDeterministicEncoding, &[_]u8{ 0xa1, 0x63, 'r', 'a', 'w', 0xa2, 0x61, 'b', 0x01, 0x61, 'a', 0x02 });
+    try expectRefusedInChunks(Held, .{}, chunk_read, error.UnexpectedTag, &[_]u8{ 0xa1, 0x63, 'r', 'a', 'w', 0xc1, 0x01 });
+    try expectRefusedInChunks(Held, .{}, chunk_read, error.NonDeterministicEncoding, &[_]u8{ 0xa1, 0x63, 'r', 'a', 'w', 0x18, 0x01 });
+}
+
+test "a resumable read counts the items of the whole stream where it reads them, and refuses a claim over the budget before it allocates" {
+    // {"a": [1], "b": 2}: six items, which the map's head (four) and the array's (one) do not foresee, so the count is the head of `b`'s value.
+    const Budget = struct {
+        a: []const u16,
+        b: u16,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const mixed = [_]u8{ 0xa2, 0x61, 'a', 0x81, 0x01, 0x61, 'b', 0x02 };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    _ = try readInChunks(Budget, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 6 }, arena_state.allocator(), &mixed, &.{4});
+    try expectRefusedInChunks(Budget, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 5 }, error.TooManyItems, &mixed);
+    // A list that claims more items than the budget has left is refused at its head, with nothing allocated for it.
+    const Big = struct {
+        list: []const u64,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const claim = [_]u8{ 0xa1, 0x64, 'l', 'i', 's', 't', 0x9a, 0x00, 0x0f, 0x42, 0x40 };
+    var counting = std.testing.FailingAllocator.init(arena_state.allocator(), .{});
+    for (0..claim.len + 1) |cut| {
+        const got = chunkedOutcome(Big, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 100 }, counting.allocator(), &claim, &.{cut});
+        try std.testing.expectEqual(error.TooManyItems, got.err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.allocated_bytes);
+}
+
+// ---- a sorted map in the resumable write -----------------------------------------------------------------------
+
+const long_key_bytes: [300]u8 = @splat('k');
+const long_key: []const u8 = &long_key_bytes;
+const inner_entries = [_]zerde.SortedMap(u8).Entry{ .{ .key = "x", .value = 1 }, .{ .key = "yy", .value = 255 } };
+const window_entries = [_]zerde.SortedMap(zerde.SortedMap(u8)).Entry{
+    .{ .key = "a", .value = .{ .entries = &inner_entries } },
+    .{ .key = "bb", .value = .{ .entries = &.{} } },
+    .{ .key = "q\"\\\n", .value = .{ .entries = &inner_entries } },
+    .{ .key = "\xc3\xa9\xe2\x82\xac", .value = .{ .entries = &inner_entries } },
+    .{ .key = long_key, .value = .{ .entries = &inner_entries } },
+};
+const WindowedMap = struct {
+    head: u8,
+    m: zerde.SortedMap(zerde.SortedMap(u8)),
+    tail: []const u8,
+    pub const serde = .{ .fields = .{ .m = .{ .max_len = 8 } } };
+};
+
+test "a sorted map is written in windows as it is written whole, in JSON and CBOR, a key longer than the window included" {
+    const value: WindowedMap = .{ .head = 7, .m = .{ .entries = &window_entries }, .tail = "after the map" };
+    try expectWindows(zerde.json, WindowedMap, value, .{}, .{});
+    try expectWindows(zerde.cbor, WindowedMap, value, .{}, .{});
+    try expectWindows(zerde.cbor, WindowedMap, value, .{}, .{ .deterministic = true });
+    const empty: WindowedMap = .{ .head = 0, .m = .{ .entries = &.{} }, .tail = "" };
+    try expectWindows(zerde.json, WindowedMap, empty, .{}, .{});
+    try expectWindows(zerde.cbor, WindowedMap, empty, .{}, .{ .deterministic = true });
+    // A window of one token's room: a key goes through it a few bytes at a time.
+    const got = try writeInWindows(zerde.json, WindowedMap, value, .{}, .{}, zerde.resumable.Writer(zerde.json, WindowedMap, .{}, .{}).min_window);
+    defer allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"" ++ long_key ++ "\":{\"x\":1,\"yy\":255}") != null);
+}
+
+test "a resumable write of a sorted map refuses entries that are not in order, as the whole write does, before the entry" {
+    const entries = [_]zerde.SortedMap(u8).Entry{ .{ .key = "a", .value = 1 }, .{ .key = "c", .value = 2 }, .{ .key = "b", .value = 3 } };
+    const repeated = [_]zerde.SortedMap(u8).Entry{ .{ .key = "a", .value = 1 }, .{ .key = "a", .value = 2 } };
+    const Holder = struct { m: zerde.SortedMap(u8) };
+    inline for (.{ zerde.json, zerde.cbor }) |Format| {
+        inline for (.{ .{ &entries, error.NonDeterministicEncoding }, .{ &repeated, error.DuplicateField } }) |case| {
+            const value: Holder = .{ .m = .{ .entries = case[0] } };
+            var resumed = zerde.resumable.Writer(Format, Holder, .{}, .{}).init();
+            var window: [128]u8 = undefined;
+            var written: std.ArrayList(u8) = .empty;
+            defer written.deinit(allocator);
+            while (true) {
+                const filled = resumed.fill(value, &window) catch |err| {
+                    try std.testing.expectEqual(case[1], err);
+                    break;
+                };
+                try written.appendSlice(allocator, window[0..filled.len]);
+                try std.testing.expect(!filled.done);
+            }
+        }
+    }
+}
+
+// ---- stored CBOR rendered as JSON in windows --------------------------------------------------------------------
+
+/// The JSON of the stored CBOR `stored` by reading it (strict) into the value writer: the whole-buffer render.
+fn renderWhole(stored: []const u8, comptime json_cfg: anytype) ![]u8 {
+    var reader = try zerde.cbor.pullReader(allocator, stored, .{ .mode = zerde.cbor.Mode.strict });
+    defer reader.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var writer = zerde.json.valueWriter(allocator, &out.writer, json_cfg);
+    defer writer.deinit();
+    while (try reader.next()) |event| try writer.writeEvent(event);
+    try writer.finish();
+    try reader.finish();
+    return out.toOwnedSlice();
+}
+
+/// Every window of the resumable render, joined.
+fn renderInWindows(comptime json_cfg: anytype, stored: []const u8, window_len: usize) ![]u8 {
+    var render = zerde.resumable.Render(json_cfg).init();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const window = try allocator.alloc(u8, window_len);
+    defer allocator.free(window);
+    while (true) {
+        const filled = try render.fill(stored, window);
+        try std.testing.expect(filled.len <= window_len);
+        try out.appendSlice(allocator, window[0..filled.len]);
+        if (filled.done) break;
+        try std.testing.expect(filled.len > 0);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try render.fill(stored, window)).len);
+    return out.toOwnedSlice(allocator);
+}
+
+/// The render in windows is the whole render, for every window from the smallest to a few hundred bytes more and one that holds it all.
+fn expectRenderWindows(comptime json_cfg: anytype, stored: []const u8) !void {
+    const whole = try renderWhole(stored, json_cfg);
+    defer allocator.free(whole);
+    const min = zerde.resumable.Render(json_cfg).min_window;
+    var size: usize = min;
+    while (size < min + 300) : (size += 1) {
+        const got = try renderInWindows(json_cfg, stored, size);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(whole, got);
+    }
+    const all = try renderInWindows(json_cfg, stored, whole.len + min);
+    defer allocator.free(all);
+    try std.testing.expectEqualStrings(whole, all);
+}
+
+const render_text: []const u8 = "text with \"quotes\", a \\ and a tab\t, a newline\n, a control \x01, \xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80, and so on and on";
+const render_bytes_data: [500]u8 = blk: {
+    var data: [500]u8 = undefined;
+    for (&data, 0..) |*byte, index| byte.* = @truncate(index * 7);
+    break :blk data;
+};
+const render_labels = [_]zerde.SortedMap(u32).Entry{
+    .{ .key = "b", .value = 2 },
+    .{ .key = "cc", .value = 4_000_000_000 },
+    .{ .key = "d\"d", .value = 0 },
+    .{ .key = "\xc3\xa9\xe2\x82\xac", .value = 1 },
+    .{ .key = long_key, .value = 9 },
+};
+const render_rows = [_][]const u16{ &.{ 1, 2, 3 }, &.{}, &.{65535} };
+
+const RenderInner = struct {
+    flag: bool,
+    note: ?[]const u8,
+    pub const serde = .{ .fields = .{ .note = .{ .optional = .nullable } } };
+};
+
+const RenderDoc = struct {
+    nothing: ?u8,
+    yes: bool,
+    no: bool,
+    big: u64,
+    neg: i64,
+    half: f64,
+    single: f64,
+    double: f64,
+    huge: f64,
+    tiny: f64,
+    zero: f64,
+    negative_zero: f64,
+    text: []const u8,
+    long_text: []const u8,
+    blob: zerde.ByteString,
+    rows: []const []const u16,
+    labels: zerde.SortedMap(u32),
+    empty_labels: zerde.SortedMap(u8),
+    inner: RenderInner,
+    pub const serde = .{ .fields = .{ .nothing = .{ .optional = .nullable } } };
+};
+
+fn sampleRenderDoc(blob: []const u8) RenderDoc {
+    return .{
+        .nothing = null,
+        .yes = true,
+        .no = false,
+        .big = std.math.maxInt(u64),
+        .neg = std.math.minInt(i64),
+        .half = 1.5,
+        .single = 100000.0,
+        .double = 0.1,
+        .huge = 1e300,
+        .tiny = 5e-324,
+        .zero = 0.0,
+        .negative_zero = -0.0,
+        .text = render_text,
+        .long_text = long_key,
+        .blob = .{ .bytes = blob },
+        .rows = &render_rows,
+        .labels = .{ .entries = &render_labels },
+        .empty_labels = .{ .entries = &.{} },
+        .inner = .{ .flag = true, .note = null },
+    };
+}
+
+test "stored CBOR is rendered as JSON in windows as it is rendered whole, for every window" {
+    // By default bytes are written as JSON strings, so they must be text; base64 takes any.
+    var stored = try writeCbor(sampleRenderDoc(long_key), .{}, .{ .deterministic = true });
+    defer stored.deinit();
+    try expectRenderWindows(.{}, stored.written());
+    var binary = try writeCbor(sampleRenderDoc(&render_bytes_data), .{}, .{ .deterministic = true });
+    defer binary.deinit();
+    try expectRenderWindows(.{ .bytes = zerde.json.BytesEncoding.base64 }, binary.written());
+    try expectRenderWindows(.{ .bytes = zerde.json.BytesEncoding.base64url, .trusted_text = true }, binary.written());
+    try std.testing.expectError(error.InvalidUtf8, renderWhole(binary.written(), .{}));
+    var render = zerde.resumable.Render(.{}).init();
+    var window: [128]u8 = undefined;
+    try std.testing.expectError(error.InvalidUtf8, render.fill(binary.written(), &window));
+    try expectRenderWindows(.{ .bytes = zerde.json.BytesEncoding.base64url, .trusted_text = true }, stored.written());
+    // The pieces of a document: a scalar, an empty container, nested empty ones, a string longer than the window.
+    inline for (.{
+        &[_]u8{0x05},
+        &[_]u8{0x20},
+        &[_]u8{0xf5},
+        &[_]u8{0xf6},
+        &[_]u8{ 0xf9, 0x3c, 0x00 },
+        &[_]u8{0x80},
+        &[_]u8{0xa0},
+        &[_]u8{ 0x82, 0x80, 0xa0 },
+        &[_]u8{ 0xa1, 0x60, 0xa1, 0x61, 'k', 0x80 },
+        &[_]u8{0x60},
+        &[_]u8{0x40},
+        &[_]u8{ 0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
+        &[_]u8{ 0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
+    }) |item| try expectRenderWindows(.{}, item);
+    // Containers 128 deep, which is as deep as there is room for.
+    const deep = try nestedCbor(127, 0x81);
+    defer allocator.free(deep);
+    try expectRenderWindows(.{}, deep);
+}
+
+test "the first window of a render refuses what cannot be rendered, with the error of the whole render, and writes nothing" {
+    const Case = struct { err: anyerror, stored: []const u8 };
+    const deep = try nestedCbor(128, 0x81);
+    defer allocator.free(deep);
+    // Faults after more than a window: the first window must already refuse them.
+    var late_nan: std.ArrayList(u8) = .empty;
+    defer late_nan.deinit(allocator);
+    try late_nan.appendSlice(allocator, &.{ 0x82, 0x79, 0x01, 0x2c });
+    try late_nan.appendNTimes(allocator, 'k', 300);
+    try late_nan.appendSlice(allocator, &.{ 0xf9, 0x7e, 0x00 });
+    var late_key: std.ArrayList(u8) = .empty;
+    defer late_key.deinit(allocator);
+    try late_key.appendSlice(allocator, &.{ 0x82, 0x79, 0x01, 0x2c });
+    try late_key.appendNTimes(allocator, 'k', 300);
+    try late_key.appendSlice(allocator, &.{ 0xa1, 0x01, 0x01 });
+    const cases = [_]Case{
+        .{ .err = error.UnexpectedType, .stored = &.{ 0xa1, 0x01, 0x01 } }, // an integer key
+        .{ .err = error.UnexpectedType, .stored = &.{ 0xa1, 0x41, 'k', 0x01 } }, // a byte string key
+        .{ .err = error.UnexpectedType, .stored = &.{ 0xa2, 0x61, 'a', 0x01, 0xf5, 0x01 } }, // a bool key, after a good entry
+        .{ .err = error.NonFiniteFloat, .stored = &.{ 0xf9, 0x7e, 0x00 } },
+        .{ .err = error.NonFiniteFloat, .stored = &.{ 0x82, 0x01, 0xf9, 0x7c, 0x00 } },
+        .{ .err = error.NonDeterministicEncoding, .stored = &.{ 0xa2, 0x61, 'b', 0x01, 0x61, 'a', 0x02 } },
+        .{ .err = error.DuplicateField, .stored = &.{ 0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02 } },
+        .{ .err = error.NonDeterministicEncoding, .stored = &.{ 0x18, 0x05 } },
+        .{ .err = error.NonDeterministicEncoding, .stored = &.{ 0x9f, 0xff } },
+        .{ .err = error.UnexpectedTag, .stored = &.{ 0xc1, 0x01 } },
+        .{ .err = error.InvalidUtf8, .stored = &.{ 0x62, 0xff, 0xff } },
+        .{ .err = error.UnexpectedEndOfInput, .stored = &.{ 0x82, 0x01 } },
+        .{ .err = error.TrailingCharacters, .stored = &.{ 0x01, 0x02 } },
+        .{ .err = error.CborNestingTooDeep, .stored = deep },
+        .{ .err = error.NonFiniteFloat, .stored = late_nan.items },
+        .{ .err = error.UnexpectedType, .stored = late_key.items },
+    };
+    for (cases, 0..) |case, number| {
+        errdefer std.debug.print("render case {d}\n", .{number});
+        try std.testing.expectError(case.err, renderWhole(case.stored, .{}));
+        var render = zerde.resumable.Render(.{}).init();
+        var window: [128]u8 = undefined;
+        try std.testing.expectError(case.err, render.fill(case.stored, &window));
+    }
+    // A window smaller than one token is refused, and the item is not touched.
+    var render = zerde.resumable.Render(.{}).init();
+    var small: [zerde.resumable.Render(.{}).min_window - 1]u8 = undefined;
+    try std.testing.expectError(error.WindowTooSmall, render.fill(&.{0x05}, &small));
+}

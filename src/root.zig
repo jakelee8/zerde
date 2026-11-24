@@ -40,6 +40,8 @@ pub const reflect = @import("reflect.zig");
 pub const wire = @import("wire.zig");
 /// A typed value written in fixed windows, resumably; see `resumable.zig`.
 pub const resumable = @import("resumable.zig");
+/// A strict CBOR reader fed in chunks, under `resumable.Decoder`; see `chunk.zig`.
+pub const chunk = @import("chunk.zig");
 /// A CBOR frame as a skeleton and references to the byte strings it leaves out; see `gather.zig`.
 pub const gather = @import("gather.zig");
 /// A map with data keys as a sorted slice of entries; see `sorted.zig`.

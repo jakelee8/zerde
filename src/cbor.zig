@@ -140,7 +140,7 @@ pub fn encodeKey(comptime key: meta.FieldKey) []const u8 {
 }
 
 /// Writes the shortest head for `major` and `value` into `out` and returns its length.
-fn writeHead(out: []u8, major: u8, value: u64) usize {
+pub fn writeHead(out: []u8, major: u8, value: u64) usize {
     const initial = major << 5;
     if (value < 24) {
         out[0] = initial | @as(u8, @intCast(value));
@@ -188,7 +188,7 @@ const KeyOrder = struct {
     zeros: u2 = 0,
 };
 
-const Header = struct {
+pub const Header = struct {
     major: u8,
     ai: u8,
     value: u64,
@@ -432,9 +432,14 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             return true;
         }
 
-        /// The key of an entry of a map whose keys are data (`SortedMap`): text, as a field name is.
-        pub fn beginMapKey(self: *Self, key: []const u8) !void {
-            try encodeText(self.writer, key, readOption(self.cfg, "trusted_text", false));
+        /// The start of an entry of a map whose keys are data (`SortedMap`), and the end of its key; the key, text, is written between
+        /// them as any text is (`emitString`, or `emitStringPart` in windows). A CBOR map has nothing to put at either.
+        pub fn beginMapEntry(self: *Self) !void {
+            _ = self;
+        }
+
+        pub fn endMapKey(self: *Self) !void {
+            _ = self;
         }
 
         pub fn beginStructFieldInteger(self: *Self, comptime Parent: type, comptime key: i128, comptime FieldType: type) !bool {
@@ -1403,7 +1408,7 @@ pub fn CborDeserializer(comptime Config: type) type {
 /// the same key when they are numerically equal, so -0.0 is 0.0, and two NaNs are the same key when
 /// they have the same significand after zero-extension to 64 bits (their sign is not compared).
 /// The value of a float head, widened to a double.
-fn floatValue(header: Header) f64 {
+pub fn floatValue(header: Header) f64 {
     return switch (header.ai) {
         25 => @floatCast(@as(f16, @bitCast(@as(u16, @intCast(header.value))))),
         26 => @floatCast(@as(f32, @bitCast(@as(u32, @intCast(header.value))))),
@@ -1514,16 +1519,30 @@ fn skipTrusted(input: []const u8, index: *usize, depth: usize) !void {
 /// ascend strictly, so none repeats. Without it a repeated key is not looked for: that needs an
 /// allocation, which `validate` has.
 fn verifyItem(input: []const u8, deterministic: bool) !void {
+    try verifyAs(input, deterministic, .write);
+}
+
+/// `verifyItem` as a strict read checks an item: a repeated key is `error.DuplicateField`, and with `check_text` false (a read
+/// under `trusted_text`) text is not checked as UTF-8. A resumable read of a `Raw` uses it on the item once it is whole.
+pub fn verifyStrict(input: []const u8, check_text: bool) !void {
+    try verifyAs(input, true, if (check_text) .read else .read_trusted);
+}
+
+/// Whose rules `checkItem` applies: a write's (a repeated key is `NonDeterministicEncoding`, text is checked) or a strict
+/// read's (a repeated key is `DuplicateField`, text is checked unless `trusted_text`).
+const Check = enum { write, read, read_trusted };
+
+fn verifyAs(input: []const u8, deterministic: bool, check: Check) !void {
     var index: usize = 0;
     var zero = false;
-    try checkItem(input, &index, 0, deterministic, &zero);
+    try checkItem(input, &index, 0, deterministic, &zero, check);
     if (index != input.len) return error.TrailingCharacters;
 }
 
 /// `zero` is set when the item holds a float zero, which a deterministic check needs for a key: 0.0 and -0.0
 /// are one key (RFC 8949 section 5.6.1), so a map may not have both, and a key that holds one is refused, as a
 /// strict read does (`CborDeserializer.recordKeyItem`).
-fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool, zero: *bool) anyerror!void {
+fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool, zero: *bool, check: Check) anyerror!void {
     var header = try parseHeader(input, index);
     while (header.major == 6) {
         // A tag adds no nesting; a strict reader refuses it.
@@ -1546,9 +1565,9 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
                 }
                 const chunk = try parseHeader(input, index);
                 if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;
-                try checkString(input, index, chunk);
+                try checkString(input, index, chunk, check != .read_trusted);
             }
-        } else try checkString(input, index, header),
+        } else try checkString(input, index, header, check != .read_trusted),
         else => {
             if (depth >= max_nesting) return error.CborNestingTooDeep;
             const per: u64 = if (header.major == 5) 2 else 1;
@@ -1560,7 +1579,7 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
                         break;
                     }
                     var step: u64 = 0;
-                    while (step < per) : (step += 1) try checkItem(input, index, depth + 1, deterministic, zero);
+                    while (step < per) : (step += 1) try checkItem(input, index, depth + 1, deterministic, zero, check);
                 }
             } else {
                 var order: KeyOrder = .{};
@@ -1568,17 +1587,21 @@ fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool
                 while (count < header.value) : (count += 1) {
                     const key_start = index.*;
                     var key_zero = false;
-                    try checkItem(input, index, depth + 1, deterministic, &key_zero);
+                    try checkItem(input, index, depth + 1, deterministic, &key_zero, check);
                     zero.* = zero.* or key_zero;
                     if (per == 2) {
                         if (deterministic) {
                             const key = input[key_start..index.*];
-                            if (order.end != 0 and !std.mem.lessThan(u8, input[order.start..order.end], key)) return error.NonDeterministicEncoding;
+                            if (order.end != 0) {
+                                const before = input[order.start..order.end];
+                                if (check != .write and std.mem.eql(u8, before, key)) return error.DuplicateField;
+                                if (!std.mem.lessThan(u8, before, key)) return error.NonDeterministicEncoding;
+                            }
                             order.start = key_start;
                             order.end = index.*;
                             if (key_zero) try noteZeroKey(&order, key);
                         }
-                        try checkItem(input, index, depth + 1, deterministic, zero);
+                        try checkItem(input, index, depth + 1, deterministic, zero, check);
                     }
                 }
             }
@@ -1594,10 +1617,10 @@ fn noteZeroKey(order: *KeyOrder, key: []const u8) !void {
     if (order.zeros == 3) return error.DuplicateField;
 }
 
-fn checkString(input: []const u8, index: *usize, header: Header) !void {
+fn checkString(input: []const u8, index: *usize, header: Header, check_text: bool) !void {
     if (header.value > input.len - index.*) return error.UnexpectedEndOfInput;
     const end = index.* + @as(usize, @intCast(header.value));
-    if (header.major == 3 and !bulk.validUtf8(input[index.*..end])) return error.InvalidUtf8;
+    if (check_text and header.major == 3 and !bulk.validUtf8(input[index.*..end])) return error.InvalidUtf8;
     index.* = end;
 }
 
@@ -1749,9 +1772,9 @@ const CanonicalWriter = struct {
                 },
                 else => {},
             }
-            try checkItem(self.input, index, depth + 1, false, &zero);
+            try checkItem(self.input, index, depth + 1, false, &zero, .write);
             const value = index.*;
-            try checkItem(self.input, index, depth + 1, false, &zero);
+            try checkItem(self.input, index, depth + 1, false, &zero, .write);
             if (self.top == self.entries.len) return error.OutOfMemory;
             self.entries[self.top] = .{ .key = @intCast(key), .value = @intCast(value) };
             self.top += 1;
@@ -2630,7 +2653,7 @@ pub fn parseSliceAliasedWith(
 /// Reads one head and checks that it is well-formed: a reserved additional-info value, an
 /// indefinite length on a type that has none, and a two-byte simple value below 32 are all refused
 /// (RFC 8949 §3.3 and Appendix C). A length written longer than it needs to be is accepted.
-fn parseHeader(input: []const u8, cursor: *usize) !Header {
+pub fn parseHeader(input: []const u8, cursor: *usize) !Header {
     if (cursor.* >= input.len) return error.UnexpectedEndOfInput;
 
     const initial = input[cursor.*];
@@ -2833,7 +2856,7 @@ fn checkLimits(comptime cfg: anytype) void {
 }
 
 /// Whether a head with a length argument is written in the fewest bytes (RFC 8949 §4.2.1).
-fn isShortestHead(header: Header) bool {
+pub fn isShortestHead(header: Header) bool {
     if (header.major == 7 or header.indefinite) return true;
     return switch (header.ai) {
         24 => header.value >= 24,
@@ -2846,7 +2869,7 @@ fn isShortestHead(header: Header) bool {
 
 /// Whether a float head is the preferred serialization of RFC 8949 §4.2.2: the shortest of half,
 /// single and double that keeps the value, and NaN only as `0xf97e00`.
-fn isPreferredFloat(header: Header) bool {
+pub fn isPreferredFloat(header: Header) bool {
     switch (header.ai) {
         25 => {
             const half: f16 = @bitCast(@as(u16, @intCast(header.value)));

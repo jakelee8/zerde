@@ -67,6 +67,46 @@ pub fn validUtf8(bytes: []const u8) bool {
     return validUtf8Words(bytes);
 }
 
+/// UTF-8 checked a piece at a time, as a stream delivers it: `feed` says whether a piece is valid after what came before,
+/// and keeps the bytes of a sequence the piece ends inside (at most three) for the next; `done` says that none is left
+/// unfinished. What it accepts is what `validUtf8` accepts of the pieces joined.
+pub const Utf8Stream = struct {
+    tail: [4]u8 = undefined,
+    len: usize = 0,
+
+    pub fn feed(self: *Utf8Stream, piece: []const u8) bool {
+        var rest = piece;
+        if (self.len != 0) {
+            const need = std.unicode.utf8ByteSequenceLength(self.tail[0]) catch return false;
+            const take = @min(need - self.len, rest.len);
+            @memcpy(self.tail[self.len..][0..take], rest[0..take]);
+            self.len += take;
+            rest = rest[take..];
+            if (self.len < need) return true;
+            if (!std.unicode.utf8ValidateSlice(self.tail[0..need])) return false;
+            self.len = 0;
+        }
+        // An incomplete sequence at the end waits for the next piece.
+        var end = rest.len;
+        var back: usize = 0;
+        while (back < 3 and back < rest.len) : (back += 1) {
+            const byte = rest[rest.len - 1 - back];
+            if (byte & 0xc0 == 0x80) continue;
+            const need = std.unicode.utf8ByteSequenceLength(byte) catch break;
+            if (need > back + 1) end = rest.len - 1 - back;
+            break;
+        }
+        if (!validUtf8(rest[0..end])) return false;
+        self.len = rest.len - end;
+        @memcpy(self.tail[0..self.len], rest[end..]);
+        return true;
+    }
+
+    pub fn done(self: Utf8Stream) bool {
+        return self.len == 0;
+    }
+};
+
 /// Whether `bytes` is valid UTF-8, skipping ASCII eight bytes at a time. Text that is not ASCII is
 /// checked by the standard library's decoder, a region at a time: from the first byte of a word with
 /// a high bit to the end of the run of such words.
@@ -307,4 +347,51 @@ test "writeEscaped fills the spare room of the writer exactly, and falls back wh
     try after.writeAll("pre:");
     try writeEscaped(&after, "\"x\n");
     try std.testing.expectEqualStrings("pre:\\\"x\\n", after.buffered());
+}
+
+/// Whether the pieces, fed one after another, are valid UTF-8 as a whole: what `validUtf8` says of them joined.
+fn streamValid(pieces: []const []const u8) bool {
+    var stream: Utf8Stream = .{};
+    for (pieces) |piece| if (!stream.feed(piece)) return false;
+    return stream.done();
+}
+
+test "Utf8Stream says of pieces what validUtf8 says of the whole, whichever way it is cut" {
+    // Valid and invalid text of every kind of sequence: ASCII, each length of sequence, overlong forms, surrogates, a lone
+    // continuation, a lead with nothing after it, and bytes no sequence has.
+    const texts = [_][]const u8{
+        "",             "plain ascii",      "\xc3\xa9",             "a\xe2\x82\xacb",   "\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80\xf0\x9f\x98\x81x",
+        "\xc0\x80",     "\xe0\x80\x80",     "\xed\xa0\x80",         "\x80",             "\xc3",             "a\xe2\x82",
+        "\xf0\x9f\x98", "\xff",             "\xf8\x88\x80\x80\x80", "\xf4\x90\x80\x80", "\xe2\x82\xac\xe2", "ab\xc3\xa9\xc3",
+        "\xe2\x28\xa1", "\xf0\x28\x8c\xbc",
+    };
+    for (texts) |text| {
+        const expected = validUtf8(text);
+        try std.testing.expectEqual(expected, streamValid(&.{text}));
+        for (0..text.len + 1) |first| {
+            try std.testing.expectEqual(expected, streamValid(&.{ text[0..first], text[first..] }));
+            for (first..text.len + 1) |second| {
+                try std.testing.expectEqual(expected, streamValid(&.{ text[0..first], text[first..second], text[second..] }));
+            }
+        }
+        // One byte at a time.
+        var stream: Utf8Stream = .{};
+        var ok = true;
+        for (text) |byte| ok = ok and stream.feed(&.{byte});
+        try std.testing.expectEqual(expected, ok and stream.done());
+    }
+    // Many short strings of bytes that are mostly the high ones sequences are made of.
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    const alphabet = [_]u8{ 0x41, 0x7f, 0x80, 0xa0, 0xbf, 0xc2, 0xc3, 0xdf, 0xe0, 0xe1, 0xed, 0xef, 0xf0, 0xf1, 0xf4, 0xf5, 0xff };
+    for (0..4000) |_| {
+        var buffer: [10]u8 = undefined;
+        const len = random.uintAtMost(usize, buffer.len);
+        for (buffer[0..len]) |*byte| byte.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        const text = buffer[0..len];
+        const expected = validUtf8(text);
+        const cut = random.uintAtMost(usize, len);
+        const second = cut + random.uintAtMost(usize, len - cut);
+        try std.testing.expectEqual(expected, streamValid(&.{ text[0..cut], text[cut..second], text[second..] }));
+    }
 }

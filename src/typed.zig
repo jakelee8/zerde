@@ -10,6 +10,8 @@ const Allocator = std.mem.Allocator;
 const diagnostic_mod = @import("diagnostic.zig");
 const meta = @import("meta.zig");
 const sorted = @import("sorted.zig");
+const bulk = @import("bulk.zig");
+const resume_read = @import("typed_resume.zig");
 
 pub const Error = Allocator.Error || error{
     UnsupportedType,
@@ -227,7 +229,9 @@ fn keyLess(comptime field_order: meta.FieldOrder, a: []const u8, b: []const u8) 
 
 /// Entry point used by `root.zig` once a format-specific deserializer has been created.
 pub fn deserialize(comptime T: type, allocator: Allocator, deserializer: anytype, comptime cfg: anytype) anyerror!T {
-    return deserializeValue(TypedSink{}, T, allocator, deserializer, cfg, null, false);
+    var result: T = undefined;
+    try deserializeValue(TypedSink{}, T, &result, allocator, deserializer, cfg, null, false, NoRead{});
+    return result;
 }
 
 pub fn deserializeWithDiagnostics(
@@ -237,7 +241,9 @@ pub fn deserializeWithDiagnostics(
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
 ) anyerror!T {
-    return deserializeValue(TypedSink{}, T, allocator, deserializer, cfg, diagnostics, true);
+    var result: T = undefined;
+    try deserializeValue(TypedSink{}, T, &result, allocator, deserializer, cfg, diagnostics, true, NoRead{});
+    return result;
 }
 
 /// Where a resumable write is. A write into a window that fills up stops at a token and keeps, for each open
@@ -487,27 +493,56 @@ fn serializeValue(
                 return;
             }
             if (comptime isSortedMap(T)) {
-                if (comptime resumable) @compileError("a resumable write cannot write a sorted map: " ++ @typeName(T));
-                if (!@hasDecl(SerializerType, "beginMapKey")) @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a sorted map: " ++ @typeName(T));
+                if (!@hasDecl(SerializerType, "beginMapEntry")) @compileError("format " ++ @typeName(SerializerType) ++ " cannot write a sorted map: " ++ @typeName(T));
+                var local: Level = .{};
+                const level: *Level = if (comptime resumable) try rc.enter() else &local;
+                defer if (comptime resumable) rc.leave();
                 // The entries are written as they are, in order, and refused if they are not: what goes out is in key order.
-                if (@hasDecl(SerializerType, "beginStructSized")) {
-                    try serializer.beginStructSized(T, value.entries.len);
-                } else {
-                    try serializer.beginStruct(T);
+                if (!level.entered) {
+                    try reserveRoom(rc, atomic_room);
+                    if (@hasDecl(SerializerType, "beginStructSized")) {
+                        try serializer.beginStructSized(T, value.entries.len);
+                    } else {
+                        try serializer.beginStruct(T);
+                    }
+                    level.entered = true;
                 }
-                var previous: ?[]const u8 = null;
-                for (value.entries) |entry| {
-                    if (previous) |before| switch (sorted.order(before, entry.key)) {
-                        .lt => {},
-                        .eq => return error.DuplicateField,
-                        .gt => return error.NonDeterministicEncoding,
-                    };
-                    previous = entry.key;
-                    try serializer.beginMapKey(entry.key);
-                    try serializeValue(serializer, entry.value, cfg, Format, order_policy, rc);
+                // An entry is its key (a text, which a window may end inside), its value, and the tokens around them: `phase` is the
+                // part it is in, 0 for the start, 1 the key, 2 after the key, 3 the value, and `index` the entries done.
+                var index: usize = level.index;
+                while (index < value.entries.len) : (index += 1) {
+                    const entry = value.entries[index];
+                    if (level.phase == 0) {
+                        if (index > 0) switch (sorted.order(value.entries[index - 1].key, entry.key)) {
+                            .lt => {},
+                            .eq => return error.DuplicateField,
+                            .gt => return error.NonDeterministicEncoding,
+                        };
+                        try reserveRoom(rc, atomic_room);
+                        try serializer.beginMapEntry();
+                        level.phase = 1;
+                    }
+                    if (level.phase == 1) {
+                        try emitText(serializer, rc, .string, entry.key);
+                        level.phase = 2;
+                    }
+                    if (level.phase == 2) {
+                        try reserveRoom(rc, atomic_room);
+                        try serializer.endMapKey();
+                        level.phase = 3;
+                    }
+                    if (level.phase == 3) {
+                        try serializeValue(serializer, entry.value, cfg, Format, order_policy, rc);
+                        level.phase = 4;
+                    }
+                    try reserveRoom(rc, atomic_room);
                     try serializer.endStructField(T, "entry", @TypeOf(entry.value));
+                    level.phase = 0;
+                    level.index = @intCast(index + 1);
                 }
+                try reserveRoom(rc, atomic_room);
                 try serializer.endStruct(T);
+                level.* = .{};
                 return;
             }
             if (info.is_tuple) @compileError("tuple structs are not supported: " ++ @typeName(T));
@@ -757,8 +792,11 @@ fn omitField(comptime T: type, comptime field_name: []const u8, comptime FieldTy
 /// builds its fixed layout (`wire.Wire(T)`) straight from the reader. Every rule of a read (what a token
 /// may be, bounds, field keys, optionals, unions, defaults, unknown and repeated fields, `check`) is in this
 /// one walk, and a sink says only how a result is assembled, so a layout has no second copy of a rule.
-/// A sink has `Of(T)`, the type of the result for `T`, and `scalar`, `text`, `bytesOf`, `list`, `some`,
-/// `none`, `enumOf`, `unionOf`, `unionVoid`, `fromDefault`, `check` and `free`, as `TypedSink` shows.
+/// The walk is destination-passing: a value is read into the `*Of(T)` the caller gives, so what a container has
+/// built so far is in the destination and not in a frame of the walk, which is what lets a resumable read
+/// (`ReadLevel`) stop in the middle of one. A sink has `Of(T)`, the type of the result for `T`, and `scalar`,
+/// `text`, `bytesOf`, `list`, `someDest`, `none`, `enumOf`, `unionDest`, `unionVoid`, `fromDefault`, `check` and
+/// `free`, as `TypedSink` shows.
 pub const TypedSink = struct {
     pub fn Of(comptime T: type) type {
         return T;
@@ -782,8 +820,11 @@ pub const TypedSink = struct {
         return items;
     }
 
-    pub fn some(_: TypedSink, comptime T: type, value: @typeInfo(T).optional.child) !T {
-        return value;
+    /// Makes `dest` the present optional and gives its value to read into; with `init` false it is present already
+    /// (a resumable read coming back to a value it began).
+    pub fn someDest(_: TypedSink, comptime T: type, dest: *T, init: bool) *@typeInfo(T).optional.child {
+        if (init) dest.* = @as(@typeInfo(T).optional.child, undefined);
+        return &dest.*.?;
     }
 
     pub fn none(_: TypedSink, comptime T: type) !T {
@@ -794,8 +835,11 @@ pub const TypedSink = struct {
         return value;
     }
 
-    pub fn unionOf(_: TypedSink, comptime T: type, comptime name: []const u8, payload: anytype) !T {
-        return @unionInit(T, name, payload);
+    /// Makes `dest` the variant `name` and gives its payload to read into; with `init` false it is that variant
+    /// already.
+    pub fn unionDest(_: TypedSink, comptime T: type, comptime name: []const u8, dest: *T, init: bool) *@FieldType(T, name) {
+        if (init) dest.* = @unionInit(T, name, undefined);
+        return &@field(dest.*, name);
     }
 
     pub fn unionVoid(_: TypedSink, comptime T: type, comptime name: []const u8) !T {
@@ -820,20 +864,77 @@ pub const TypedSink = struct {
 
 /// Reads one `T` as `sink` builds it: the typed walk, for a sink of another layout (see `TypedSink`).
 pub fn deserializeInto(sink: anytype, comptime T: type, allocator: Allocator, deserializer: anytype, comptime cfg: anytype) anyerror!@TypeOf(sink).Of(T) {
-    return deserializeValue(sink, T, allocator, deserializer, cfg, null, false);
+    var result: @TypeOf(sink).Of(T) = undefined;
+    try deserializeValue(sink, T, &result, allocator, deserializer, cfg, null, false, NoRead{});
+    return result;
 }
 
-fn deserializeValue(
+/// One step of a resumable read into `dest`: `deserializer` is a chunk reader (`chunk.Reader`) and `rc` the state
+/// (`typed_resume.State`). `error.NeedMore` says the chunk is used up and the step is to be made again, with the
+/// same `dest` and `rc`, once the reader has the next chunk; success says `dest` holds the value. After any other
+/// error `dest` and `rc` are not to be used again, and nothing is freed: a resumable read takes its memory from an
+/// arena or a fixed buffer.
+pub fn deserializeResumable(
+    sink: anytype,
+    comptime T: type,
+    dest: *@TypeOf(sink).Of(T),
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    rc: anytype,
+) anyerror!void {
+    try deserializeValue(sink, T, dest, allocator, deserializer, cfg, null, false, rc);
+}
+
+/// Marks a read that is not resumable: every resume step compiles to nothing.
+pub const NoRead = struct {};
+
+/// What a resumable read keeps for one open container, optional or union between calls. The walk goes down the same
+/// path again at each call, and each level skips what it has done and goes on from here; what the numbers mean is
+/// said where each is used (`typed_resume.zig`).
+pub const ReadLevel = struct {
+    phase: u8 = 0,
+    /// Items or entries complete.
+    index: usize = 0,
+    /// Items or entries the container states.
+    count: usize = 0,
+    /// A struct: the fields before this rank have a value, read or resolved as absent.
+    cursor: usize = 0,
+    /// A struct's field rank or a union's variant, from the key just read.
+    pick: usize = 0,
+    /// A list or a sorted map: the array its head allocated, in the sink's element type.
+    items: ?*anyopaque = null,
+    /// A sorted map: the key of the entry before.
+    prev: []const u8 = &.{},
+    /// A struct: a required field has no key, which is said at the end.
+    missing: bool = false,
+};
+
+/// The string, key or `Raw` a resumable read is in the middle of: its length, how much of it has come, and where
+/// it goes. Only one is in flight at a time, so a read has one.
+pub const ReadLeaf = struct {
+    started: bool = false,
+    len: usize = 0,
+    at: usize = 0,
+    buf: []u8 = &.{},
+    /// A text that is dropped, not kept (a key longer than every name), is still checked as UTF-8, a piece at a time.
+    utf8: bulk.Utf8Stream = .{},
+};
+
+pub fn deserializeValue(
     s: anytype,
     comptime T: type,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     const DeserializerType = @TypeOf(deserializer.*);
     if (comptime hasHook(T, "zerdeDecode")) {
+        if (comptime @TypeOf(rc) != NoRead) @compileError("a resumable read cannot call the decode hook of " ++ @typeName(T));
         if (!@hasDecl(DeserializerType, "pullView")) {
             @compileError("format " ++ @typeName(DeserializerType) ++ " cannot call the decode hook of " ++ @typeName(T));
         }
@@ -845,57 +946,89 @@ fn deserializeValue(
             freeTypedPartial(T, allocator, decoded, @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings());
             return error.HookIncomplete;
         }
-        return decoded;
+        dest.* = decoded;
+        return;
     }
-    return switch (@typeInfo(T)) {
-        .bool => try s.scalar(T, try deserializer.readBool()),
+    switch (@typeInfo(T)) {
+        .bool => dest.* = try s.scalar(T, try deserializer.readBool()),
         // Formats parse numbers once into a common token; the typed layer is responsible for exact casts.
-        .int, .comptime_int => try s.scalar(T, if (@hasDecl(DeserializerType, "readInt"))
+        .int, .comptime_int => dest.* = try s.scalar(T, if (@hasDecl(DeserializerType, "readInt"))
             try deserializer.readInt(T)
         else
             try decodeIntNumber(T, try deserializer.readNumber())),
-        .float, .comptime_float => try s.scalar(T, if (@hasDecl(DeserializerType, "readFloat"))
+        .float, .comptime_float => dest.* = try s.scalar(T, if (@hasDecl(DeserializerType, "readFloat"))
             try deserializer.readFloat(T)
         else
             try decodeFloatNumber(T, try deserializer.readNumber())),
-        .optional => |info| blk: {
-            if (@typeInfo(info.child) == .optional) {
-                @compileError("a nested optional is only supported as a struct field, where an absent field and null differ: " ++ @typeName(T));
-            }
-            if (@hasDecl(DeserializerType, "readOptionalPresent")) {
-                if (!try deserializer.readOptionalPresent()) break :blk try s.none(T);
+        .optional => |info| try deserializeOptional(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}, rc),
+        .@"enum" => dest.* = try s.enumOf(T, try decodeEnumValue(T, allocator, deserializer, cfg, rc)),
+        .@"union" => |info| try deserializeUnion(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc),
+        .array => |info| try deserializeArray(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc),
+        .pointer => |info| try deserializePointer(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}, rc),
+        .@"struct" => |info| {
+            if (T == ByteString) {
+                dest.* = try s.bytesOf(T, try readByteSlice(allocator, deserializer, .{}, rc));
+            } else if (comptime isRaw(T)) {
+                dest.* = try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, .{}, rc));
             } else {
-                if (try deserializer.peekKind() == .null) {
-                    try deserializer.readNull();
-                    break :blk try s.none(T);
-                }
+                try deserializeStruct(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
             }
-            break :blk try s.some(T, try deserializeValue(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics));
         },
-        .@"enum" => try s.enumOf(T, try decodeEnumValue(T, allocator, deserializer, cfg)),
-        .@"union" => |info| try deserializeUnion(s, T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
-        .array => |info| try deserializeArray(s, T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
-        .pointer => |info| try deserializePointer(s, T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}),
-        .@"struct" => |info| if (T == ByteString)
-            try s.bytesOf(T, try readByteSlice(allocator, deserializer, .{}))
-        else if (comptime isRaw(T))
-            try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, .{}))
-        else
-            try deserializeStruct(s, T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics),
-        else => error.UnsupportedType,
-    };
+        else => return error.UnsupportedType,
+    }
+}
+
+/// An optional: null, or a value read as its child is, with the child's `bounds` if the field has any. A resumable
+/// read decides once (`phase` 0), at the head of the value, and goes on into the child from then on.
+fn deserializeOptional(
+    s: anytype,
+    comptime T: type,
+    comptime info: std.builtin.Type.Optional,
+    dest: *@TypeOf(s).Of(T),
+    allocator: Allocator,
+    deserializer: anytype,
+    comptime cfg: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track_diagnostics: bool,
+    comptime bounds: meta.Bounds,
+    rc: anytype,
+) anyerror!void {
+    if (@typeInfo(info.child) == .optional) {
+        @compileError("a nested optional is only supported as a struct field, where an absent field and null differ: " ++ @typeName(T));
+    }
+    var local: ReadLevel = .{};
+    const level: *ReadLevel = if (comptime @TypeOf(rc) != NoRead) rc.enter() else &local;
+    defer if (comptime @TypeOf(rc) != NoRead) rc.leave();
+    const first = level.phase == 0;
+    if (first) {
+        if (try readNullIfPresent(deserializer)) {
+            dest.* = try s.none(T);
+            level.* = .{};
+            return;
+        }
+        level.phase = 1;
+    }
+    const child_dest = s.someDest(T, dest, first);
+    if (comptime bounds.isDefault()) {
+        try deserializeValue(s, info.child, child_dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
+    } else {
+        try deserializeBounded(s, info.child, bounds, child_dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
+    }
+    level.* = .{};
 }
 
 fn deserializeUnion(
     s: anytype,
     comptime T: type,
     comptime info: std.builtin.Type.Union,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     const DeserializerType = @TypeOf(deserializer.*);
     if (info.tag_type == null) @compileError("an untagged union cannot be deserialized: " ++ @typeName(T));
     if (!@hasDecl(DeserializerType, "supports_unions")) {
@@ -906,6 +1039,7 @@ fn deserializeUnion(
     if (integer_keys and !@hasDecl(DeserializerType, "supports_integer_keys")) {
         @compileError("format " ++ @typeName(DeserializerType) ++ " does not support integer keys: " ++ @typeName(T));
     }
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.unionValue(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
 
     switch (try deserializer.peekKind()) {
         .string => {
@@ -917,14 +1051,20 @@ fn deserializeUnion(
                     .long => return error.InvalidEnumTag,
                 };
                 inline for (info.field_names, info.field_types) |variant, FieldType| {
-                    if (FieldType == void and variantHasText(T, variant, cfg, name)) return try s.unionVoid(T, variant);
+                    if (FieldType == void and variantHasText(T, variant, cfg, name)) {
+                        dest.* = try s.unionVoid(T, variant);
+                        return;
+                    }
                 }
                 return error.InvalidEnumTag;
             }
             const token = try deserializer.readString(allocator);
             defer token.deinit(allocator);
             inline for (info.field_names, info.field_types) |name, FieldType| {
-                if (FieldType == void and variantHasText(T, name, cfg, token.bytes)) return try s.unionVoid(T, name);
+                if (FieldType == void and variantHasText(T, name, cfg, token.bytes)) {
+                    dest.* = try s.unionVoid(T, name);
+                    return;
+                }
             }
             return error.InvalidEnumTag;
         },
@@ -935,7 +1075,10 @@ fn deserializeUnion(
                 .float => return error.UnexpectedType,
             };
             inline for (info.field_names, info.field_types) |name, FieldType| {
-                if (FieldType == void and variantHasInteger(T, name, cfg, number)) return try s.unionVoid(T, name);
+                if (FieldType == void and variantHasInteger(T, name, cfg, number)) {
+                    dest.* = try s.unionVoid(T, name);
+                    return;
+                }
             }
             return error.InvalidEnumTag;
         },
@@ -948,21 +1091,20 @@ fn deserializeUnion(
             const key = (try nextUnionKey(deserializer, allocator, cap, &buffer)) orelse return error.LengthMismatch;
             defer key.deinit(allocator);
 
-            const result: @TypeOf(s).Of(T) = blk: {
-                inline for (info.field_names, info.field_types) |name, FieldType| {
-                    const matches = switch (key.value) {
-                        .text => |bytes| variantHasText(T, name, cfg, bytes),
-                        .integer => |number| variantHasInteger(T, name, cfg, number),
-                        .long => false,
-                    };
-                    if (FieldType != void and matches) {
-                        const payload = try deserializeFieldValue(s, FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name, meta.effectiveBounds(T, name, cfg));
-                        break :blk try s.unionOf(T, name, payload);
-                    }
+            var matched = false;
+            inline for (info.field_names, info.field_types) |name, FieldType| {
+                const matches = switch (key.value) {
+                    .text => |bytes| variantHasText(T, name, cfg, bytes),
+                    .integer => |number| variantHasInteger(T, name, cfg, number),
+                    .long => false,
+                };
+                if (FieldType != void and matches) {
+                    matched = true;
+                    try deserializeFieldValue(s, FieldType, s.unionDest(T, name, dest, true), allocator, deserializer, cfg, diagnostics, track_diagnostics, name, meta.effectiveBounds(T, name, cfg), rc);
                 }
-                return error.InvalidEnumTag;
-            };
-            errdefer s.free(T, allocator, result, borrowed_strings);
+            }
+            if (!matched) return error.InvalidEnumTag;
+            errdefer s.free(T, allocator, dest.*, borrowed_strings);
 
             // A union is one entry: a second one is not another variant.
             var extra_buffer: [cap]u8 = undefined;
@@ -970,7 +1112,6 @@ fn deserializeUnion(
                 extra.deinit(allocator);
                 return error.LengthMismatch;
             }
-            return result;
         },
         else => return error.UnexpectedType,
     }
@@ -994,7 +1135,7 @@ pub const ObjectKeyShort = union(enum) {
 
 /// The length in bytes of the longest text key of a union's variants, or of an enum's names, which a key
 /// is compared with.
-fn longestVariantName(comptime T: type, comptime info: std.builtin.Type.Union, comptime cfg: anytype) usize {
+pub fn longestVariantName(comptime T: type, comptime info: std.builtin.Type.Union, comptime cfg: anytype) usize {
     comptime {
         var longest: usize = 0;
         for (info.field_names) |name| {
@@ -1007,7 +1148,7 @@ fn longestVariantName(comptime T: type, comptime info: std.builtin.Type.Union, c
     }
 }
 
-fn longestEnumName(comptime info: std.builtin.Type.Enum) usize {
+pub fn longestEnumName(comptime info: std.builtin.Type.Enum) usize {
     comptime {
         var longest: usize = 0;
         for (info.field_names) |name| longest = @max(longest, name.len);
@@ -1049,21 +1190,21 @@ fn nextUnionKey(deserializer: anytype, allocator: Allocator, comptime cap: usize
     return .{ .value = .{ .text = token.bytes }, .token = token };
 }
 
-fn unionHasIntegerKeys(comptime T: type, comptime info: std.builtin.Type.Union, comptime cfg: anytype) bool {
+pub fn unionHasIntegerKeys(comptime T: type, comptime info: std.builtin.Type.Union, comptime cfg: anytype) bool {
     inline for (info.field_names) |name| {
         if (meta.effectiveFieldKey(T, name, cfg) == .integer) return true;
     }
     return false;
 }
 
-fn variantHasText(comptime T: type, comptime name: []const u8, comptime cfg: anytype, bytes: []const u8) bool {
+pub fn variantHasText(comptime T: type, comptime name: []const u8, comptime cfg: anytype, bytes: []const u8) bool {
     return switch (comptime meta.effectiveFieldKey(T, name, cfg)) {
         .text => |text| std.mem.eql(u8, bytes, text),
         .integer => false,
     };
 }
 
-fn variantHasInteger(comptime T: type, comptime name: []const u8, comptime cfg: anytype, number: i128) bool {
+pub fn variantHasInteger(comptime T: type, comptime name: []const u8, comptime cfg: anytype, number: i128) bool {
     return switch (comptime meta.effectiveFieldKey(T, name, cfg)) {
         .text => false,
         .integer => |key| key == number,
@@ -1095,11 +1236,12 @@ pub fn narrowFloat(comptime T: type, wide: f64) Error!T {
     return narrowed;
 }
 
-fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype, comptime cfg: anytype) anyerror!T {
+fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype, comptime cfg: anytype, rc: anytype) anyerror!T {
     const DeserializerType = @TypeOf(deserializer.*);
     if (@hasDecl(DeserializerType, "readEnumTag")) {
         return try deserializer.readEnumTag(T);
     }
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.enumValue(T, deserializer, cfg, rc);
 
     return switch (try deserializer.peekKind()) {
         .string => blk: {
@@ -1134,13 +1276,17 @@ fn deserializeArray(
     s: anytype,
     comptime T: type,
     comptime info: std.builtin.Type.Array,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     const DeserializerType = @TypeOf(deserializer.*);
+    const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.array(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
 
     if (info.child == u8) {
         // A byte array is read from the format's byte-string token, never from a text string.
@@ -1150,53 +1296,60 @@ fn deserializeArray(
         if (token.bytes.len != info.len) return error.LengthMismatch;
         var result: T = undefined;
         @memcpy(result[0..], token.bytes);
-        return try s.scalar(T, result);
+        dest.* = try s.scalar(T, result);
+        return;
     }
 
     const known_len = try beginArrayWithKnownLen(deserializer);
     if (known_len) |len| {
         if (len != info.len) return error.LengthMismatch;
     }
-    var result: @TypeOf(s).Of(T) = undefined;
+    // The elements read so far are released if a later one fails.
+    var initialized: usize = 0;
+    errdefer for (dest[0..initialized]) |item| s.free(info.child, allocator, item, borrowed_strings);
 
     if (known_len) |_| {
         if (@hasDecl(DeserializerType, "finishKnownLenArray")) {
             inline for (0..info.len) |index| {
-                result[index] = try deserializeIndexedValue(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index);
+                try deserializeIndexedValue(s, info.child, &dest[index], allocator, deserializer, cfg, diagnostics, track_diagnostics, index, rc);
+                initialized = index + 1;
             }
             try deserializer.finishKnownLenArray();
         } else {
             inline for (0..info.len) |index| {
                 if (!try deserializer.nextArrayItem()) return error.LengthMismatch;
-                result[index] = try deserializeIndexedValue(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index);
+                try deserializeIndexedValue(s, info.child, &dest[index], allocator, deserializer, cfg, diagnostics, track_diagnostics, index, rc);
+                initialized = index + 1;
             }
             if (try deserializer.nextArrayItem()) return error.LengthMismatch;
         }
-        return result;
+        return;
     }
 
     var index: usize = 0;
     while (try deserializer.nextArrayItem()) {
         if (index >= info.len) return error.LengthMismatch;
-        result[index] = try deserializeIndexedValue(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index);
+        try deserializeIndexedValue(s, info.child, &dest[index], allocator, deserializer, cfg, diagnostics, track_diagnostics, index, rc);
         index += 1;
+        initialized = index;
     }
 
     if (index != info.len) return error.LengthMismatch;
-    return result;
 }
 
 fn deserializePointer(
     s: anytype,
     comptime T: type,
     comptime info: std.builtin.Type.Pointer,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
     comptime bounds: meta.Bounds,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     const DeserializerType = @TypeOf(deserializer.*);
     const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
     const Out = @TypeOf(s).Of;
@@ -1204,6 +1357,10 @@ fn deserializePointer(
     switch (info.size) {
         .slice => {
             if (info.child == u8) {
+                if (comptime @TypeOf(rc) != NoRead) {
+                    dest.* = try s.text(T, try resume_read.text(3, allocator, deserializer, bounds, rc));
+                    return;
+                }
                 const token = if (comptime hasMax(bounds) and @hasDecl(DeserializerType, "readStringMax"))
                     try deserializer.readStringMax(allocator, bounds.max_len)
                 else
@@ -1211,9 +1368,14 @@ fn deserializePointer(
                 errdefer token.deinit(allocator);
                 try checkLength(bounds, token.bytes.len);
                 // Aliased slice parses can hand byte and string fields straight back to the caller without copying.
-                if (borrowed_strings or token.allocated) return try s.text(T, token.bytes);
-                return try s.text(T, try allocator.dupe(info.child, token.bytes));
+                if (borrowed_strings or token.allocated) {
+                    dest.* = try s.text(T, token.bytes);
+                    return;
+                }
+                dest.* = try s.text(T, try allocator.dupe(info.child, token.bytes));
+                return;
             }
+            if (comptime @TypeOf(rc) != NoRead) return resume_read.list(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds, rc);
 
             const known_len = try beginArrayWithKnownLen(deserializer);
             if (known_len) |len| {
@@ -1229,21 +1391,22 @@ fn deserializePointer(
 
                 if (@hasDecl(DeserializerType, "finishKnownLenArray")) {
                     for (0..len) |index| {
-                        items[index] = try deserializeElement(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index, bounds);
+                        try deserializeElement(s, info.child, &items[index], allocator, deserializer, cfg, diagnostics, track_diagnostics, index, bounds, rc);
                         initialized = index + 1;
                     }
                     try deserializer.finishKnownLenArray();
                 } else {
                     for (0..len) |index| {
                         if (!try deserializer.nextArrayItem()) return error.LengthMismatch;
-                        items[index] = try deserializeElement(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, index, bounds);
+                        try deserializeElement(s, info.child, &items[index], allocator, deserializer, cfg, diagnostics, track_diagnostics, index, bounds, rc);
                         initialized = index + 1;
                     }
 
                     if (try deserializer.nextArrayItem()) return error.LengthMismatch;
                 }
 
-                return try s.list(T, items);
+                dest.* = try s.list(T, items);
+                return;
             }
 
             var items: std.ArrayList(Out(info.child)) = .empty;
@@ -1254,19 +1417,21 @@ fn deserializePointer(
 
             while (try deserializer.nextArrayItem()) {
                 if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;
-                const item = try deserializeElement(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len, bounds);
+                var item: Out(info.child) = undefined;
+                try deserializeElement(s, info.child, &item, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len, bounds, rc);
                 errdefer s.free(info.child, allocator, item, borrowed_strings);
                 try items.append(allocator, item);
             }
             try checkLength(bounds, items.items.len);
 
-            return try s.list(T, try items.toOwnedSlice(allocator));
+            dest.* = try s.list(T, try items.toOwnedSlice(allocator));
         },
         .one => {
-            const ptr = try allocator.create(info.child);
+            if (comptime @TypeOf(rc) != NoRead) return resume_read.one(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
+            const ptr = try allocator.create(Out(info.child));
             errdefer allocator.destroy(ptr);
-            ptr.* = try deserializeValue(s, info.child, allocator, deserializer, cfg, diagnostics, track_diagnostics);
-            return ptr;
+            try deserializeValue(s, info.child, ptr, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
+            dest.* = ptr;
         },
         else => return error.UnsupportedType,
     }
@@ -1300,7 +1465,8 @@ fn readByteToken(allocator: Allocator, deserializer: anytype) anyerror!StringTok
 
 /// Reads a variable-length byte string into memory the caller owns, or into the input when the
 /// parse aliases it.
-fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
+fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror![]const u8 {
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.text(2, allocator, deserializer, bounds, rc);
     const DeserializerType = @TypeOf(deserializer.*);
     const token = if (comptime hasMax(bounds) and @hasDecl(DeserializerType, "readByteTokenMax"))
         try deserializer.readByteTokenMax(allocator, bounds.max_len)
@@ -1314,7 +1480,8 @@ fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: m
 }
 
 /// Reads the next item as raw bytes into memory the caller owns, or into the input when the parse aliases it.
-fn readRawSlice(comptime T: type, allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds) anyerror![]const u8 {
+fn readRawSlice(comptime T: type, allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror![]const u8 {
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.raw(T, allocator, deserializer, bounds, rc);
     const DeserializerType = @TypeOf(deserializer.*);
     if (!@hasDecl(DeserializerType, "readRaw") or DeserializerType.raw_format != T.zerde_raw_format) {
         @compileError("format " ++ @typeName(DeserializerType) ++ " cannot read a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
@@ -1330,35 +1497,37 @@ fn deserializeStruct(
     s: anytype,
     comptime T: type,
     comptime info: std.builtin.Type.Struct,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     if (info.is_tuple) return error.UnsupportedType;
 
     const DeserializerType = @TypeOf(deserializer.*);
     const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.structValue(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
     if (@hasDecl(DeserializerType, "beginStructOrdered")) {
         try deserializer.beginStructOrdered(T);
 
-        var ordered_result: @TypeOf(s).Of(T) = undefined;
         var ordered_seen: [info.field_names.len]bool = @splat(false);
-        errdefer freePartialStruct(s, T, allocator, &ordered_result, &ordered_seen, borrowed_strings);
+        errdefer freePartialStruct(s, T, allocator, dest, &ordered_seen, borrowed_strings);
 
         inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field_name, field_type, field_attrs, i| {
             if (field_attrs.@"comptime") {
                 @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field_name);
             }
 
-            @field(ordered_result, field_name) = try deserializeFieldValue(s, field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, meta.effectiveBounds(T, field_name, cfg));
+            try deserializeFieldValue(s, field_type, &@field(dest.*, field_name), allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, meta.effectiveBounds(T, field_name, cfg), rc);
             ordered_seen[i] = true;
         }
 
         if (@hasDecl(DeserializerType, "endStructOrdered")) try deserializer.endStructOrdered(T);
-        try s.check(T, allocator, &ordered_result);
-        return ordered_result;
+        try s.check(T, allocator, dest);
+        return;
     }
 
     if (comptime structHasIntegerKeys(T, info, cfg) and !@hasDecl(DeserializerType, "supports_integer_keys")) {
@@ -1368,14 +1537,13 @@ fn deserializeStruct(
     if (comptime meta.effectiveDeclaredInOrder(T, cfg) and @hasDecl(DeserializerType, "keyEncoder")) {
         assertDeclaredOrder(T, cfg, DeserializerType.keyEncoder);
         if (comptime !@hasDecl(DeserializerType, "nextObjectFieldIndex")) @compileError("a merge walk needs the field index of a key");
-        if (deserializer.keysAscend()) return mergeStruct(s, T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+        if (deserializer.keysAscend()) return mergeStruct(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
     }
 
     try deserializer.beginObject();
 
-    var result: @TypeOf(s).Of(T) = undefined;
     var seen: [info.field_names.len]bool = @splat(false);
-    errdefer freePartialStruct(s, T, allocator, &result, &seen, borrowed_strings);
+    errdefer freePartialStruct(s, T, allocator, dest, &seen, borrowed_strings);
 
     // The members the type does not declare go to its extras field, when it has one.
     const extras_name = comptime meta.extrasField(T);
@@ -1400,7 +1568,7 @@ fn deserializeStruct(
                     inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
                         if (field_index == i) {
                             if (seen[i]) return error.DuplicateField;
-                            @field(result, field_name) = try deserializeStructField(s, T, field_name, field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+                            try deserializeStructField(s, T, field_name, field_type, &@field(dest.*, field_name), allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
                             seen[i] = true;
                         }
                     }
@@ -1408,10 +1576,10 @@ fn deserializeStruct(
             }
         }
 
-        if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, &result, &seen);
-        try fillMissingFields(s, T, info, cfg, allocator, &result, &seen);
-        try s.check(T, allocator, &result);
-        return result;
+        if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, dest, &seen);
+        try fillMissingFields(s, T, info, cfg, allocator, dest, &seen);
+        try s.check(T, allocator, dest);
+        return;
     }
 
     while (try deserializer.nextObjectField(allocator)) |object_field| {
@@ -1421,7 +1589,7 @@ fn deserializeStruct(
             inline for (info.field_names, info.field_types, 0..) |struct_field_name, field_type, i| {
                 if (field_index == i) {
                     if (seen[i]) return error.DuplicateField;
-                    @field(result, struct_field_name) = try deserializeStructField(s, T, struct_field_name, field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+                    try deserializeStructField(s, T, struct_field_name, field_type, &@field(dest.*, struct_field_name), allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
                     seen[i] = true;
                 }
             }
@@ -1436,10 +1604,9 @@ fn deserializeStruct(
         }
     }
 
-    if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, &result, &seen);
-    try fillMissingFields(s, T, info, cfg, allocator, &result, &seen);
-    try s.check(T, allocator, &result);
-    return result;
+    if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, dest, &seen);
+    try fillMissingFields(s, T, info, cfg, allocator, dest, &seen);
+    try s.check(T, allocator, dest);
 }
 
 /// A `SortedMap`: the entries of a map of text keys, each key after the one before it, which is checked as it is read, so a
@@ -1449,17 +1616,20 @@ fn deserializeStruct(
 fn deserializeSortedMap(
     s: anytype,
     comptime T: type,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
     comptime bounds: meta.Bounds,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     const DeserializerType = @TypeOf(deserializer.*);
     const Entry = T.Entry;
     const Out = @TypeOf(s).Of;
     const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.sortedMap(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds, rc);
     try deserializer.beginObject();
     var items: std.ArrayList(Out(Entry)) = .empty;
     errdefer {
@@ -1487,13 +1657,14 @@ fn deserializeSortedMap(
             .gt => return error.NonDeterministicEncoding,
         };
         previous = key;
-        const value = try deserializeElement(s, T.Value, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len, bounds);
+        var value: Out(T.Value) = undefined;
+        try deserializeElement(s, T.Value, &value, allocator, deserializer, cfg, diagnostics, track_diagnostics, items.items.len, bounds, rc);
         errdefer s.free(T.Value, allocator, value, borrowed_strings);
         try items.append(allocator, .{ .key = try s.text([]const u8, key), .value = value });
         owned = false;
     }
     try checkLength(bounds, items.items.len);
-    return .{ .entries = try s.list([]const Entry, try items.toOwnedSlice(allocator)) };
+    dest.* = .{ .entries = try s.list([]const Entry, try items.toOwnedSlice(allocator)) };
 }
 
 /// The next key of a `SortedMap`: by a format that records keys for a repeat check (`nextSortedKey`), one that is not
@@ -1510,23 +1681,24 @@ fn mergeStruct(
     s: anytype,
     comptime T: type,
     comptime info: std.builtin.Type.Struct,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     const DeserializerType = @TypeOf(deserializer.*);
     const borrowed_strings = @hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings();
     if (comptime structHasIntegerKeys(T, info, cfg) and !@hasDecl(DeserializerType, "supports_integer_keys")) {
         @compileError("format " ++ @typeName(DeserializerType) ++ " does not support integer keys: " ++ @typeName(T));
     }
     try deserializer.beginObject();
-    var result: @TypeOf(s).Of(T) = undefined;
     // The fields before `cursor` have a value: read, or resolved as absent.
     var cursor: usize = 0;
     errdefer inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
-        if (i < cursor) s.free(field_type, allocator, @field(result, field_name), borrowed_strings);
+        if (i < cursor) s.free(field_type, allocator, @field(dest.*, field_name), borrowed_strings);
     };
     while (true) {
         switch (try deserializer.nextObjectFieldIndex(T, cfg)) {
@@ -1540,11 +1712,11 @@ fn mergeStruct(
                     if (field_index == i) {
                         inline for (0..i) |absent| {
                             if (absent >= cursor) {
-                                try fillField(s, T, info, cfg, allocator, &result, absent);
+                                try fillField(s, T, info, cfg, allocator, dest, absent);
                                 cursor = absent + 1;
                             }
                         }
-                        @field(result, field_name) = try deserializeStructField(s, T, field_name, field_type, allocator, deserializer, cfg, diagnostics, track_diagnostics);
+                        try deserializeStructField(s, T, field_name, field_type, &@field(dest.*, field_name), allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
                         cursor = i + 1;
                     }
                 }
@@ -1553,12 +1725,11 @@ fn mergeStruct(
     }
     inline for (0..info.field_names.len) |i| {
         if (i >= cursor) {
-            try fillField(s, T, info, cfg, allocator, &result, i);
+            try fillField(s, T, info, cfg, allocator, dest, i);
             cursor = i + 1;
         }
     }
-    try s.check(T, allocator, &result);
-    return result;
+    try s.check(T, allocator, dest);
 }
 
 /// The extras field holds one map item, as a `Raw`, or an optional one, that is null when there is none.
@@ -1593,12 +1764,13 @@ fn storeExtras(
     inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
         if (comptime std.mem.eql(u8, field_name, name)) {
             const owned = try deserializer.finishExtras(allocator, mark, isRaw(field_type));
-            @field(result.*, field_name) = if (comptime isRaw(field_type))
-                try s.bytesOf(field_type, owned.?)
-            else if (owned) |bytes|
-                try s.some(field_type, try s.bytesOf(@typeInfo(field_type).optional.child, bytes))
-            else
-                try s.none(field_type);
+            if (comptime isRaw(field_type)) {
+                @field(result.*, field_name) = try s.bytesOf(field_type, owned.?);
+            } else if (owned) |bytes| {
+                s.someDest(field_type, &@field(result.*, field_name), true).* = try s.bytesOf(@typeInfo(field_type).optional.child, bytes);
+            } else {
+                @field(result.*, field_name) = try s.none(field_type);
+            }
             seen[i] = true;
         }
     }
@@ -1609,26 +1781,45 @@ fn storeExtras(
 /// A nested optional (`??T`) is the field whose absence differs from its null: a present field
 /// reads as the inner optional, so `null` is `.{ null }` and a missing field is the outer null.
 /// A plain optional with the `absent` policy refuses an explicit null.
-fn deserializeStructField(
+pub fn deserializeStructField(
     s: anytype,
     comptime T: type,
     comptime field_name: []const u8,
     comptime FieldType: type,
+    dest: *@TypeOf(s).Of(FieldType),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
-) anyerror!@TypeOf(s).Of(FieldType) {
+    rc: anytype,
+) anyerror!void {
+    const bounds = comptime meta.effectiveBounds(T, field_name, cfg);
     if (comptime isNestedOptional(FieldType)) {
         const Inner = @typeInfo(FieldType).optional.child;
-        const inner: @TypeOf(s).Of(Inner) = try deserializeFieldValue(s, Inner, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, meta.effectiveBounds(T, field_name, cfg));
-        return inner;
+        var local: ReadLevel = .{};
+        const level: *ReadLevel = if (comptime @TypeOf(rc) != NoRead) rc.enter() else &local;
+        defer if (comptime @TypeOf(rc) != NoRead) rc.leave();
+        const inner = s.someDest(FieldType, dest, level.phase == 0);
+        level.phase = 1;
+        try deserializeFieldValue(s, Inner, inner, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, bounds, rc);
+        level.* = .{};
+        return;
     }
     if (comptime @typeInfo(FieldType) == .optional and meta.effectiveOptionalPolicy(T, field_name, cfg) == .absent) {
-        if (try deserializer.peekKind() == .null) return error.UnexpectedType;
+        // An explicit null is refused where the value begins, once: a resumable read does not look again.
+        var local: ReadLevel = .{};
+        const level: *ReadLevel = if (comptime @TypeOf(rc) != NoRead) rc.enter() else &local;
+        defer if (comptime @TypeOf(rc) != NoRead) rc.leave();
+        if (level.phase == 0) {
+            if (try deserializer.peekKind() == .null) return error.UnexpectedType;
+            level.phase = 1;
+        }
+        try deserializeFieldValue(s, FieldType, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, bounds, rc);
+        level.* = .{};
+        return;
     }
-    return deserializeFieldValue(s, FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, meta.effectiveBounds(T, field_name, cfg));
+    try deserializeFieldValue(s, FieldType, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, bounds, rc);
 }
 
 /// Resolves fields the input did not name, after the object is fully consumed: a declared default,
@@ -1648,7 +1839,7 @@ fn fillMissingFields(
 }
 
 /// The value of field `i` when the input did not name it.
-fn fillField(
+pub fn fillField(
     s: anytype,
     comptime T: type,
     comptime info: std.builtin.Type.Struct,
@@ -1679,9 +1870,10 @@ fn structHasIntegerKeys(comptime T: type, comptime info: std.builtin.Type.Struct
 }
 
 /// One element of an array field: read as the field's `elem` bounds say, if it has any.
-fn deserializeElement(
+pub fn deserializeElement(
     s: anytype,
     comptime T: type,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
@@ -1689,29 +1881,30 @@ fn deserializeElement(
     comptime track_diagnostics: bool,
     index: usize,
     comptime bounds: meta.Bounds,
-) anyerror!@TypeOf(s).Of(T) {
-    if (comptime bounds.elem == null) return deserializeIndexedValue(s, T, allocator, deserializer, cfg, diagnostics, track_diagnostics, index);
+    rc: anytype,
+) anyerror!void {
+    if (comptime bounds.elem == null) return deserializeIndexedValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, index, rc);
     const elem = comptime bounds.elem.?;
     if (track_diagnostics) diagnostics.?.pushIndex(index);
-    const value = deserializeBounded(s, T, elem.*, allocator, deserializer, cfg, diagnostics, track_diagnostics) catch |err| return err;
+    deserializeBounded(s, T, elem.*, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| return err;
     if (track_diagnostics) diagnostics.?.pop();
-    return value;
 }
 
-fn deserializeIndexedValue(
+pub fn deserializeIndexedValue(
     s: anytype,
     comptime T: type,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
     index: usize,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     if (track_diagnostics) diagnostics.?.pushIndex(index);
-    const value = deserializeValue(s, T, allocator, deserializer, cfg, diagnostics, track_diagnostics) catch |err| return err;
+    deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| return err;
     if (track_diagnostics) diagnostics.?.pop();
-    return value;
 }
 
 /// Whether the field has a `max_len`.
@@ -1729,35 +1922,38 @@ fn deserializeBounded(
     s: anytype,
     comptime T: type,
     comptime bounds: meta.Bounds,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
     diagnostics: ?*diagnostic_mod.Diagnostic,
     comptime track_diagnostics: bool,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     switch (@typeInfo(T)) {
-        .optional => |info| {
-            if (try readNullIfPresent(deserializer)) return try s.none(T);
-            return try s.some(T, try deserializeBounded(s, info.child, bounds, allocator, deserializer, cfg, diagnostics, track_diagnostics));
-        },
+        .optional => |info| try deserializeOptional(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds, rc),
         .int => {
             if (comptime bounds.validate != null) @compileError("validate applies to a Raw field: " ++ @typeName(T));
-            const value = try deserializeValue(s, T, allocator, deserializer, cfg, diagnostics, track_diagnostics);
-            if (bounds.min) |min| if (value < min) return error.ValueOutOfRange;
-            if (bounds.max) |max| if (value > max) return error.ValueOutOfRange;
-            return value;
+            try deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
+            if (bounds.min) |min| if (dest.* < min) return error.ValueOutOfRange;
+            if (bounds.max) |max| if (dest.* > max) return error.ValueOutOfRange;
         },
         .pointer => |info| {
             if (info.size != .slice) @compileError("length bounds apply to a slice: " ++ @typeName(T));
             if (comptime bounds.validate != null) @compileError("validate applies to a Raw field: " ++ @typeName(T));
-            return try deserializePointer(s, T, info, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds);
+            try deserializePointer(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds, rc);
         },
         .@"struct" => {
             if (comptime bounds.validate != null and !isRaw(T)) @compileError("validate applies to a Raw field: " ++ @typeName(T));
-            if (T == ByteString) return try s.bytesOf(T, try readByteSlice(allocator, deserializer, bounds));
-            if (comptime isRaw(T)) return try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, bounds));
-            if (comptime isSortedMap(T)) return try deserializeSortedMap(s, T, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds);
-            @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T));
+            if (T == ByteString) {
+                dest.* = try s.bytesOf(T, try readByteSlice(allocator, deserializer, bounds, rc));
+            } else if (comptime isRaw(T)) {
+                dest.* = try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, bounds, rc));
+            } else if (comptime isSortedMap(T)) {
+                try deserializeSortedMap(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds, rc);
+            } else {
+                @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T));
+            }
         },
         else => @compileError("bounds apply to text, bytes, arrays and integers: " ++ @typeName(T)),
     }
@@ -1774,9 +1970,10 @@ fn readNullIfPresent(deserializer: anytype) anyerror!bool {
     return false;
 }
 
-fn deserializeFieldValue(
+pub fn deserializeFieldValue(
     s: anytype,
     comptime T: type,
+    dest: *@TypeOf(s).Of(T),
     allocator: Allocator,
     deserializer: anytype,
     comptime cfg: anytype,
@@ -1784,14 +1981,14 @@ fn deserializeFieldValue(
     comptime track_diagnostics: bool,
     comptime field_name: []const u8,
     comptime bounds: meta.Bounds,
-) anyerror!@TypeOf(s).Of(T) {
+    rc: anytype,
+) anyerror!void {
     if (track_diagnostics) diagnostics.?.pushField(field_name);
-    const value = (if (comptime bounds.isDefault())
-        deserializeValue(s, T, allocator, deserializer, cfg, diagnostics, track_diagnostics)
+    (if (comptime bounds.isDefault())
+        deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)
     else
-        deserializeBounded(s, T, bounds, allocator, deserializer, cfg, diagnostics, track_diagnostics)) catch |err| return err;
+        deserializeBounded(s, T, bounds, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)) catch |err| return err;
     if (track_diagnostics) diagnostics.?.pop();
-    return value;
 }
 
 /// Index of the field whose wire key is the text `actual`.

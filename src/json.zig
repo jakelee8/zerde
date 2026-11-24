@@ -59,7 +59,7 @@ pub const WriteConfig = struct {
     sort_keys: bool = true,
 };
 
-fn bytesEncoding(comptime Config: type, cfg: Config) BytesEncoding {
+pub fn bytesEncoding(comptime Config: type, cfg: Config) BytesEncoding {
     if (comptime meta.hasField(Config, "bytes")) return cfg.bytes;
     return .string;
 }
@@ -275,8 +275,9 @@ pub fn JsonSerializer(comptime Config: type) type {
             return true;
         }
 
-        /// The key of an entry of a map whose keys are data (`SortedMap`): written as a field name is.
-        pub fn beginMapKey(self: *Self, key: []const u8) !void {
+        /// The start of an entry of a map whose keys are data (`SortedMap`) and the end of its key: the comma that joins it to the
+        /// entry before, and the colon. The key, text, is written between them as any text is (`emitString`, or `emitStringPart` in windows).
+        pub fn beginMapEntry(self: *Self) !void {
             const container = self.current();
             if (container.kind != .object) return error.InvalidJsonState;
             if (!container.first) {
@@ -284,7 +285,9 @@ pub fn JsonSerializer(comptime Config: type) type {
             } else {
                 container.first = false;
             }
-            try writeEscapedString(self.writer, key);
+        }
+
+        pub fn endMapKey(self: *Self) !void {
             try self.writer.writeByte(':');
         }
 

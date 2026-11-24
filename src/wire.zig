@@ -45,6 +45,7 @@ const reflect = @import("reflect.zig");
 const typed = @import("typed.zig");
 const root = @import("root.zig");
 const cbor = @import("cbor.zig");
+const resumable = @import("resumable.zig");
 
 pub const Error = error{
     /// A span's offset or end does not fit `u32`, or lies before the base address.
@@ -447,11 +448,13 @@ pub const WireSink = struct {
         return .{ .offset = bytes.offset, .len = @intCast(items.len) };
     }
 
-    pub fn some(_: WireSink, comptime T: type, value: Wire(@typeInfo(T).optional.child)) !Wire(T) {
-        var out: Wire(T) = std.mem.zeroes(Wire(T));
-        out.present = 1;
-        out.value = value;
-        return out;
+    /// Makes `dest` the present optional and gives its value to read into; with `init` false it is present already.
+    pub fn someDest(_: WireSink, comptime T: type, dest: *Wire(T), init: bool) *Wire(@typeInfo(T).optional.child) {
+        if (init) {
+            dest.* = std.mem.zeroes(Wire(T));
+            dest.present = 1;
+        }
+        return &dest.value;
     }
 
     pub fn none(_: WireSink, comptime T: type) !Wire(T) {
@@ -462,11 +465,13 @@ pub const WireSink = struct {
         return @intCast(@backingInt(value));
     }
 
-    pub fn unionOf(_: WireSink, comptime T: type, comptime name: []const u8, payload: anytype) !Wire(T) {
-        var out: Wire(T) = std.mem.zeroes(Wire(T));
-        out.tag = variantIndex(T, name);
-        @field(out.payload, name) = payload;
-        return out;
+    /// Makes `dest` the variant `name` and gives its payload to read into; with `init` false it is that variant already.
+    pub fn unionDest(_: WireSink, comptime T: type, comptime name: []const u8, dest: *Wire(T), init: bool) *@FieldType(@FieldType(Wire(T), "payload"), name) {
+        if (init) {
+            dest.* = std.mem.zeroes(Wire(T));
+            dest.tag = variantIndex(T, name);
+        }
+        return &@field(dest.payload, name);
     }
 
     pub fn unionVoid(_: WireSink, comptime T: type, comptime name: []const u8) !Wire(T) {
@@ -617,6 +622,8 @@ const Limits = struct {
     max_depth: u64,
     /// A strict CBOR read: definite lengths only, so no list grows and no string is rewritten.
     strict: bool,
+    /// A resumable read (`Resumable`): every string and `Raw` is copied into the output, since the chunk it came in is gone.
+    copy: bool = false,
 };
 
 fn optionalOf(comptime cfg: anytype, comptime name: []const u8) ?u64 {
@@ -787,7 +794,7 @@ fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const
 /// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
 /// members (they would cost without limit: set `deny_unknown_fields`), or when it collects extras.
 pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
-    const sizes = comptime computeSizes(Format, T, serde_cfg, format_cfg);
+    const sizes = comptime computeSizes(Format, T, serde_cfg, format_cfg, false);
     return sizes.output + sizes.scratch;
 }
 
@@ -798,12 +805,68 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 pub const Sizes = struct { output: usize, scratch: usize };
 
 pub fn regionSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) Sizes {
-    return comptime computeSizes(Format, T, serde_cfg, format_cfg);
+    return comptime computeSizes(Format, T, serde_cfg, format_cfg, false);
 }
 
-fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) Sizes {
+/// `regionSizes` for a resumable decode (`Resumable`) of strict CBOR: every string, byte string and `Raw` is copied into `output`
+/// as it arrives, each in an allocation of exactly its length (a `Raw`'s grows in place to at most its bound and is cut to its
+/// length), so they are charged where a whole-input strict read charges nothing; the arrays are charged as it charges them, and
+/// `scratch` is empty, since the reader's state is in the `Resumable`. Every string must have a bound (`max_len`, or
+/// `max_string_len`), a `Raw` as well, and a `SortedMap`'s keys the config's `max_string_len`. `cbor_cfg` must say `mode = .strict`.
+pub fn resumableRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
+    return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true);
+}
+
+/// The bytes of `resumableRegionSizes`, together.
+pub fn maxResumableArenaSize(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) usize {
+    const sizes = comptime resumableRegionSizes(T, serde_cfg, cbor_cfg);
+    return sizes.output + sizes.scratch;
+}
+
+/// A resumable decode (see `resumable.Reading`) into `Wire(T)` in a caller region: strict CBOR fed in chunks, the arrays and every
+/// string copied into `output`, which is `resumableRegionSizes(...).output` bytes for any input the config allows. Spans are offsets
+/// from `base` as in `decodeInto`, and point into `output` only, since no chunk is kept. It points into itself, so it is set
+/// up in place (`init`) and must not be moved. A decode that fails is not undone: `output` is the caller's to reuse.
+pub fn Resumable(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) type {
+    const Reading = resumable.Reading(WireSink, T, serde_cfg, cbor_cfg);
+    return struct {
+        arena: std.heap.FixedBufferAllocator,
+        regions: [1][]const u8,
+        reading: Reading,
+
+        const Self = @This();
+
+        pub fn init(self: *Self, output: []u8, base: usize) void {
+            self.arena = std.heap.FixedBufferAllocator.init(output);
+            self.regions = .{output};
+            self.reading = Reading.init(.{
+                .base = base,
+                .memory = .{ .base = base, .regions = &self.regions },
+                .arena = &self.arena,
+            }, self.arena.allocator());
+        }
+
+        /// The next chunk, all of it; says whether the value is complete (`resumable.Reading.feed`).
+        pub fn feed(self: *Self, bytes: []const u8) anyerror!bool {
+            return self.reading.feed(bytes);
+        }
+
+        /// The value and the bytes of `output` it uses, once `feed` has said it is complete.
+        pub fn finish(self: *Self) anyerror!Decoded(T) {
+            const value = try self.reading.finish();
+            return .{ .value = value, .used = self.arena.end_index };
+        }
+    };
+}
+
+fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype, comptime copy: bool) Sizes {
     @setEvalBranchQuota(1_000_000);
-    const limits = comptime limitsOf(Format, format_cfg);
+    const limits = comptime blk: {
+        var found = limitsOf(Format, format_cfg);
+        if (copy and !found.strict) @compileError("a resumable read reads strict CBOR: set mode = .strict");
+        found.copy = copy;
+        break :blk found;
+    };
     const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0);
     const slack = 256;
     const items = limits.max_items;
@@ -842,13 +905,13 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
         .text => blk: {
             // A strict read has only definite strings, which it never rewrites: they are spans of the input.
-            if (limits.strict) break :blk .{};
+            if (limits.strict and !limits.copy) break :blk .{};
             // A string with an escape or in chunks is measured first and written once, exactly sized.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a string");
             break :blk .{ .text = .{ .fixed = n } };
         },
         .byte_string => blk: {
-            if (limits.strict) break :blk .{};
+            if (limits.strict and !limits.copy) break :blk .{};
             // The bytes only: base64 is decoded from the input, or from the unescaped text a chunk at a time.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a byte string");
             break :blk .{ .text = .{ .fixed = n } };
@@ -856,7 +919,11 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         .raw => blk: {
             // A strict read keeps no record of a key (it compares neighbours, and refuses a composite key that
             // holds a float zero), so a raw item of CBOR costs nothing.
-            if (limits.strict) break :blk .{};
+            if (limits.strict) {
+                // A resumable read copies it, whole, into the output.
+                if (!limits.copy) break :blk .{};
+                break :blk .{ .text = .{ .fixed = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item") } };
+            }
             // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
             // for a key that is itself an array or map its canonical bytes, once more at each level of
             // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
