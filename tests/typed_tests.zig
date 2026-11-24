@@ -4729,6 +4729,21 @@ fn expectIntegralError(comptime T: type, expected: anyerror, text: []const u8) !
     try std.testing.expectError(expected, zerde.json.parseSliceWith(T, allocator, text, .{}, integral));
 }
 
+/// `head`, `zeros` zeros, `tail` as one number text, read into an `i64`: its value, or the error it is refused with.
+fn expectIntegralPadded(expected: anytype, head: []const u8, zeros: usize, tail: []const u8) !void {
+    const text = try allocator.alloc(u8, head.len + zeros + tail.len);
+    defer allocator.free(text);
+    @memcpy(text[0..head.len], head);
+    @memset(text[head.len..][0..zeros], '0');
+    @memcpy(text[head.len + zeros ..], tail);
+    const result = zerde.json.parseSliceWith(i64, allocator, text, .{}, integral);
+    if (@typeInfo(@TypeOf(expected)) == .error_set) {
+        try std.testing.expectError(expected, result);
+    } else {
+        try std.testing.expectEqual(@as(i64, expected), try result);
+    }
+}
+
 test "integral_numbers takes a number whose exact decimal value is an integer, whatever its spelling" {
     try expectIntegral(i64, 1, "1.0");
     try expectIntegral(i64, 100, "1e2");
@@ -4749,6 +4764,9 @@ test "integral_numbers takes a number whose exact decimal value is an integer, w
     try expectIntegral(i64, 12, "12");
     try expectIntegral(u8, 255, "255.0");
     try expectIntegral(u8, 0, "-0e0");
+    // `-0` is the number zero, which an unsigned type holds: spelled as an integer or as a float it is read alike.
+    try expectIntegral(u8, 0, "-0");
+    try expectIntegral(u8, 0, "-0.0");
     // More digits than a binary64 holds are exact: these are not rounded.
     try expectIntegral(u128, 100000000000000000000, "100000000000000000000.0");
     try expectIntegral(i128, std.math.maxInt(i128), "170141183460469231731687303715884105727.0");
@@ -4781,9 +4799,22 @@ test "integral_numbers refuses a value that has a fraction, or does not fit, by 
     try expectIntegralError(i128, error.IntegerOverflow, "170141183460469231731687303715884105728.0");
     try expectIntegralError(u128, error.IntegerOverflow, "340282366920938463463374607431768211456.0");
     try expectIntegralError(i128, error.IntegerOverflow, "1" ++ comptime longName(60, '0') ++ ".0");
+    // A fraction of a million digits cancels no exponent: the scale is the true one, in sign and size.
+    try expectIntegralPadded(error.IntegerOverflow, "0.", 999_999, "1e2000000");
+    try expectIntegralPadded(error.UnexpectedType, "1", 1_500_000, "e-2000000");
+    try expectIntegralPadded(1, "0.", 999_999, "1e1000000");
     // Something that is not an integer type, a string, a bad number.
     try expectIntegralError(i64, error.InvalidNumber, "\"1.0\"");
     try expectIntegralError(i64, error.InvalidNumber, "1.");
+}
+
+test "negative zero is the number zero for an unsigned integer, and any other negative is out of range" {
+    // RFC 8259 writes `-0` as a number, whose value is zero; zero is in range for `u8`, as `-0.0` is with integral_numbers.
+    const zero = try zerde.json.parseSlice(u8, allocator, "-0");
+    try std.testing.expectEqual(@as(u8, 0), zero);
+    try expectJsonError(u8, error.IntegerOverflow, "-1");
+    try expectJsonError(u8, error.IntegerOverflow, "-256");
+    try expectJsonError(u8, error.UnexpectedType, "-0.0");
 }
 
 test "integral_numbers is off by default, and a float field and the typed layer's bounds are unchanged" {
@@ -5095,6 +5126,55 @@ test "a sorted map's bounds are checked before it is allocated, and its values h
     const ok = try zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{},\"limits\":{\"a\":1,\"b\":2,\"c\":100}}");
     defer zerde.free(allocator, ok);
     try std.testing.expectEqual(@as(?u32, 100), ok.limits.get("c"));
+}
+
+test "a sorted map of more entries than max_len is refused at the first one over, before more is allocated" {
+    // 200 sorted keys against max_len 3: an allocator that fails at the 50th allocation is never reached.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "{\"id\":1,\"labels\":{},\"limits\":{");
+    for (0..200) |at| {
+        if (at != 0) try text.append(allocator, ',');
+        try text.print(allocator, "\"k{d:0>3}\":1", .{at});
+    }
+    try text.appendSlice(allocator, "}}");
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 50 });
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSlice(Maps, failing.allocator(), text.items));
+    try std.testing.expect(failing.allocations <= 20);
+    // The same through a decode into regions, which has nothing to grow into.
+    var region: Region = .{};
+    @memcpy(region.bytes[0..text.items.len], text.items);
+    const cfg = .{ .max_items = 512, .max_string_len = 16, .max_input_bytes = 4096 };
+    const sizes = comptime wire.regionSizes(zerde.json, Maps, .{}, cfg);
+    var scratch: [sizes.scratch]u8 align(16) = undefined;
+    try std.testing.expectError(error.LengthOutOfBounds, wire.decodeInto(zerde.json, Maps, region.bytes[8192..][0..sizes.output], &scratch, region.base(), region.bytes[0..text.items.len], .{}, cfg));
+}
+
+const LabelsOnly = struct {
+    labels: Labels,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .labels = .{ .max_len = 4 } } };
+};
+
+test "a lenient CBOR sorted map decodes within exactly regionSizes: its keys are not recorded for a repeat check" {
+    const cfg = .{ .mode = zerde.cbor.Mode.lenient, .max_input_bytes = 256, .max_items = 64, .max_string_len = 16 };
+    const sizes = comptime wire.regionSizes(zerde.cbor, LabelsOnly, .{}, cfg);
+    // Indefinite maps with definite keys, and with chunked keys; the bound must hold for both.
+    const plain = [_]u8{ 0xbf, 0x66, 'l', 'a', 'b', 'e', 'l', 's', 0xbf, 0x61, 'a', 0x61, 'x', 0x61, 'b', 0x61, 'x', 0x61, 'c', 0x61, 'x', 0x61, 'd', 0x61, 'x', 0xff, 0xff };
+    const chunked = [_]u8{ 0xbf, 0x66, 'l', 'a', 'b', 'e', 'l', 's', 0xbf, 0x7f, 0x61, 'a', 0xff, 0x61, 'x', 0x7f, 0x61, 'b', 0xff, 0x61, 'x', 0x7f, 0x61, 'c', 0xff, 0x61, 'x', 0x7f, 0x61, 'd', 0xff, 0x61, 'x', 0xff, 0xff };
+    inline for (.{ &plain, &chunked }) |input| {
+        var region: [2048]u8 align(16) = undefined;
+        @memcpy(region[0..input.len], input);
+        var scratch: [sizes.scratch]u8 align(16) = undefined;
+        const decoded = try wire.decodeInto(zerde.cbor, LabelsOnly, region[1024..][0..sizes.output], &scratch, @intFromPtr(&region), region[0..input.len], .{}, cfg);
+        try std.testing.expectEqual(@as(u32, 4), decoded.value.labels.entries.len);
+    }
+    // A repeat and a disorder are still refused, by the order of the keys.
+    var repeat = plain;
+    repeat[14] = 'a';
+    var region: [2048]u8 align(16) = undefined;
+    @memcpy(region[0..repeat.len], &repeat);
+    var scratch: [sizes.scratch]u8 align(16) = undefined;
+    try std.testing.expectError(error.DuplicateField, wire.decodeInto(zerde.cbor, LabelsOnly, region[1024..][0..sizes.output], &scratch, @intFromPtr(&region), region[0..repeat.len], .{}, cfg));
 }
 
 test "a sorted map decodes into the wire layout with its keys in the input, and its arena bound holds" {

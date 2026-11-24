@@ -284,7 +284,8 @@ What they refuse, and why:
   `error.FloatOutOfRange`, not infinity). JSON can opt in to the exact-value rule for integer fields with
   `.integral_numbers = true` in the read config: a number such as `1.0`, `1e2` or `12300e-2` is then taken when its
   exact decimal value, worked out from its digits and never from a binary64 value, is an integer that fits the field
-  (`1.0000000000000001` and `1.5` are still `error.UnexpectedType`, `256.0` for a `u8` is `error.IntegerOverflow`)
+  (`1.0000000000000001` and `1.5` are still `error.UnexpectedType`, `256.0` for a `u8` is `error.IntegerOverflow`).
+  `-0` is the number zero, so a `u8` takes it as `-0.0` is taken with this option
 - more than 128 open containers (`error.CborNestingTooDeep`, `error.JsonNestingTooDeep`), so a hostile
   input cannot exhaust the stack; and a CBOR length that claims more items than the input has bytes
 - a CBOR map with two equal keys (`error.DuplicateField`), checked in every map including those in
@@ -481,8 +482,8 @@ to the front of `dst` (never longer than `bytes`, so a `dst` of that length is e
 and returns it. A map is put in key order through an index of its entries in `scratch`, 8 bytes an entry, each
 entry then written once, from the input, in order: there is no working buffer and no copy of the result.
 `zerde.cbor.canonicalScratchSize(n)` is the scratch for `n` map entries open at once (a map's own and those of the
-maps that hold it; `error.OutOfMemory` when short). It differs from `canonicalize` in one way: a map key that is
-an array or a map is `error.UnexpectedType`, as in the pull reader, because ordering it would need its own
+maps that hold it; `error.OutOfMemory` when short). It differs from `canonicalize` in one way, so the two accept different inputs: `canonicalize` takes a map key that is
+an array or a map, and `canonicalizeInto` refuses it with `error.UnexpectedType`, as the pull reader does, because ordering it would need its own
 canonical form kept, which has no bound. Repeated keys (any spelling, and 0.0 with -0.0) are `error.DuplicateField`.
 
 ### Resumable writes
@@ -506,7 +507,7 @@ and no copy of a key (an aliased read keeps the input's bytes; in a decode into 
 `{ key: Span, value: Wire(V) }`). CBOR and JSON read and write it as a map of text keys. A read refuses a key that does
 not sort after the one before it in every mode (`error.NonDeterministicEncoding`, or `error.DuplicateField` when equal),
 a write refuses entries that are not in order (the same errors), a field's `max_len` bounds the entries (checked from the map's
-head when its length is stated) and `.elem` bounds each value. A resumable write of one is a compile error.
+head when its length is stated, and at each entry otherwise) and `.elem` bounds each value. A resumable write of one is a compile error.
 
 ### Gather encode
 

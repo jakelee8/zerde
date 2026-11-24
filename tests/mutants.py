@@ -108,7 +108,7 @@ MUTANTS = [
     ("cbor.zig", "if (std.mem.eql(u8, before, key)) return error.DuplicateField;", "if (std.mem.eql(u8, before, key) and false) return error.DuplicateField;"),
     ("cbor.zig", "if (!std.mem.lessThan(u8, before, key)) return error.NonDeterministicEncoding;", "if (!std.mem.lessThan(u8, before, key) and false) return error.NonDeterministicEncoding;"),
     ("cbor.zig", "try self.checkKeyOrder(&frame.order, start);\n            return result;", "return result;"),
-    ("cbor.zig", "try self.orderFrameKey(start);\n            try self.recordText(token);\n            return token;", "_ = start;\n            try self.recordText(token);\n            return token;"),
+    ("cbor.zig", "try self.orderFrameKey(start);\n            return token;\n        }\n\n        /// A text string read into", "_ = start;\n            return token;\n        }\n\n        /// A text string read into"),
     ("cbor.zig", "0, 1 => {\n                    try self.orderFrameKey(start);", "0, 1 => {"),
     ("cbor.zig", "try self.checkKeyOrder(&order, key_start);\n                            try self.skipItem(depth + 1);\n                        }\n                    }\n", "_ = key_start;\n                            try self.skipItem(depth + 1);\n                        }\n                    }\n"),
     ("cbor.zig", "if (self.items > self.max_items) return error.TooManyItems;", "if (self.items > self.max_items and false) return error.TooManyItems;"),
@@ -528,7 +528,7 @@ MUTANTS = [
     ("json.zig", "            if (count != 0) pending_zeros += 1;", "            if (count != 0) pending_zeros += 0;"),
     ("json.zig", "        if (in_fraction) fraction_digits += 1;\n", ""),
     ("json.zig", "    if (count == 0) return 0;\n", ""),
-    ("json.zig", "        while (at < text.len) : (at += 1) exponent = @min(exponent * 10 + (text[at] - '0'), 1_000_000);", "        while (at < text.len) : (at += 1) exponent = exponent * 10 + (text[at] - '0');"),
+    ("json.zig", "        while (at < text.len) : (at += 1) exponent = @min(exponent * 10 + (text[at] - '0'), exponent_cap);", "        while (at < text.len) : (at += 1) exponent = exponent * 10 + (text[at] - '0');"),
     ("json.zig", "        if (exponent_negative) exponent = -exponent;\n", ""),
     ("json.zig", "    if (scale < 0) return error.UnexpectedType;\n", ""),
     ("json.zig", "    if (@as(i64, @intCast(count)) + scale > max_digits - 1) return error.IntegerOverflow;\n", ""),
@@ -549,6 +549,9 @@ MUTANTS = [
     ("sorted.zig", "    if (a.len != b.len) return std.math.order(a.len, b.len);\n", ""),
     ("sorted.zig", "                    .lt => low = middle + 1,\n                    .gt => high = middle,", "                    .lt => low = middle + 1,\n                    .gt => high = middle + 1,"),
     ("cbor.zig", "            return if (frame.indefinite) null else frame.remaining;", "            return null;"),
+    ("typed.zig", "        if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;\n        const key: []const u8", "        const key: []const u8"),
+    ("typed.zig", "    if (comptime @hasDecl(@TypeOf(deserializer.*), \"nextSortedKey\")) return deserializer.nextSortedKey(allocator);\n", ""),
+    ("json.zig", "const exponent_cap = 1 << 50;", "const exponent_cap = 1_000_000;"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

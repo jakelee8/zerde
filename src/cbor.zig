@@ -746,6 +746,16 @@ pub fn CborDeserializer(comptime Config: type) type {
         }
 
         pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {
+            const token = (try self.nextSortedKey(allocator)) orelse return null;
+            errdefer token.deinit(allocator);
+            try self.recordText(token);
+            return token;
+        }
+
+        /// The next text key of a map, not recorded for the repeated-key check. The reader of a `SortedMap`
+        /// uses it: that reader refuses a repeat by comparing neighbours, so a record would be scratch that
+        /// `regionSizes` does not count.
+        pub fn nextSortedKey(self: *Self, allocator: Allocator) !?StringToken {
             if (try self.beginObjectEntry()) return null;
 
             const start = self.index;
@@ -754,7 +764,6 @@ pub fn CborDeserializer(comptime Config: type) type {
             const token = try self.finishString(allocator, header);
             errdefer token.deinit(allocator);
             try self.orderFrameKey(start);
-            try self.recordText(token);
             return token;
         }
 

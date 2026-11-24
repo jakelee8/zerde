@@ -1453,7 +1453,7 @@ fn deserializeStruct(
 /// A `SortedMap`: the entries of a map of text keys, each key after the one before it, which is checked as it is read, so a
 /// map that is unsorted or repeats a key is refused in every mode. A key is the input's own bytes in an aliased read and a copy
 /// otherwise; the entries are one exact allocation when the format states their number. `bounds.max_len` is checked
-/// before that allocation, and `bounds.elem` bounds each value.
+/// before that allocation, and at each entry when the format does not state it, and `bounds.elem` bounds each value.
 fn deserializeSortedMap(
     s: anytype,
     comptime T: type,
@@ -1482,8 +1482,9 @@ fn deserializeSortedMap(
         }
     }
     var previous: ?[]const u8 = null;
-    while (try deserializer.nextObjectField(allocator)) |token| {
+    while (try nextSortedMapKey(deserializer, allocator)) |token| {
         errdefer token.deinit(allocator);
+        if (items.items.len >= bounds.max_len) return error.LengthOutOfBounds;
         const key: []const u8 = if (borrowed_strings or token.allocated) token.bytes else try allocator.dupe(u8, token.bytes);
         // A key copied here is freed here on a failure; an escaped one is the token's, which is freed above.
         var owned = !borrowed_strings and !token.allocated;
@@ -1501,6 +1502,13 @@ fn deserializeSortedMap(
     }
     try checkLength(bounds, items.items.len);
     return .{ .entries = try s.list([]const Entry, try items.toOwnedSlice(allocator)) };
+}
+
+/// The next key of a `SortedMap`: by a format that records keys for a repeat check (`nextSortedKey`), one that is not
+/// recorded, since the sorted order refuses a repeat by itself.
+fn nextSortedMapKey(deserializer: anytype, allocator: Allocator) anyerror!?StringToken {
+    if (comptime @hasDecl(@TypeOf(deserializer.*), "nextSortedKey")) return deserializer.nextSortedKey(allocator);
+    return deserializer.nextObjectField(allocator);
 }
 
 /// A struct whose fields are declared in key order, read from a deserializer that guarantees its keys ascend (`keysAscend`):

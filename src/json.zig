@@ -490,14 +490,9 @@ pub fn JsonDeserializer(comptime Config: type) type {
 
             return switch (@typeInfo(T)) {
                 .comptime_int => std.fmt.parseInt(i128, parsed.slice, 10) catch return error.InvalidNumber,
-                .int => |info| blk: {
-                    if (info.signedness == .unsigned and parsed.slice.len > 0 and parsed.slice[0] == '-') {
-                        break :blk error.IntegerOverflow;
-                    }
-                    break :blk std.fmt.parseInt(T, parsed.slice, 10) catch |err| switch (err) {
-                        error.Overflow => error.IntegerOverflow,
-                        error.InvalidCharacter => error.InvalidNumber,
-                    };
+                .int => std.fmt.parseInt(T, parsed.slice, 10) catch |err| switch (err) {
+                    error.Overflow => error.IntegerOverflow,
+                    error.InvalidCharacter => error.InvalidNumber,
                 },
                 else => error.UnsupportedType,
             };
@@ -1498,7 +1493,9 @@ fn integralFromText(comptime T: type, text: []const u8) !T {
         count += 1;
     }
     if (count == 0) return 0;
-    // The exponent saturates far beyond any integer's digits, so a long one costs nothing.
+    // The exponent saturates at a value no text can reach by its fraction digits (a text is far shorter than 2^50 bytes),
+    // so the scale below is the true one in sign and size wherever it matters, and a long exponent costs nothing.
+    const exponent_cap = 1 << 50;
     var exponent: i64 = 0;
     if (at < text.len) {
         at += 1;
@@ -1507,7 +1504,7 @@ fn integralFromText(comptime T: type, text: []const u8) !T {
             exponent_negative = text[at] == '-';
             at += 1;
         }
-        while (at < text.len) : (at += 1) exponent = @min(exponent * 10 + (text[at] - '0'), 1_000_000);
+        while (at < text.len) : (at += 1) exponent = @min(exponent * 10 + (text[at] - '0'), exponent_cap);
         if (exponent_negative) exponent = -exponent;
     }
     const scale = exponent - fraction_digits + @as(i64, @intCast(pending_zeros));
