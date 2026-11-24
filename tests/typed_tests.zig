@@ -3633,13 +3633,9 @@ const WireRecord = struct {
         .enum_repr = .integer,
         .fields = .{
             .key = .{ .max_len = 8 },
-            .kind = .{ .min_len = 1 },
-            .revision = .{},
-            .meta = .{},
-            .note = .{ .optional = .absent },
-            .level = .{},
-            .ratio = .{},
-            .flag = .{},
+            .kind = .{ .min_len = 1, .max_len = 16 },
+            .meta = .{ .max_len = 16 },
+            .note = .{ .optional = .absent, .max_len = 8 },
         },
     };
 };
@@ -3657,20 +3653,27 @@ const WireMsg = struct {
     pair: [2]u16,
     first: ?WireEffect = null,
     pub const serde = .{ .deny_unknown_fields = true, .fields = .{
-        .id = .{},
         .effects = .{ .max_len = 4 },
-        .grid = .{},
-        .pair = .{},
+        .grid = .{ .max_len = 3, .elem = .{ .max_len = 4 } },
         .first = .{ .optional = .absent },
     } };
 };
 
+/// The limits `WireMsg` needs for an arena bound: its bytes are bounded by field, strings by the config.
+const wire_read_cfg = .{ .max_string_len = 64, .max_items = 256 };
+
 /// A region that holds the input and the arena, so every span is an offset into it from its start.
 const Region = struct {
-    bytes: [8192]u8 align(16) = undefined,
+    bytes: [16384]u8 align(16) = undefined,
+    parts: [1][]const u8 = undefined,
 
     fn base(self: *Region) usize {
         return @intFromPtr(&self.bytes);
+    }
+
+    fn memory(self: *Region) wire.Memory {
+        self.parts[0] = &self.bytes;
+        return .{ .base = self.base(), .regions = &self.parts };
     }
 };
 
@@ -3700,7 +3703,6 @@ test "a wire type has the layout of C, and describe says where every member is" 
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Effect, "tag"));
     try std.testing.expectEqual(@as(usize, 3), effect.members.len);
     try std.testing.expectEqual(@as(usize, 0), effect.members[2].node.size);
-    // The integer key of a member is in the description.
     try std.testing.expectEqualStrings("delete", effect.members[1].wire.text);
     // An optional is a presence byte, then the value.
     const opt = comptime wire.describe(?u32, .{});
@@ -3711,8 +3713,41 @@ test "a wire type has the layout of C, and describe says where every member is" 
     try std.testing.expect(@hasField(wire.Wire(Bare), "payload"));
 }
 
-fn expectSampleDecoded(comptime W: type, base: usize, w: W, input_len: usize) !void {
-    _ = input_len;
+test "an enum is an integer of a width an extern struct accepts, whatever its tag type is" {
+    // enum { a, b, c } has the tag type u2, which an extern struct refuses; negative values are signed.
+    const Small = enum { a, b, c };
+    const Neg = enum(i16) { down = -3, up = 5 };
+    const Wide = enum(u32) { big = 70000 };
+    const Holder = struct { s: Small, n: Neg, w: Wide, count: u32 };
+    try std.testing.expect(wire.Wire(Small) == u8);
+    try std.testing.expect(wire.Wire(Neg) == i8);
+    try std.testing.expect(wire.Wire(Wide) == u32);
+    const node = comptime wire.describe(Holder, .{});
+    try std.testing.expectEqual(@as(usize, 4), node.members[3].offset - node.members[2].offset);
+    var arena_buffer: [256]u8 = undefined;
+    var arena = std.heap.FixedBufferAllocator.init(&arena_buffer);
+    var region: Region = .{};
+    const mem = region.memory();
+    const w = try wire.toWire(Holder, arena.allocator(), mem.base, .{ .s = .c, .n = .down, .w = .big, .count = 1 });
+    try std.testing.expectEqual(@as(u8, 2), w.s);
+    try std.testing.expectEqual(@as(i8, -3), w.n);
+    const back = try wire.fromWire(Holder, arena.allocator(), mem, w);
+    try std.testing.expectEqual(Small.c, back.s);
+    try std.testing.expectEqual(Neg.down, back.n);
+    // A value that is no variant, including one that does not fit the tag type.
+    var bad = w;
+    bad.s = 3;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, arena.allocator(), mem, bad));
+    // 4 does not fit the two bits of Small's tag type, though its low bits name a variant.
+    bad = w;
+    bad.s = 4;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, arena.allocator(), mem, bad));
+    bad = w;
+    bad.n = 100;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, arena.allocator(), mem, bad));
+}
+
+fn expectSampleDecoded(mem: wire.Memory, w: wire.Wire(WireMsg)) !void {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &w.id);
     try std.testing.expectEqual(@as([2]u16, .{ 5, 6 }), w.pair);
     try std.testing.expectEqual(@as(u8, 1), w.first.present);
@@ -3720,55 +3755,197 @@ fn expectSampleDecoded(comptime W: type, base: usize, w: W, input_len: usize) !v
     // The effects span points at four contiguous wire effects.
     try std.testing.expectEqual(@as(u32, 4), w.effects.len);
     const Effect = wire.Wire(WireEffect);
-    const effects: [*]const Effect = @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(base + w.effects.offset))));
+    const effects = try mem.listOf(Effect, w.effects);
     try std.testing.expectEqual(@as(u8, 0), effects[0].tag);
     const put = effects[0].payload.put;
-    try std.testing.expectEqualStrings("k1", wire.bytesOf(base, put.key));
-    try std.testing.expectEqualStrings("note", wire.bytesOf(base, put.kind));
+    try std.testing.expectEqualStrings("k1", try mem.bytesOf(put.key));
+    try std.testing.expectEqualStrings("note", try mem.bytesOf(put.kind));
     try std.testing.expectEqual(@as(u64, 9), put.revision);
-    try std.testing.expectEqualStrings("m", wire.bytesOf(base, put.meta));
+    try std.testing.expectEqualStrings("m", try mem.bytesOf(put.meta));
     try std.testing.expectEqual(@as(u8, 1), put.note.present);
-    try std.testing.expectEqualStrings("n", wire.bytesOf(base, put.note.value));
+    try std.testing.expectEqualStrings("n", try mem.bytesOf(put.note.value));
     try std.testing.expectEqual(@as(u8, 7), put.level);
     try std.testing.expectEqual(@as(f32, 0.5), put.ratio);
     try std.testing.expect(put.flag);
     try std.testing.expectEqual(@as(u8, 1), effects[1].tag);
-    try std.testing.expectEqualStrings("gone", wire.bytesOf(base, effects[1].payload.delete));
+    try std.testing.expectEqualStrings("gone", try mem.bytesOf(effects[1].payload.delete));
     try std.testing.expectEqual(@as(u8, 2), effects[2].tag);
     try std.testing.expectEqual(@as(u8, 0), effects[3].payload.put.note.present);
     try std.testing.expectEqual(@as(f32, -1), effects[3].payload.put.ratio);
     // Arrays of arrays: spans of spans.
     try std.testing.expectEqual(@as(u32, 3), w.grid.len);
-    const grid: [*]const wire.Span = @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(base + w.grid.offset))));
+    const grid = try mem.listOf(wire.Span, w.grid);
     try std.testing.expectEqual(@as(u32, 2), grid[0].len);
     try std.testing.expectEqual(@as(u32, 0), grid[1].len);
-    const inner: [*]const u16 = @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(base + grid[0].offset))));
+    const inner = try mem.listOf(u16, grid[0]);
     try std.testing.expectEqual(@as(u16, 2), inner[1]);
 }
 
 test "a message decodes into its wire layout, in CBOR and in JSON, and encodes back to the same bytes" {
     const msg = sampleMsg();
     inline for (.{ zerde.cbor, zerde.json }) |Format| {
-        // Write the sample, put it into a region, and decode it there.
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         const write_cfg = if (Format == zerde.cbor) .{ .deterministic = true } else .{};
         try zerde.serializeWith(Format, &out.writer, msg, .{}, write_cfg);
         var region: Region = .{};
-        @memcpy(region.bytes[0..out.written().len], out.written());
-        var fixed = std.heap.FixedBufferAllocator.init(region.bytes[out.written().len..]);
-        const read_cfg = if (Format == zerde.cbor) .{ .mode = zerde.cbor.Mode.strict } else .{};
-        const w = try wire.decode(Format, WireMsg, fixed.allocator(), region.base(), region.bytes[0..out.written().len], .{}, read_cfg);
-        try expectSampleDecoded(wire.Wire(WireMsg), region.base(), w, out.written().len);
+        const len = out.written().len;
+        @memcpy(region.bytes[0..len], out.written());
+        var arena = std.heap.FixedBufferAllocator.init(region.bytes[len..]);
+        const read_cfg = if (Format == zerde.cbor) .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 256 } else wire_read_cfg;
+        const w = try wire.decode(Format, WireMsg, &arena, region.base(), region.bytes[0..len], .{}, read_cfg);
+        const mem = region.memory();
+        try expectSampleDecoded(mem, w);
 
         // And back: the same bytes.
         var again: std.Io.Writer.Allocating = .init(allocator);
         defer again.deinit();
-        var scratch: Region = .{};
-        var fixed_out = std.heap.FixedBufferAllocator.init(&scratch.bytes);
-        try wire.encode(Format, WireMsg, fixed_out.allocator(), region.base(), w, &again.writer, .{}, write_cfg);
+        var scratch: [4096]u8 = undefined;
+        var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
+        try wire.encode(Format, WireMsg, &scratch_arena, mem, w, &again.writer, .{}, write_cfg);
         try std.testing.expectEqualSlices(u8, out.written(), again.written());
+        // The scratch arena is put back.
+        try std.testing.expectEqual(@as(usize, 0), scratch_arena.end_index);
     }
+}
+
+fn repeatText(w: *std.Io.Writer, text: []const u8, count: usize) !void {
+    for (0..count) |_| try w.writeAll(text);
+}
+
+test "the arena bound holds for the worst input, escapes and all, and a decode puts the arena back on an error" {
+    const bound = comptime wire.maxArenaSize(WireMsg, .{}, wire_read_cfg);
+    // Four put effects with the longest strings the bounds allow, escaped in JSON so each is copied.
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    const w = &json.writer;
+    try w.writeAll("{\"id\":\"abcd\",\"effects\":[");
+    for (0..4) |index| {
+        if (index != 0) try w.writeAll(",");
+        try w.writeAll("{\"put\":{\"key\":\"");
+        try repeatText(w, "\\n", 4);
+        try w.writeAll("\",\"kind\":\"");
+        try repeatText(w, "\\t", 8);
+        try w.writeAll("\",\"revision\":1,\"meta\":\"");
+        try repeatText(w, "\\n", 8);
+        try w.writeAll("\",\"note\":\"");
+        try repeatText(w, "\\r", 4);
+        try w.writeAll("\",\"level\":7,\"ratio\":1.5,\"flag\":true}}");
+    }
+    try w.writeAll("],\"grid\":[[1,2,3,4],[1,2,3,4],[1,2,3,4]],\"pair\":[1,2],\"first\":{\"put\":{\"key\":\"a\",\"kind\":\"b\",\"revision\":1,\"meta\":\"c\",\"level\":1,\"ratio\":0,\"flag\":false}}}");
+    var region: Region = .{};
+    const len = json.written().len;
+    try std.testing.expect(len + bound < region.bytes.len);
+    @memcpy(region.bytes[0..len], json.written());
+    // Exactly the bound is enough.
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[len..][0..bound]);
+    const decoded = try wire.decode(zerde.json, WireMsg, &arena, region.base(), region.bytes[0..len], .{}, wire_read_cfg);
+    try std.testing.expectEqual(@as(u32, 4), decoded.effects.len);
+    try std.testing.expect(arena.end_index <= bound);
+    // The escaped strings are in the arena, not the input, and the whole of it is reachable through the memory.
+    const effects = try region.memory().listOf(wire.Wire(WireEffect), decoded.effects);
+    const key = try region.memory().bytesOf(effects[0].payload.put.key);
+    try std.testing.expectEqualStrings("\n\n\n\n", key);
+    try std.testing.expect(@intFromPtr(key.ptr) >= @intFromPtr(&region.bytes[len]));
+
+    // A failed decode leaves the arena as it found it.
+    arena.reset();
+    _ = try arena.allocator().alloc(u8, 8);
+    const before = arena.end_index;
+    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.json, WireMsg, &arena, region.base(), "{\"id\":\"abcd\",\"effects\":[\"noop\",\"noop\",\"noop\",\"noop\",\"noop\"],\"grid\":[],\"pair\":[1,2]}", .{}, wire_read_cfg));
+    try std.testing.expectEqual(before, arena.end_index);
+}
+
+test "a list of scalars is not copied into the wire layout" {
+    const Scalars = struct {
+        xs: []const u32,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .xs = .{ .max_len = 100 } } };
+    };
+    var region: Region = .{};
+    const input = "{\"xs\":[1,2,3]}";
+    @memcpy(region.bytes[0..input.len], input);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[input.len..]);
+    const w = try wire.decode(zerde.json, Scalars, &arena, region.base(), region.bytes[0..input.len], .{}, .{});
+    // The span points at the array the typed read made, and nothing else was allocated for it.
+    const xs = try region.memory().listOf(u32, w.xs);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, xs);
+    // The conversions copy nothing for it, either way.
+    const values = [_]u32{ 4, 5, 6 };
+    var scratch: [64]u8 align(16) = undefined;
+    var none = std.heap.FixedBufferAllocator.init(&scratch);
+    const span = try wire.toWire([]const u32, none.allocator(), @intFromPtr(&values), &values);
+    try std.testing.expectEqual(wire.Span{ .offset = 0, .len = 3 }, span);
+    const back = try wire.fromWire([]const u32, none.allocator(), .{ .base = @intFromPtr(&values), .regions = &.{std.mem.sliceAsBytes(&values)} }, span);
+    try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(back.ptr));
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    // And the arena bound counts only the typed array: (3 * n + 64) * size + 40 * alignment, and the slack.
+    try std.testing.expectEqual(@as(usize, (3 * 100 + 64) * 4 + 40 * 4 + 256), wire.maxArenaSize(Scalars, .{}, .{}));
+}
+
+test "a wire value from outside is not trusted: spans outside the memory or misaligned are refused" {
+    var region: Region = .{};
+    var other: [64]u8 align(16) = undefined;
+    const mem = region.memory();
+    var arena_buffer: [1024]u8 = undefined;
+    var arena = std.heap.FixedBufferAllocator.init(&arena_buffer);
+    const Effect = wire.Wire(WireEffect);
+    const Holder = struct { xs: []const u32, names: []const []const u8 };
+    const HolderWire = wire.Wire(Holder);
+    // Inside the region, aligned: fine.
+    @memcpy(region.bytes[0..4], &[4]u8{ 1, 0, 0, 0 });
+    var w = std.mem.zeroes(HolderWire);
+    w.xs = .{ .offset = 0, .len = 1 };
+    try std.testing.expectEqualSlices(u32, &.{1}, (try wire.fromWire(Holder, arena.allocator(), mem, w)).xs);
+    // Past the end, before the start, misaligned, and a sum that overflows.
+    w.xs = .{ .offset = region.bytes.len - 2, .len = 1 };
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    w.xs = .{ .offset = 2, .len = 1 };
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    w.xs = .{ .offset = std.math.maxInt(u32), .len = std.math.maxInt(u32) };
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    const low_mem: wire.Memory = .{ .base = mem.base -% 1, .regions = mem.regions };
+    w.xs = .{ .offset = 0, .len = 1 };
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), low_mem, w));
+    // Before the start of the region is refused for bytes too, which have no alignment to refuse it.
+    try std.testing.expectError(error.OffsetOutOfRange, low_mem.bytesOf(.{ .offset = 0, .len = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), (try mem.bytesOf(.{ .offset = 0, .len = 1 })).len);
+    // Memory the caller did not name is refused even when it is real.
+    const outside: wire.Memory = .{ .base = @intFromPtr(&other), .regions = mem.regions };
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), outside, w));
+    // A text span is checked the same way, and so is the span of an inner list.
+    var names = std.mem.zeroes(Effect);
+    _ = &names;
+    w.xs = .{ .offset = 0, .len = 0 };
+    w.names = .{ .offset = 4, .len = 1 };
+    @memset(region.bytes[4..12], 0);
+    try std.testing.expectEqual(@as(usize, 0), (try wire.fromWire(Holder, arena.allocator(), mem, w)).names[0].len);
+    @memset(region.bytes[4..12], 0xff);
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    // A tag that names nothing, an enum value and a presence byte that mean nothing.
+    var bad = std.mem.zeroes(Effect);
+    bad.tag = 9;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireEffect, arena.allocator(), mem, bad));
+    var level = std.mem.zeroes(wire.Wire(WireRecord));
+    level.level = 99;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireRecord, arena.allocator(), mem, level));
+    var presence = std.mem.zeroes(wire.Wire(?u32));
+    presence.present = 2;
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(?u32, arena.allocator(), mem, presence));
+    presence.present = 1;
+    presence.value = 5;
+    try std.testing.expectEqual(@as(?u32, 5), try wire.fromWire(?u32, arena.allocator(), mem, presence));
+    // A zero length is no memory: it needs no region and makes no pointer.
+    const none: wire.Memory = .{ .base = 0, .regions = &.{} };
+    try std.testing.expectEqual(@as(usize, 0), (try none.bytesOf(.{ .offset = 0, .len = 0 })).len);
+    // spanOf and the base.
+    const text = "hello";
+    const span = try wire.spanOf(@intFromPtr(text), text[1..4]);
+    try std.testing.expectEqual(@as(u32, 1), span.offset);
+    const here: wire.Memory = .{ .base = @intFromPtr(text), .regions = &.{text} };
+    try std.testing.expectEqualStrings("ell", try here.bytesOf(span));
+    try std.testing.expectEqual(wire.Span{ .offset = 0, .len = 0 }, try wire.spanOf(1234, &.{}));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.spanOf(@intFromPtr(text) -% 0xffff_fffe, text[0..5]));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.spanOf(@intFromPtr(text) + 1, text));
 }
 
 test "the rules of the schema apply to a wire decode, and an offset that does not fit is an error" {
@@ -3779,8 +3956,8 @@ test "the rules of the schema apply to a wire decode, and an offset that does no
     var region: Region = .{};
     const len = out.written().len;
     @memcpy(region.bytes[0..len], out.written());
-
-    var fixed = std.heap.FixedBufferAllocator.init(region.bytes[len..]);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[len..]);
+    const cfg = .{ .max_string_len = 64, .max_items = 256 };
     // A field bound refuses: five effects, at most four.
     var five: std.ArrayList(WireEffect) = .empty;
     defer five.deinit(allocator);
@@ -3791,7 +3968,7 @@ test "the rules of the schema apply to a wire decode, and an offset that does no
     defer big_out.deinit();
     try zerde.serializeWith(zerde.cbor, &big_out.writer, big, .{}, .{ .deterministic = true });
     @memcpy(region.bytes[0..big_out.written().len], big_out.written());
-    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, WireMsg, fixed.allocator(), region.base(), region.bytes[0..big_out.written().len], .{}, .{}));
+    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, WireMsg, &arena, region.base(), region.bytes[0..big_out.written().len], .{}, cfg));
 
     // Strict mode refuses a non-deterministic input.
     var lenient = std.ArrayList(u8).empty;
@@ -3800,49 +3977,20 @@ test "the rules of the schema apply to a wire decode, and an offset that does no
     try lenient.appendSlice(allocator, out.written()[1..]);
     try lenient.append(allocator, 0xff);
     @memcpy(region.bytes[0..lenient.items.len], lenient.items);
-    fixed.reset();
-    try std.testing.expectError(error.NonDeterministicEncoding, wire.decode(zerde.cbor, WireMsg, fixed.allocator(), region.base(), region.bytes[0..lenient.items.len], .{}, .{ .mode = zerde.cbor.Mode.strict }));
+    arena.reset();
+    try std.testing.expectError(error.NonDeterministicEncoding, wire.decode(zerde.cbor, WireMsg, &arena, region.base(), region.bytes[0..lenient.items.len], .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 256 }));
 
     // The base: before the input is an error, and so is an offset beyond 32 bits (a native base of 0).
     @memcpy(region.bytes[0..len], out.written());
-    fixed.reset();
-    try std.testing.expectError(error.OffsetOutOfRange, wire.decode(zerde.cbor, WireMsg, fixed.allocator(), region.base() + 1_000_000, region.bytes[0..len], .{}, .{}));
-    fixed.reset();
-    try std.testing.expectError(error.OffsetOutOfRange, wire.decode(zerde.cbor, WireMsg, fixed.allocator(), 0, region.bytes[0..len], .{}, .{}));
-    // spanOf and bytesOf agree.
-    const text = "hello";
-    const span = try wire.spanOf(@intFromPtr(text), text[1..4]);
-    try std.testing.expectEqual(@as(u32, 1), span.offset);
-    try std.testing.expectEqualStrings("ell", wire.bytesOf(@intFromPtr(text), span));
-    try std.testing.expectEqual(wire.Span{ .offset = 0, .len = 0 }, try wire.spanOf(1234, &.{}));
-    // An end past 32 bits is refused though the offset is not.
-    try std.testing.expectError(error.OffsetOutOfRange, wire.spanOf(@intFromPtr(text) -% 0xffff_fffe, text[0..5]));
-    // A zero length is no memory: base 0 and offset 0 must not make a pointer.
-    try std.testing.expectEqual(@as(usize, 0), wire.bytesOf(0, .{ .offset = 0, .len = 0 }).len);
-    var arena0 = std.heap.FixedBufferAllocator.init(&region.bytes);
-    try std.testing.expectEqual(@as(usize, 0), (try wire.fromWire([]const u16, arena0.allocator(), 0, .{ .offset = 0, .len = 0 })).len);
-    // An enum value and a presence byte that mean nothing, a tag too.
-    var level = std.mem.zeroes(wire.Wire(WireRecord));
-    level.level = 99;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireRecord, arena0.allocator(), 0, level));
-    var presence = std.mem.zeroes(wire.Wire(?u32));
-    presence.present = 2;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(?u32, arena0.allocator(), 0, presence));
-    presence.present = 1;
-    presence.value = 5;
-    try std.testing.expectEqual(@as(?u32, 5), try wire.fromWire(?u32, arena0.allocator(), 0, presence));
+    arena.reset();
+    try std.testing.expectError(error.OffsetOutOfRange, wire.decode(zerde.cbor, WireMsg, &arena, region.base() + 1_000_000, region.bytes[0..len], .{}, cfg));
+    try std.testing.expectEqual(@as(usize, 0), arena.end_index);
+    try std.testing.expectError(error.OffsetOutOfRange, wire.decode(zerde.cbor, WireMsg, &arena, 0, region.bytes[0..len], .{}, cfg));
     // Bytes after the message are not part of it.
     var trailing: [1024]u8 = undefined;
-    @memcpy(trailing[0..out.written().len], out.written());
-    trailing[out.written().len] = 0;
-    fixed.reset();
-    try std.testing.expectError(error.TrailingCharacters, wire.decode(zerde.cbor, WireMsg, fixed.allocator(), region.base(), trailing[0 .. out.written().len + 1], .{}, .{}));
-    // A tag that names nothing.
-    const Effect = wire.Wire(WireEffect);
-    var bad = std.mem.zeroes(Effect);
-    bad.tag = 9;
-    var arena = std.heap.FixedBufferAllocator.init(&region.bytes);
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireEffect, arena.allocator(), 0, bad));
+    @memcpy(trailing[0..len], out.written());
+    trailing[len] = 0;
+    try std.testing.expectError(error.TrailingCharacters, wire.decode(zerde.cbor, WireMsg, &arena, region.base(), trailing[0 .. len + 1], .{}, cfg));
 }
 
 test "a wire type read through the typed layer: Hooked, user_data and readTyped" {
@@ -3850,7 +3998,6 @@ test "a wire type read through the typed layer: Hooked, user_data and readTyped"
         id: u8,
         effect: wire.Hooked(WireEffect),
     };
-    // {"id": 3, "effect": {0: {...}}} in CBOR, in a region with its arena.
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const effect = sampleMsg().effects[0];
@@ -3871,12 +4018,25 @@ test "a wire type read through the typed layer: Hooked, user_data and readTyped"
     try d.finish();
     try std.testing.expectEqual(@as(u8, 3), holder.id);
     try std.testing.expectEqual(@as(u8, 0), holder.effect.value.tag);
-    try std.testing.expectEqualStrings("k1", wire.bytesOf(region.base(), holder.effect.value.payload.put.key));
+    try std.testing.expectEqualStrings("k1", try region.memory().bytesOf(holder.effect.value.payload.put.key));
     // Without user_data the base is 0, which a native address cannot be offset from.
     var plain = try zerde.cbor.sliceDeserializer(fixed.allocator(), region.bytes[0..len], .{});
     defer plain.deinit(fixed.allocator());
     plain.can_borrow_strings = true;
     try std.testing.expectError(error.OffsetOutOfRange, zerde.typed.deserialize(Holder, fixed.allocator(), &plain, .{}));
+    // A call site's config for the inner type: HookedWith.
+    const Renamed = struct { first_name: []const u8 };
+    const Named = struct { person: wire.HookedWith(Renamed, .{ .rename_all = zerde.FieldCase.camelCase }) };
+    var named_region: Region = .{};
+    const named_input = "{\"person\":{\"firstName\":\"Ada\"}}";
+    @memcpy(named_region.bytes[0..named_input.len], named_input);
+    var named_arena = std.heap.FixedBufferAllocator.init(named_region.bytes[named_input.len..]);
+    var named_d = try zerde.json.sliceDeserializer(named_arena.allocator(), named_region.bytes[0..named_input.len], .{});
+    defer named_d.deinit(named_arena.allocator());
+    named_d.can_borrow_strings = true;
+    named_d.user_data = named_region.base();
+    const named = try zerde.typed.deserialize(Named, named_arena.allocator(), &named_d, .{});
+    try std.testing.expectEqualStrings("Ada", try named_region.memory().bytesOf(named.person.value.first_name));
     // readTyped only before the first event.
     var pull = try zerde.cbor.pullReader(allocator, enc.written(), .{});
     defer pull.deinit();
@@ -3906,7 +4066,7 @@ test "integer keys, a Raw and bounds in a wire type, and their keys in the descr
         id: u16,
         meta: zerde.cbor.Raw,
         tags: []const u8,
-        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .id = .{ .key = 0 }, .meta = .{ .key = 1 }, .tags = .{ .key = 2, .max_len = 3 } } };
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .id = .{ .key = 0 }, .meta = .{ .key = 1, .max_len = 32 }, .tags = .{ .key = 2, .max_len = 3 } } };
     };
     const node = comptime wire.describe(Frame, .{});
     try std.testing.expectEqual(@as(i128, 2), @as(i128, node.members[2].wire.integer));
@@ -3917,12 +4077,14 @@ test "integer keys, a Raw and bounds in a wire type, and their keys in the descr
     var region: Region = .{};
     const len = out.written().len;
     @memcpy(region.bytes[0..len], out.written());
-    var fixed = std.heap.FixedBufferAllocator.init(region.bytes[len..]);
-    const w = try wire.decode(zerde.cbor, Frame, fixed.allocator(), region.base(), region.bytes[0..len], .{}, .{ .mode = zerde.cbor.Mode.strict });
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[len..]);
+    const cfg = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 32 };
+    const w = try wire.decode(zerde.cbor, Frame, &arena, region.base(), region.bytes[0..len], .{}, cfg);
     try std.testing.expectEqual(@as(u16, 7), w.id);
-    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'k', 0x01 }, wire.bytesOf(region.base(), w.meta));
-    // The raw span is the very bytes of the input: no copy.
-    try std.testing.expect(@intFromPtr(wire.bytesOf(region.base(), w.meta).ptr) >= region.base());
-    try std.testing.expect(@intFromPtr(wire.bytesOf(region.base(), w.meta).ptr) < region.base() + len);
-    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, Frame, fixed.allocator(), region.base(), &.{ 0xa3, 0x00, 0x01, 0x01, 0xa0, 0x02, 0x64, 'a', 'b', 'c', 'd' }, .{}, .{}));
+    const meta_bytes = try region.memory().bytesOf(w.meta);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x61, 'k', 0x01 }, meta_bytes);
+    // The raw span is the very bytes of the input: no copy, and the arena holds nothing for it.
+    try std.testing.expect(@intFromPtr(meta_bytes.ptr) >= region.base() and @intFromPtr(meta_bytes.ptr) < region.base() + len);
+    try std.testing.expectError(error.LengthOutOfBounds, wire.decode(zerde.cbor, Frame, &arena, region.base(), &.{ 0xa3, 0x00, 0x01, 0x01, 0xa0, 0x02, 0x64, 'a', 'b', 'c', 'd' }, .{}, cfg));
+    try std.testing.expect(wire.maxArenaSize(Frame, .{}, cfg) > 0);
 }

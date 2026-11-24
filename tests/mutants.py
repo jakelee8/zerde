@@ -6,6 +6,7 @@ crash counts: the guard is structural). A mutant that survives is a guard withou
 
     python3 tests/mutants.py            # every mutant
     python3 tests/mutants.py 3 17       # by index
+    python3 tests/mutants.py --check    # every pattern is still in the source (run it after editing src/)
 
 The source is copied aside and restored after each mutant, and again on exit. Run it on a clean tree;
 `flock` is used when a lock path is given in MUTANT_LOCK.
@@ -24,8 +25,6 @@ os.chdir(ROOT)
 MUTANTS = [
     ("cbor.zig", "if (header.major != 3) return error.UnexpectedType;\n            return self.finishString(allocator, header);", "return self.finishString(allocator, header);"),
     ("cbor.zig", "if (header.major != 2) return error.UnexpectedType;\n            return self.finishString(allocator, header);", "return self.finishString(allocator, header);"),
-    ("cbor.zig", "if (is_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;\n                return .{ .bytes = raw, .allocated = false };", "return .{ .bytes = raw, .allocated = false };"),
-    ("cbor.zig", "if (is_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;\n                try assembled", "try assembled"),
     ("cbor.zig", "if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;", "if (chunk.indefinite) return error.InvalidStringChunk;"),
     ("cbor.zig", "if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;", "if (chunk.major != header.major) return error.InvalidStringChunk;"),
     ("cbor.zig", "                const header = try self.nextHead();\n                if (header.major != 6) return header;\n                if (header.value != self_described_tag) return error.UnexpectedTag;", "                const header = try self.nextHead();\n                if (header.major != 6) return header;"),
@@ -71,11 +70,11 @@ MUTANTS = [
     ("json.zig", "if (parsed.is_float) return error.UnexpectedType;\n\n            return switch (@typeInfo(T)) {\n                .comptime_int", "_ = 0;\n\n            return switch (@typeInfo(T)) {\n                .comptime_int"),
     ("json.zig", "if (std.math.isInf(value)) return error.FloatOutOfRange;", "_ = 0;"),
     ("json.zig", "if (!std.math.isFinite(value)) return error.NonFiniteFloat;", "_ = 0;"),
-    ("json.zig", "if (!bulk.validUtf8(value)) return error.InvalidUtf8;\n            try writeEscapedString(writer, value);", "try writeEscapedString(writer, value);"),
-    ("json.zig", ".bytes = try validUtf8(self.input[start .. self.index - 1]),", ".bytes = self.input[start .. self.index - 1],"),
-    ("json.zig", "try builder.appendSlice(allocator, try validUtf8(self.input[start .. self.index - 1]));\n                    try self.appendEscape", "try builder.appendSlice(allocator, self.input[start .. self.index - 1]);\n                    try self.appendEscape"),
-    ("json.zig", "try builder.appendSlice(allocator, try validUtf8(self.input[chunk_start .. self.index - 1]));\n                    return", "try builder.appendSlice(allocator, self.input[chunk_start .. self.index - 1]);\n                    return"),
-    ("json.zig", "try builder.appendSlice(allocator, try validUtf8(self.input[chunk_start .. self.index - 1]));\n                    try self.appendEscape", "try builder.appendSlice(allocator, self.input[chunk_start .. self.index - 1]);\n                    try self.appendEscape"),
+    ("json.zig", "if (!bulk.validUtf8(value)) return error.InvalidUtf8;\n            try writeQuoted(writer, value);", "try writeQuoted(writer, value);"),
+    ("json.zig", ".bytes = try self.validUtf8(self.input[start .. self.index - 1]),", ".bytes = self.input[start .. self.index - 1],"),
+    ("json.zig", "try builder.appendSlice(allocator, try self.validUtf8(self.input[start .. self.index - 1]));\n                    try self.appendEscape", "try builder.appendSlice(allocator, self.input[start .. self.index - 1]);\n                    try self.appendEscape"),
+    ("json.zig", "try builder.appendSlice(allocator, try self.validUtf8(self.input[chunk_start .. self.index - 1]));\n                    return", "try builder.appendSlice(allocator, self.input[chunk_start .. self.index - 1]);\n                    return"),
+    ("json.zig", "try builder.appendSlice(allocator, try self.validUtf8(self.input[chunk_start .. self.index - 1]));\n                    try self.appendEscape", "try builder.appendSlice(allocator, self.input[chunk_start .. self.index - 1]);\n                    try self.appendEscape"),
     ("json.zig", ".number => {\n                    try self.count();\n                    _ = try self.parser.parseNumberSlice();", ".number => {\n                    try self.count();\n                    _ = try self.readNumber();"),
     ("json.zig", "return .{ .float = try parseFiniteFloat(f64, parsed.slice) };", "return .{ .float = std.fmt.parseFloat(f64, parsed.slice) catch return error.InvalidNumber };"),
     ("msgpack.zig", ".integer => castIntValue(T, try self.decodeInteger(tag)),\n                else", ".integer => castIntValue(T, try self.decodeInteger(tag)),\n                .float => castIntValue(T, @as(i128, @intFromFloat(try self.decodeFloat(tag)))),\n                else"),
@@ -123,7 +122,6 @@ MUTANTS = [
     ("cbor.zig", "self.items -= 1;\n                    try self.recordKeyItem(self.stack_len);", "try self.recordKeyItem(self.stack_len);"),
     ("cbor.zig", "if (self.stack_len >= self.max_depth) return error.CborNestingTooDeep;", "if (self.stack_len >= self.stack.len) return error.CborNestingTooDeep;"),
     ("cbor.zig", "if (depth >= self.max_depth) return error.CborNestingTooDeep;", "if (depth >= max_nesting) return error.CborNestingTooDeep;"),
-    ("cbor.zig", "if (comptime std.mem.eql(u8, name, \"max_depth\")) return @min(value, max_nesting);", "_ = 0;"),
     ("json.zig", "pub fn readInt(self: *Self, comptime T: type) !T {\n            try self.count();", "pub fn readInt(self: *Self, comptime T: type) !T {"),
     ("json.zig", "pub fn readString(self: *Self, allocator: Allocator) !StringToken {\n            try self.count();", "pub fn readString(self: *Self, allocator: Allocator) !StringToken {"),
     ("json.zig", "pub fn beginArray(self: *Self) !void {\n            try self.count();", "pub fn beginArray(self: *Self) !void {"),
@@ -214,19 +212,16 @@ MUTANTS = [
     ("json.zig", "            .object => if (frame.expect_key) return error.UnexpectedType,", "            .object => {},"),
     ("json.zig", "    pub fn writeFloat(self: *ValueWriter, value: f64) !void {\n        if (!std.math.isFinite(value)) return error.NonFiniteFloat;", "    pub fn writeFloat(self: *ValueWriter, value: f64) !void {"),
     ("json.zig", "    fn push(self: *ValueWriter, kind: ContainerKind) !void {\n        if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;", "    fn push(self: *ValueWriter, kind: ContainerKind) !void {"),
-    ("json.zig", "                try writeEscapedString(out, value);\n                try out.writeByte(':');", "                try out.writeAll(value);\n                try out.writeByte(':');"),
+    ("json.zig", "                try writeStringText(out, value, self.trusted_text);\n                try out.writeByte(':');", "                try out.writeAll(value);\n                try out.writeByte(':');"),
     ("json.zig", "    pub fn finish(self: *ValueWriter) !void {\n        if (self.depth != 0) return error.UnbalancedContainers;", "    pub fn finish(self: *ValueWriter) !void {\n        if (self.depth != 0 and false) return error.UnbalancedContainers;"),
     ("json.zig", "    pub fn writeFloat(self: *Encoder, value: f64) !void {\n        if (!std.math.isFinite(value)) return error.NonFiniteFloat;", "    pub fn writeFloat(self: *Encoder, value: f64) !void {"),
-    ("typed.zig", "        try value.zerdeEncode(&encoder);\n        return;", "        _ = &encoder;\n        return;"),
-    ("typed.zig", "        if (!reader.done) return error.HookIncomplete;", "        _ = 0;"),
+    ("typed.zig", "            return error.HookIncomplete;", "            return decoded;"),
     ("typed.zig", "        var reader = deserializer.pullView(allocator);\n        defer reader.deinit();", "        var reader = deserializer.pullView(allocator);"),
     ("typed.zig", "        if (!borrowed_strings) value.zerdeFree(allocator);", "        _ = value;"),
-    ("cbor.zig", "    pub fn beginArray(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 4, len);", "    pub fn beginArray(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 4, len + 1);"),
-    ("cbor.zig", "    pub fn beginMap(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 5, len);", "    pub fn beginMap(self: *Encoder, len: usize) !void {\n        try writeMajorValue(self.writer, 5, len + 1);"),
     ("cbor.zig", "            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };", "            return .{ .d = d, .owns = false, .base = 0, .allocator = allocator };"),
     ("cbor.zig", "            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };", "            return .{ .d = d, .owns = true, .base = d.stack_len, .allocator = allocator };"),
     ("json.zig", "            return .{ .d = d, .owns = false, .base = d.stack_len, .allocator = allocator };", "            return .{ .d = d, .owns = false, .base = 0, .allocator = allocator };"),
-    ("json.zig", "                if (!frame.first) try self.writer.writeByte(',');\n                frame.first = false;\n                try writeEscapedString(self.writer, value);", "                frame.first = false;\n                try writeEscapedString(self.writer, value);"),
+    ("json.zig", "                if (!frame.first) try self.writer.writeByte(',');\n                frame.first = false;\n                try writeStringText(self.writer, value, self.trusted_text);", "                frame.first = false;\n                try writeStringText(self.writer, value, self.trusted_text);"),
     ("json.zig", "                if (!frame.first) try self.writer.writeByte(',');\n                frame.first = false;\n            },\n            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {", "                frame.first = false;\n            },\n            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {"),
     ("json.zig", "            .object => if (frame.expect_key) return error.UnexpectedType,\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {", "            .object => {},\n        }\n    }\n\n    fn afterValue(self: *Encoder) void {"),
     ("json.zig", "        if (frame.kind == .object) frame.expect_key = true;\n    }\n\n    fn push(self: *Encoder", "        _ = frame;\n    }\n\n    fn push(self: *Encoder"),
@@ -253,14 +248,13 @@ MUTANTS = [
     ("bulk.zig", "            0x08 => try writer.writeAll(\"\\\\b\"),", "            0x08 => try writer.writeAll(\"\\\\f\"),"),
     ("bulk.zig", "hex[c >> 4], hex[c & 0xf] }", "hex[c & 0xf], hex[c >> 4] }"),
     ("bulk.zig", "        start = at + 1;\n    }\n}", "        start = at;\n    }\n}"),
-    ("json.zig", "    fn push(self: *Encoder, kind: ContainerKind) !void {\n        if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;", "    fn push(self: *Encoder, kind: ContainerKind) !void {"),
+    ("json.zig", "    fn push(self: *Encoder, kind: ContainerKind, len: u64) !void {\n        if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;", "    fn push(self: *Encoder, kind: ContainerKind, len: u64) !void {\n        _ = len;"),
     ("typed.zig", "            freeTypedPartial(T, allocator, decoded, @hasDecl(DeserializerType, \"borrowStrings\") and deserializer.borrowStrings());\n", "            _ = 0;\n"),
     ("typed.zig", "                errdefer freeTypedPartial(info.child, allocator, item, borrowed_strings);\n                try items.append(allocator, item);", "                try items.append(allocator, item);"),
     ("typed.zig", "if (comptime hasMax(bounds) and @hasDecl(DeserializerType, \"readStringMax\"))", "if (comptime false and @hasDecl(DeserializerType, \"readStringMax\"))"),
     ("typed.zig", "if (comptime hasMax(bounds) and @hasDecl(DeserializerType, \"readByteTokenMax\"))", "if (comptime false and @hasDecl(DeserializerType, \"readByteTokenMax\"))"),
     ("cbor.zig", "if (max < saved) self.max_string_len = max;\n            return self.readString(allocator)", "return self.readString(allocator)"),
     ("cbor.zig", "if (err == error.StringTooLong and max < saved) error.LengthOutOfBounds else err;\n        }\n\n        /// `readByteToken`", "err;\n        }\n\n        /// `readByteToken`"),
-    ("cbor.zig", "    if (!bulk.validUtf8(value)) return error.InvalidUtf8;\n    try writeMajorValue(writer, 3, value.len);", "    try writeMajorValue(writer, 3, value.len);"),
     ("json.zig", "    if (!bulk.validUtf8(bytes)) return error.InvalidUtf8;\n    try writeQuoted(writer, bytes);", "    try writeQuoted(writer, bytes);"),
     ("cbor.zig", "    var deserializer = try sliceDeserializer(allocator, input, read_cfg);\n    defer deserializer.deinit(allocator);\n    // The caller's", "    var deserializer = try sliceDeserializer(allocator, input, .{ .max_input_bytes = effectiveMaxInputBytes(read_cfg) });\n    defer deserializer.deinit(allocator);\n    // The caller's"),
     ("json.zig", "    var deserializer = try sliceDeserializer(allocator, input, read_cfg);\n    defer deserializer.deinit(allocator);\n    // The caller's", "    var deserializer = try sliceDeserializer(allocator, input, .{ .max_input_bytes = effectiveMaxInputBytes(read_cfg) });\n    defer deserializer.deinit(allocator);\n    // The caller's"),
@@ -296,7 +290,6 @@ MUTANTS = [
     ("json.zig", "            try verifyText(bytes);\n            return .{ .bytes = bytes, .pos = parser.index };", "            return .{ .bytes = bytes, .pos = parser.index };"),
     ("json.zig", "    if (parser.index != text.len) return error.TrailingCharacters;", "    _ = text;"),
     ("json.zig", "    var parser: Parser = .{ .input = text, .checked = true };", "    var parser: Parser = .{ .input = text };"),
-    ("json.zig", "                    _ = try validUtf8(self.input[start .. self.index - 1]);\n                    return;\n                },\n                '\\\\' => switch", "                    return;\n                },\n                '\\\\' => switch"),
     ("json.zig", "                    else => return error.InvalidStringEscape,\n                },\n                0...31 => return error.InvalidStringCharacter,\n                else => {},\n            }\n        }\n    }\n\n    /// Steps over a value", "                    else => {},\n                },\n                0...31 => return error.InvalidStringCharacter,\n                else => {},\n            }\n        }\n    }\n\n    /// Steps over a value"),
     ("json.zig", "                        } else if (std.unicode.utf16IsLowSurrogate(first)) {\n                            return error.InvalidUnicodeSurrogate;\n                        }\n                    },\n                    else => return error.InvalidStringEscape,", "                        }\n                    },\n                    else => return error.InvalidStringEscape,"),
     ("json.zig", "                            if (!std.unicode.utf16IsLowSurrogate(try self.parseHex4())) return error.InvalidUnicodeSurrogate;", "                            _ = try self.parseHex4();"),
@@ -322,7 +315,7 @@ MUTANTS = [
     ("json.zig", ".trusted_text = readLimitFlag(self.cfg, \"trusted_text\", false) };", ".trusted_text = false };"),
     ("json.zig", "    result.trusted_text = readLimitFlag(cfg, \"trusted_text\", false);", "    result.trusted_text = false;"),
     ("json.zig", "if (!bulk.validUtf8(self.input[start .. self.index - 1])) return error.InvalidUtf8;\n                    return;", "return;"),
-    ("meta.zig", " and self.max == null and self.elem == null;", " and self.max == null;"),
+    ("meta.zig", " and self.elem == null and self.validate == null;", " and self.validate == null;"),
     ("meta.zig", "    if (comptime fieldOverrideHas(cfg, field_name, \"elem\")) {", "    if (comptime false) {"),
     ("meta.zig", "    } else if (comptime @hasDecl(T, \"serde\") and fieldOverrideHas(T.serde, field_name, \"elem\")) {", "    } else if (comptime false) {"),
     ("meta.zig", "    if (comptime hasField(@TypeOf(attrs), \"elem\")) {\n        const elem = comptime boundsOf(@field(attrs, \"elem\"));\n        bounds.elem = &elem;\n    }\n    return bounds;", "    return bounds;"),
@@ -353,17 +346,31 @@ MUTANTS = [
     ("wire.zig", "            break :blk .{ .offset = bytes.offset, .len = @intCast(value.len) };", "            break :blk bytes;"),
     ("wire.zig", "                out.present = 1;\n", "                out.present = 2;\n"),
     ("wire.zig", "                    out.tag = variantIndex(T, @tagName(tag));", "                    out.tag = 0;"),
-    ("wire.zig", "        .@\"enum\" => std.enums.fromInt(T, wire) orelse error.InvalidTag,", "        .@\"enum\" => @enumFromInt(wire),"),
+    ("wire.zig", "        const tag = std.math.cast(@typeInfo(T).@\"enum\".tag_type, wire) orelse break :blk error.InvalidTag;", "        const tag: @typeInfo(T).@\"enum\".tag_type = @truncate(wire);"),
     ("wire.zig", "            break :blk error.InvalidTag;\n        },", "            break :blk @unionInit(T, @typeInfo(T).@\"union\".field_names[0], if (@typeInfo(T).@\"union\".field_types[0] == void) {} else undefined);\n        },"),
     ("wire.zig", "    deserializer.can_borrow_strings = true;\n    const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);\n    try deserializer.finish();\n    return try toWire", "    const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);\n    try deserializer.finish();\n    return try toWire"),
     ("wire.zig", "    const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);\n    try deserializer.finish();\n    return try toWire", "    const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);\n    return try toWire"),
-    ("wire.zig", "                else => error.InvalidTag,\n            };","                else => try fromWire(Child, allocator, base, wire.value),\n            };"),
-    ("wire.zig", "            if (wire.len == 0) break :blk &.{};\n", "            if (false) break :blk &.{};\n"),
+    ("wire.zig", "                else => error.InvalidTag,\n            };", "                else => try fromWire(Child, allocator, base, wire.value),\n            };"),
     ("typed.zig", "    if (comptime hasHook(T, \"zerdeDecode\") or hasHook(T, \"zerdeEncode\")) return;\n", "    if (comptime false) return;\n"),
     ("cbor.zig", "            if (self.done or self.d.stack_len != self.base) return error.InvalidCborState;\n", "            _ = self.done;\n"),
     ("cbor.zig", "            const value = try typed.deserialize(T, allocator, self.d, serde_cfg);\n            self.done = self.d.stack_len == self.base;", "            const value = try typed.deserialize(T, allocator, self.d, serde_cfg);\n            _ = &self.done;"),
     ("json.zig", "            if (self.done or self.d.stack_len != self.base) return error.InvalidJsonState;\n", "            _ = self.done;\n"),
     ("json.zig", "            const value = try typed.deserialize(T, allocator, self.d, serde_cfg);\n            self.done = self.d.stack_len == self.base;", "            const value = try typed.deserialize(T, allocator, self.d, serde_cfg);\n            _ = &self.done;"),
+    ("wire.zig", "        if (start % alignment != 0) return error.OffsetOutOfRange;\n", "        _ = alignment;\n"),
+    ("wire.zig", "            if (start >= low and end <= low + region.len) {", "            if (start >= low) {"),
+    ("wire.zig", "            if (start >= low and end <= low + region.len) {", "            if (end <= low + region.len) {"),
+    ("wire.zig", "            if (comptime isScalarList(Elem)) {\n                const bytes = try spanOf(base, std.mem.sliceAsBytes(value));", "            if (comptime false) {\n                const bytes = try spanOf(base, std.mem.sliceAsBytes(value));"),
+    ("wire.zig", "            if (comptime isScalarList(Elem)) break :blk source;", "            if (comptime false) break :blk source;"),
+    ("wire.zig", "    errdefer arena.end_index = mark;\n", "    _ = mark;\n"),
+    ("wire.zig", "    defer arena.end_index = mark;\n    const value = try fromWire", "    _ = mark;\n    const value = try fromWire"),
+    ("wire.zig", "        .@\"enum\" => @intCast(@backingInt(value)),", "        .@\"enum\" => @truncate(@as(u64, @intCast(@as(i64, @intCast(@backingInt(value)))) & 0x7f)),"),
+    ("wire.zig", "        for ([_]u16{ 8, 16, 32, 64 }) |bits| {", "        for ([_]u16{ 16, 32, 64 }) |bits| {"),
+    ("wire.zig", "        const signed = low < 0;", "        const signed = false;"),
+    ("wire.zig", "            if (isScalarList(Elem)) break :blk 0;\n            const n: usize = @min", "            const n: usize = @min"),
+    ("wire.zig", "            break :blk growth(n, @sizeOf(Elem), @alignOf(Elem)) + n * typedOwned(Elem, elem_bounds, cfg, limits);", "            break :blk growth(n, @sizeOf(Elem), @alignOf(Elem));"),
+    ("wire.zig", "            break :blk n * @sizeOf(Wire(Elem)) + 16 + n * wireOwned(Elem, elem_bounds, cfg, limits);", "            break :blk n * @sizeOf(Wire(Elem)) + 16;"),
+    ("wire.zig", "    return (3 * n + 64) * size + 40 * alignment;", "    return (2 * n) * size;"),
+    ("wire.zig", "            break :blk 3 * (n / 2 + 8) * 40 + 3 * n + 40 * 8;", "            break :blk 0;"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
@@ -399,7 +406,21 @@ def run(index):
     return f"{index} {name}: {verdict} {detail} | {old[:56]!r}".replace("\n", " ")
 
 
+def check():
+    """Every pattern must still be in the source, and be the code it was written for: lists the others."""
+    missing = 0
+    for index, (name, old, new) in enumerate(MUTANTS):
+        text = open(os.path.join("src", name)).read()
+        if old not in text:
+            print(f"{index} {name}: PATTERN NOT FOUND | {old[:60]!r}")
+            missing += 1
+    print(f"{len(MUTANTS)} mutants, {missing} stale")
+    sys.exit(1 if missing else 0)
+
+
 def main():
+    if sys.argv[1:] == ["--check"]:
+        check()
     backup = "/tmp/zerde-mutants-src"
     shutil.rmtree(backup, ignore_errors=True)
     shutil.copytree("src", backup)

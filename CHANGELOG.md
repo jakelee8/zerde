@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- changed (`zerde.wire`, unreleased): `decode` takes a `*std.heap.FixedBufferAllocator` and restores it on an error; `fromWire` and `encode` take a `wire.Memory` (base and valid ranges) and refuse a span outside it, misaligned or overflowing; an enum is an 8-, 16-, 32- or 64-bit integer, and `usize`, C types and odd widths are a compile error; a list of scalars is not copied; added `maxArenaSize` and `HookedWith`
+- added `tests/mutants.py --check`, which lists patterns the source no longer contains; 9 stale mutants removed and 11 re-pointed
 - added `zerde.wire`: `Wire(T)`, a fixed-layout (C) type generated from a schema type, with `Span`, `Opt`, tagged unions as `{ tag, payload }`; `decode`, `encode`, `toWire`, `fromWire`, `describe` (offsets of every member), and `Hooked(T)` for a decode hook; `PullReader.readTyped` and `userData`, a `user_data` word on the CBOR and JSON deserializers, and `zerde.typed` exported
 - fixed: a type with a `zerdeDecode` or `zerdeEncode` hook and no `zerdeFree` was walked into by `zerde.free`; it is left alone, as documented
 - added `reader.raw()` to both pull readers (the next item whole, as its bytes) and `.validate = fn (allocator, bytes) !void` for a `Raw` field in `serde.fields`, run after the read has checked the item
