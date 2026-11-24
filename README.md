@@ -455,6 +455,12 @@ every name is `.long`, read to its end and checked, and no name. `readStringShor
 `nextObjectFieldIndex` do it. A key that no field declares is allocated only for the repeated-key check of a CBOR read that
 accepts unknown members (not under `deny_unknown_fields` without `extras`, where it is refused as it is read), and for `extras`.
 
+The other formats do not allocate for a key or a name either. MessagePack, BSON, TOML, YAML and ZON hand the typed layer
+the input's own bytes for a key and for an enum's name (their `nextObjectField` and `readString` ignore the allocator); ZON
+decodes an enum's name written as a string literal with escapes into a stack buffer as long as the longest name
+(`readStringShort`) and checks a longer literal to its end. TOML and YAML build a document before the typed read, and a
+key or string with escapes is decoded into that document (an allocation of the parse, not of the read).
+
 ### Raw items
 
 A field of type `cbor.Raw` or `json.Raw` (each a `struct { bytes: []const u8 }` that carries its format in its type) is one item of that format, checked

@@ -226,9 +226,12 @@ pub fn ZonDeserializer(comptime Config: type) type {
             return switch (self.currentNode()) {
                 .enum_literal => |field_name| std.meta.stringToEnum(T, field_name.get(&self.zoir.?)) orelse return self.failCurrent(error.InvalidEnumTag),
                 .string_literal => blk: {
-                    const token = try self.readString(self.allocator);
-                    defer token.deinit(self.allocator);
-                    break :blk std.meta.stringToEnum(T, token.bytes) orelse return self.failCurrent(error.InvalidEnumTag);
+                    const cap = comptime typed.longestEnumName(@typeInfo(T).@"enum");
+                    var buffer: [cap]u8 = undefined;
+                    break :blk switch (try self.readStringShort(cap, &buffer)) {
+                        .text => |bytes| std.meta.stringToEnum(T, bytes) orelse return self.failCurrent(error.InvalidEnumTag),
+                        .long => return self.failCurrent(error.InvalidEnumTag),
+                    };
                 },
                 else => return self.failCurrent(error.UnexpectedType),
             };
@@ -245,6 +248,42 @@ pub fn ZonDeserializer(comptime Config: type) type {
                 },
                 else => return self.failCurrent(error.UnexpectedType),
             };
+        }
+
+        /// A string compared with names a type declares, decoded into `buffer` without allocating (see
+        /// `typed.ShortText`). A literal whose decoded text is longer than `cap` is `.long`, and is still checked to
+        /// its end, so an invalid escape is refused as it is when the text is allocated.
+        pub fn readStringShort(self: *Self, comptime cap: usize, buffer: *[cap]u8) !typed.ShortText {
+            try self.ensureParsed();
+            const node = switch (self.currentNode()) {
+                .string_literal => self.currentNodeIndex(),
+                .enum_literal => |field_name| return .{ .text = field_name.get(&self.zoir.?) },
+                else => return self.failCurrent(error.UnexpectedType),
+            };
+            const ast = self.ast.?;
+            const ast_node = node.getAstNode(&self.zoir.?);
+            var fixed: std.Io.Writer = .fixed(buffer);
+            const fits = ZonGen.parseStrLit(&ast, ast_node, &fixed);
+            if (fits) |result| {
+                try self.checkLiteral(ast, ast_node, result);
+                return .{ .text = fixed.buffered() };
+            } else |_| {
+                // Too long for every name: read to its end, still, to check it.
+                var discard: std.Io.Writer.Discarding = .init(&.{});
+                try self.checkLiteral(ast, ast_node, ZonGen.parseStrLit(&ast, ast_node, &discard.writer) catch unreachable);
+                return .long;
+            }
+        }
+
+        fn checkLiteral(self: *Self, ast: std.zig.Ast, ast_node: std.zig.Ast.Node.Index, result: std.zig.string_literal.Result) !void {
+            switch (result) {
+                .success => {},
+                .failure => |err| {
+                    const token = ast.nodeMainToken(ast_node);
+                    self.last_error_location = locationFromAstToken(ast, token, @intCast(err.offset()));
+                    return error.InvalidStringLiteral;
+                },
+            }
         }
 
         pub fn beginArray(self: *Self) !void {
@@ -389,15 +428,7 @@ pub fn ZonDeserializer(comptime Config: type) type {
 
             try out.ensureUnusedCapacity(ZonGen.strLitSizeHint(&ast, ast_node));
             const result = ZonGen.parseStrLit(&ast, ast_node, &out.writer) catch return error.OutOfMemory;
-            switch (result) {
-                .success => {},
-                .failure => |err| {
-                    const token = ast.nodeMainToken(ast_node);
-                    const location = locationFromAstToken(ast, token, @intCast(err.offset()));
-                    self.last_error_location = location;
-                    return error.InvalidStringLiteral;
-                },
-            }
+            try self.checkLiteral(ast, ast_node, result);
 
             return .{
                 .bytes = try out.toOwnedSlice(),

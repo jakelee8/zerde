@@ -8052,3 +8052,55 @@ test "a resumable decode that leaves strings in the stream holds a text to its l
     _ = try decoder.feed(&enough);
     try std.testing.expectEqual(wire.Span{ .offset = 7, .len = 2 }, (try decoder.finish()).value.name);
 }
+
+// ---- Keys and names of TOML, YAML, ZON, BSON and msgpack: compared where they are read --------------------------
+
+const NameColor = enum { red, green };
+const NamedFields = struct { a: u8, c: NameColor };
+const NoFields = struct {};
+
+fn allocationsOf(comptime Format: type, comptime T: type, input: []const u8) !usize {
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
+    const value = try zerde.parseSliceAliased(Format, T, counting.allocator(), input);
+    _ = value;
+    return counting.allocations;
+}
+
+/// A read of declared keys and of an enum's name allocates what a read that ignores every member does: the
+/// document the format builds first, and nothing for the keys and names themselves.
+fn expectNamesFree(comptime Format: type, input: []const u8) !void {
+    try std.testing.expectEqual(try allocationsOf(Format, NoFields, input), try allocationsOf(Format, NamedFields, input));
+}
+
+test "TOML and YAML read a declared key and an enum name without allocating" {
+    try expectNamesFree(zerde.toml, "a = 1\nc = \"red\"\n");
+    try expectNamesFree(zerde.toml, "a = 1\nc = \"r\\u0065d\"\n");
+    try expectNamesFree(zerde.yaml, "a: 1\nc: red\n");
+    try expectNamesFree(zerde.yaml, "a: 1\nc: \"red\"\n");
+    const toml = try zerde.parseSliceAliased(zerde.toml, NamedFields, allocator, "a = 1\nc = \"gre\\u0065n\"\n");
+    try std.testing.expectEqual(NameColor.green, toml.c);
+    try std.testing.expectError(error.InvalidEnumTag, zerde.parseSliceAliased(zerde.toml, NamedFields, allocator, "a = 1\nc = \"blue\"\n"));
+}
+
+test "ZON reads an enum's name from a string literal without allocating" {
+    // A literal in escapes, an enum literal and a plain literal: the same allocations as a read of no member.
+    try expectNamesFree(zerde.zon, ".{ .a = 1, .c = \"r\\x65d\" }");
+    try expectNamesFree(zerde.zon, ".{ .a = 1, .c = \"red\" }");
+    try expectNamesFree(zerde.zon, ".{ .a = 1, .c = .red }");
+    const green = try zerde.parseSliceAliased(zerde.zon, NamedFields, allocator, ".{ .a = 1, .c = \"gre\\x65n\" }");
+    try std.testing.expectEqual(NameColor.green, green.c);
+    // A name is the exact length of the longest one, or it is none; a longer literal is read to its end.
+    try std.testing.expectError(error.InvalidEnumTag, zerde.parseSliceAliased(zerde.zon, NamedFields, allocator, ".{ .a = 1, .c = \"gre\\x65en\" }"));
+    try std.testing.expectError(error.InvalidEnumTag, zerde.parseSliceAliased(zerde.zon, NamedFields, allocator, ".{ .a = 1, .c = \"reddddddddddddddddddddd\" }"));
+    try std.testing.expectError(error.InvalidStringLiteral, zerde.parseSliceAliased(zerde.zon, NamedFields, allocator, ".{ .a = 1, .c = \"reddddddddddddddddddddd\\q\" }"));
+    try std.testing.expectError(error.InvalidStringLiteral, zerde.parseSliceAliased(zerde.zon, NamedFields, allocator, ".{ .a = 1, .c = \"r\\q\" }"));
+}
+
+test "BSON and msgpack read a declared key and an enum name without allocating" {
+    const bson = [_]u8{ 23, 0, 0, 0, 0x10, 'a', 0, 1, 0, 0, 0, 0x02, 'c', 0, 4, 0, 0, 0, 'r', 'e', 'd', 0, 0 };
+    try std.testing.expectEqual(@as(usize, 0), try allocationsOf(zerde.bson, NamedFields, &bson));
+    const msgpack = [_]u8{ 0x82, 0xa1, 'a', 0x01, 0xa1, 'c', 0xa3, 'r', 'e', 'd' };
+    try std.testing.expectEqual(@as(usize, 0), try allocationsOf(zerde.msgpack, NamedFields, &msgpack));
+    const got = try zerde.parseSliceAliased(zerde.msgpack, NamedFields, allocator, &msgpack);
+    try std.testing.expectEqual(NameColor.red, got.c);
+}

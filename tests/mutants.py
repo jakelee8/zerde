@@ -646,6 +646,15 @@ MUTANTS = [
     ("typed.zig", "                    level.index = @intCast(index + 1);\n                }\n                try reserveRoom(rc, atomic_room);\n                try serializer.endStruct(T);", "                }\n                try reserveRoom(rc, atomic_room);\n                try serializer.endStruct(T);"),
     ("typed.zig", "                            .gt => return error.NonDeterministicEncoding,\n                        };\n                        try reserveRoom", "                            .gt => {},\n                        };\n                        try reserveRoom"),
     ("typed.zig", "    if (index != info.len) return error.LengthMismatch;\n}", "}"),
+    ('bson.zig', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = allocator;', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = try allocator.dupe(u8, "k");'),
+    ('bson.zig', 'pub fn readString(self: *Self, allocator: Allocator) !StringToken {\n            _ = allocator;', 'pub fn readString(self: *Self, allocator: Allocator) !StringToken {\n            _ = try allocator.dupe(u8, "k");'),
+    ('toml_read.zig', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = allocator;', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = try allocator.dupe(u8, "k");'),
+    ('toml_read.zig', 'pub fn readString(self: *Self, allocator: Allocator) !StringToken {\n            _ = allocator;', 'pub fn readString(self: *Self, allocator: Allocator) !StringToken {\n            _ = try allocator.dupe(u8, "k");'),
+    ('yaml_read.zig', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = allocator;', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = try allocator.dupe(u8, "k");'),
+    ('yaml_read.zig', 'pub fn readString(self: *Self, allocator: Allocator) !StringToken {\n            _ = allocator;', 'pub fn readString(self: *Self, allocator: Allocator) !StringToken {\n            _ = try allocator.dupe(u8, "k");'),
+    ('zon_read.zig', 'try self.checkLiteral(ast, ast_node, ZonGen.parseStrLit(&ast, ast_node, &discard.writer) catch unreachable);\n                return .long;', '_ = ZonGen.parseStrLit(&ast, ast_node, &discard.writer) catch unreachable;\n                return .long;'),
+    ('zon_read.zig', 'var fixed: std.Io.Writer = .fixed(buffer);', 'var fixed: std.Io.Writer = .fixed(buffer[0..cap -| 1]);'),
+    ('zon_read.zig', 'switch (try self.readStringShort(cap, &buffer)) {', 'switch (blk2: {\n                        _ = &buffer;\n                        break :blk2 typed.ShortText{ .text = (try self.readString(self.allocator)).bytes };\n                    }) {'),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
