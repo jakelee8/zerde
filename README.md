@@ -478,7 +478,10 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
 - `wire.maxArenaSize(T, serde_cfg, format_cfg)` is an upper bound, computed at comptime, of the bytes a decode takes
   from the arena. It uses the `max_len` and `.elem` of each field and, from `format_cfg`: `max_items` (items in the whole
   input, which bounds every list without a `max_len` and all lists together, so nesting such lists does not multiply it),
-  `max_string_len`, `max_depth` and `max_input_bytes`, which `decode` enforces (`error.InputTooLarge`). Only what is
+  `max_string_len`, `max_depth`, `max_input_bytes`, which `decode` enforces (`error.InputTooLarge`), and `mode`: a strict
+  CBOR read has only definite strings and lengths, so it rewrites no string and allocates each list once, at its exact size.
+  The bound is worked out in 64 bits and is a compile error only when it does not fit the target's `usize`. A bound set on a
+  union variant (`serde.fields.<variant>`) applies to its payload, in the read and in the bound. Only what is
   rewritten costs: the strings together hold at most twice the input (a JSON base64 string is built, then decoded), and one string at a time, at the top of the arena, costs half again and 128 bytes more while its buffer grows, which the bound adds once for the largest; a list the capacities an array list grows through, and a `Raw` item
   only what the CBOR reader keeps to check its map keys (once, reused from one item to the next). It is a compile error when
   something a decode reaches has no bound, when a struct accepts unknown members (set `deny_unknown_fields`) or collects

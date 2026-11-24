@@ -385,6 +385,18 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(module_tests).step);
     }
 
+    // The arena bound is computed at comptime in the target's own `usize`, so it is compiled for wasm32 too.
+    const wasm_bound = b.addObject(.{
+        .name = "wasm-bound",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wasm_bound.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "zerde", .module = tests_root_mod }},
+        }),
+    });
+    test_step.dependOn(&wasm_bound.step);
+
     const examples_step = b.step("examples", "Compile native and WASM examples");
     inline for (.{
         .{ "json-roundtrip", "examples/json_roundtrip.zig" },

@@ -600,7 +600,7 @@ fn deserializeUnion(
                         .integer => |number| variantHasInteger(T, name, cfg, number),
                     };
                     if (FieldType != void and matches) {
-                        const payload = try deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name, .{});
+                        const payload = try deserializeFieldValue(FieldType, allocator, deserializer, cfg, diagnostics, track_diagnostics, name, meta.effectiveBounds(T, name, cfg));
                         break :blk @unionInit(T, name, payload);
                     }
                 }

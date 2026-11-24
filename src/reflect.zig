@@ -162,6 +162,8 @@ pub const VariantInfo = struct {
     /// The payload type; `void` for a variant that is only its key.
     type: type,
     kind: Kind,
+    /// The bounds of the payload (`serde.fields.<variant>`), applied as a field's are.
+    bounds: meta.Bounds,
 };
 
 /// The variants of tagged union `T`.
@@ -178,6 +180,7 @@ pub fn variants(comptime T: type, comptime cfg: anytype) []const VariantInfo {
                 .wire = meta.effectiveFieldKey(T, name, cfg),
                 .type = PayloadType,
                 .kind = kindOf(PayloadType),
+                .bounds = meta.effectiveBounds(T, name, cfg),
             };
         }
         const final = out;

@@ -45,6 +45,7 @@ const meta = @import("meta.zig");
 const reflect = @import("reflect.zig");
 const typed = @import("typed.zig");
 const root = @import("root.zig");
+const cbor = @import("cbor.zig");
 
 pub const Error = error{
     /// A span's offset or end does not fit `u32`, or lies before the base address.
@@ -498,19 +499,22 @@ pub fn describe(comptime T: type, comptime cfg: anytype) Node {
 // ---- the arena a decode needs -----------------------------------------------------------------------------------
 
 const Limits = struct {
-    max_items: usize,
-    max_string_len: usize,
-    max_depth: usize,
-    max_input_bytes: usize,
+    max_items: u64,
+    max_string_len: u64,
+    max_depth: u64,
+    max_input_bytes: u64,
+    /// A strict CBOR read: definite lengths only, so no list grows and no string is rewritten.
+    strict: bool,
 };
 
 fn limitsOf(comptime format_cfg: anytype) Limits {
-    const unbounded = std.math.maxInt(usize);
+    const unbounded: u64 = std.math.maxInt(usize);
     return .{
         .max_items = if (meta.hasField(@TypeOf(format_cfg), "max_items")) @field(format_cfg, "max_items") else unbounded,
         .max_string_len = if (meta.hasField(@TypeOf(format_cfg), "max_string_len")) @field(format_cfg, "max_string_len") else unbounded,
         .max_depth = if (meta.hasField(@TypeOf(format_cfg), "max_depth")) @min(@field(format_cfg, "max_depth"), 128) else 128,
         .max_input_bytes = if (meta.hasField(@TypeOf(format_cfg), "max_input_bytes")) @field(format_cfg, "max_input_bytes") else unbounded,
+        .strict = meta.hasField(@TypeOf(format_cfg), "mode") and @field(format_cfg, "mode") == cbor.Mode.strict,
     };
 }
 
@@ -520,14 +524,14 @@ fn limitsOf(comptime format_cfg: anytype) Limits {
 /// draws on the one budget the whole input has, so lists nested in it do not multiply it: `pool` is how
 /// much the worst use of one item costs, and combines by the most, not the sum.
 const Amount = struct {
-    fixed: usize = 0,
-    pool: usize = 0,
+    fixed: u64 = 0,
+    pool: u64 = 0,
 
     fn plus(a: Amount, b: Amount) Amount {
         return .{ .fixed = a.fixed + b.fixed, .pool = @max(a.pool, b.pool) };
     }
 
-    fn times(a: Amount, n: usize) Amount {
+    fn times(a: Amount, n: u64) Amount {
         return .{ .fixed = a.fixed * n, .pool = a.pool };
     }
 
@@ -536,7 +540,7 @@ const Amount = struct {
     }
 
     /// With every item of the budget at most `items` of it.
-    fn total(a: Amount, comptime items: usize) usize {
+    fn total(a: Amount, comptime items: u64) u64 {
         return a.fixed + a.pool * items;
     }
 };
@@ -554,11 +558,11 @@ const Cost = struct {
     lists: Amount = .{},
     text: Amount = .{},
     /// The most one string takes while it is built, over what it holds when done (the most of any, not a sum).
-    transient: usize = 0,
-    scratch: usize = 0,
-    list_size: usize = 0,
-    list_align: usize = 0,
-    list_wire: usize = 0,
+    transient: u64 = 0,
+    scratch: u64 = 0,
+    list_size: u64 = 0,
+    list_align: u64 = 0,
+    list_wire: u64 = 0,
 
     fn plus(a: Cost, b: Cost) Cost {
         return .{
@@ -572,7 +576,15 @@ const Cost = struct {
         };
     }
 
-    fn times(a: Cost, n: usize) Cost {
+    /// The costs of one read and of the copy of the same items into the wire layout: what is spent per
+    /// item of the budget is spent twice (once as typed, once as wire).
+    fn together(typed_cost: Cost, wire_cost: Cost) Cost {
+        var out = typed_cost.plus(wire_cost);
+        out.lists.pool = typed_cost.lists.pool + wire_cost.lists.pool;
+        return out;
+    }
+
+    fn times(a: Cost, n: u64) Cost {
         var out = a;
         out.lists = a.lists.times(n);
         out.text = a.text.times(n);
@@ -595,11 +607,11 @@ const Cost = struct {
 /// The bytes a list of `n` items of `size` and `alignment` takes in a fixed buffer, worst case: an
 /// array list grows from nothing through the capacities the standard library gives it, each a new
 /// allocation (the buffer reuses only the last one), and is copied to its exact size at the end.
-fn growth(n: usize, size: usize, alignment: usize) usize {
+fn growth(n: u64, size: u64, alignment: u64) u64 {
     if (n == 0) return 0;
     const init = @max(1, 128 / size);
-    var capacity: usize = 0;
-    var total: usize = 0;
+    var capacity: u64 = 0;
+    var total: u64 = 0;
     while (capacity < n) {
         capacity = (capacity + 1) + ((capacity + 1) / 2 + init);
         total += capacity * size + alignment - 1;
@@ -610,10 +622,10 @@ fn growth(n: usize, size: usize, alignment: usize) usize {
 /// The most `growth` costs for one item of the shared budget: a list of `k` items uses `k + 1` of
 /// it (its own place and its elements), and costs most per item just after it grew, so the ratio is
 /// taken at one item and at each capacity boundary up to `budget` items.
-fn growthPerItem(budget: usize, size: usize, alignment: usize) usize {
+fn growthPerItem(budget: u64, size: u64, alignment: u64) u64 {
     const init = @max(1, 128 / size);
     var worst = (growth(1, size, alignment) + 1) / 2;
-    var capacity: usize = 0;
+    var capacity: u64 = 0;
     while (capacity < budget) {
         capacity = (capacity + 1) + ((capacity + 1) / 2 + init);
         const k = capacity + 1;
@@ -622,13 +634,26 @@ fn growthPerItem(budget: usize, size: usize, alignment: usize) usize {
     return worst;
 }
 
-fn bound(comptime name: []const u8, comptime limit: usize, comptime what: []const u8) usize {
+/// The bytes of a list of `n` items in a read: `growth` for one that is built as it is read, and the
+/// exact size for one a strict CBOR read allocates once, since it states its length up front.
+fn listBytes(n: u64, size: u64, alignment: u64, strict: bool) u64 {
+    if (!strict) return growth(n, size, alignment);
+    return if (n == 0) 0 else n * size + alignment - 1;
+}
+
+/// `growthPerItem` for `listBytes`: a list of `k` items takes `k * size + alignment - 1` of `k + 1`.
+fn listPerItem(budget: u64, size: u64, alignment: u64, strict: bool) u64 {
+    if (!strict) return growthPerItem(budget, size, alignment);
+    return size + alignment;
+}
+
+fn bound(comptime name: []const u8, comptime limit: u64, comptime what: []const u8) u64 {
     if (limit == std.math.maxInt(usize)) @compileError(what ++ " has no bound a decode can rely on: " ++ name);
     return limit;
 }
 
 /// Whether `limit` is a bound and not the lack of one.
-fn bounded(limit: usize) bool {
+fn bounded(limit: u64) bool {
     return limit != std.math.maxInt(usize);
 }
 
@@ -651,16 +676,20 @@ fn bounded(limit: usize) bool {
 /// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
 /// members (they would cost without limit: set `deny_unknown_fields`), or when it collects extras.
 pub fn maxArenaSize(comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
+    return comptime computeBound(T, serde_cfg, format_cfg);
+}
+
+fn computeBound(comptime T: type, comptime serde_cfg: anytype, comptime format_cfg: anytype) usize {
     @setEvalBranchQuota(1_000_000);
     const limits = comptime limitsOf(format_cfg);
-    const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0).plus(wireOwned(T, .{}, serde_cfg, limits));
+    const cost = comptime typedOwned(T, .{}, serde_cfg, limits, 0).together(wireOwned(T, .{}, serde_cfg, limits));
     const slack = 256;
     const items = limits.max_items;
 
     // Arrays of lists: from the fields, and, where the items are bounded, from the budget alone.
     var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", items, "the items of the input"));
     if (cost.list_size != 0 and bounded(items)) {
-        const per_item = growthPerItem(items, cost.list_size, cost.list_align) + cost.list_wire + 16;
+        const per_item = listPerItem(items, cost.list_size, cost.list_align, limits.strict) + cost.list_wire + 16;
         lists = @min(lists, per_item * items);
     }
 
@@ -671,36 +700,41 @@ pub fn maxArenaSize(comptime T: type, comptime serde_cfg: anytype, comptime form
         // Every byte of a rewritten string comes from the input, at most twice: a JSON base64 string is
         // built (at most the input), then decoded (three quarters of it). A string is built last in the
         // arena, so its buffer grows in place and costs what it holds.
-        const input: usize = limits.max_input_bytes;
+        const input: u64 = limits.max_input_bytes;
         text = @min(text, 2 * input);
         transient = @min(transient, building(input));
     }
-    return lists + text + transient + cost.scratch + slack;
+    const total = lists + text + transient + cost.scratch + slack;
+    if (total > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
+    return @intCast(total);
 }
 
 /// How much more than its final `n` bytes a string takes while it is built: its buffer is an array list,
 /// which grows in place (it is the last thing in the arena) to `n + n / 2 + 128` before it is cut to size.
-fn building(n: usize) usize {
+fn building(n: u64) u64 {
     return n / 2 + 128;
 }
 
 /// The list bound of a field, if it has one of its own: a field's `max_len` is a number of items the
 /// field can hold; without it the list draws on the shared budget.
-fn ownBound(comptime bounds: meta.Bounds) ?usize {
+fn ownBound(comptime bounds: meta.Bounds) ?u64 {
     return if (bounds.max_len == std.math.maxInt(usize)) null else bounds.max_len;
 }
 
 /// What the typed read allocates for one value of `T`, beyond the storage `T` itself takes.
-fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: usize) Cost {
+fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) Cost {
     return switch (comptime reflect.kindOf(T)) {
         .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
         .text => blk: {
-            const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a string");
+            // A strict read has only definite strings, which it never rewrites: they are spans of the input.
+            if (limits.strict) break :blk .{};
+            const n: u64 = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a string");
             break :blk .{ .text = .{ .fixed = n }, .transient = building(n) };
         },
         .byte_string => blk: {
+            if (limits.strict) break :blk .{};
             // The token it is read from (base64 is a third longer) and the bytes it decodes to.
-            const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a byte string");
+            const n: u64 = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a byte string");
             const token = @min(limits.max_string_len, @max(n, n / 3 * 4 + 8));
             break :blk .{ .text = .{ .fixed = token + n }, .transient = building(token) };
         },
@@ -709,7 +743,7 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             // for a key that is itself an array or map its canonical bytes, once more at each level of
             // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
             // the most of the two. Only CBOR does this; the bound is for either format.
-            const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a raw item");
+            const n: u64 = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a raw item");
             // The item is itself a container, below the `depth` that hold it.
             const levels = @min(limits.max_depth -| (depth + 1), n / 4 + 1);
             break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1)) };
@@ -720,13 +754,13 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             const element = typedOwned(Elem, elem_bounds, cfg, limits, depth + 1);
             var own: Cost = .{ .list_size = @sizeOf(Elem), .list_align = @alignOf(Elem), .list_wire = if (isScalarList(Elem)) 0 else @sizeOf(Wire(Elem)) };
             if (ownBound(bounds)) |n| {
-                own.lists.fixed = growth(n, @sizeOf(Elem), @alignOf(Elem));
+                own.lists.fixed = listBytes(n, @sizeOf(Elem), @alignOf(Elem), limits.strict);
                 break :blk own.plus(element.times(n));
             }
             // From the shared budget: each item costs its share of the array and what its own
             // element costs, and one item's worth of what a list nested in it costs.
             const items = bound("max_items", limits.max_items, "the items of the input");
-            own.lists.pool = growthPerItem(items, @sizeOf(Elem), @alignOf(Elem)) + element.lists.fixed;
+            own.lists.pool = listPerItem(items, @sizeOf(Elem), @alignOf(Elem), limits.strict) + element.lists.fixed;
             own.text.pool = element.text.fixed;
             break :blk own.plus(.{
                 .lists = .{ .pool = element.lists.pool },
@@ -753,7 +787,7 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         .@"union" => blk: {
             var most: Cost = .{};
             for (reflect.variants(T, cfg)) |variant| {
-                if (variant.type != void) most = most.most(typedOwned(variant.type, .{}, cfg, limits, depth + 1));
+                if (variant.type != void) most = most.most(typedOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
             }
             break :blk most;
         },
@@ -785,7 +819,7 @@ fn wireOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyty
         .@"union" => blk: {
             var most: Cost = .{};
             for (reflect.variants(T, cfg)) |variant| {
-                if (variant.type != void) most = most.most(wireOwned(variant.type, .{}, cfg, limits));
+                if (variant.type != void) most = most.most(wireOwned(variant.type, variant.bounds, cfg, limits));
             }
             break :blk most;
         },

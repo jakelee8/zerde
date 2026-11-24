@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fixed (`zerde.wire.maxArenaSize`): the arithmetic is in 64 bits (it overflowed a 32-bit `usize` on wasm32 for 4,096-item lists and 4 MiB strings) and `zig build test` compiles a probe for wasm32; the typed copy and the wire copy of the same budget items are added, not taken as the most; a strict CBOR read (`mode = .strict` in the format config) is charged no rewritten text and exact list sizes
+- fixed: a bound on a union variant (`serde.fields.<variant>`, such as `max_len` on a `Raw` payload) is applied by the typed read, which ignored it, and by the arena bound; `reflect.variants` reports it
 - fixed (`zerde.wire.maxArenaSize`): the bound now adds the most one rewritten string takes while its buffer grows (half again and 128 bytes over its length), so a string over about 260 bytes fits an arena of exactly the bound; its doc states one rule for the text cap
 - fixed (`zerde.wire`): a bool is a `u8` checked as 0 or 1 on `fromWire` and `encode`, and a list of bools is converted, not aliased (an invalid bool byte was accepted)
 - changed (`zerde.wire.maxArenaSize`): lists with no bound of their own share the `max_items` budget instead of multiplying per level; only rewritten text and the reader's key scratch are charged, text at most twice `max_input_bytes`, which `decode` now enforces (`error.InputTooLarge`); an array list's growth is computed from the standard library's capacities; adversarial tests decode into an arena of exactly the bound

@@ -4509,9 +4509,9 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     try std.testing.expectEqual(@as(usize, 187419), wire.maxArenaSize(Raws, .{}, .{}));
     try std.testing.expectEqual(@as(usize, 24751), wire.maxArenaSize(Raws, .{}, .{ .max_depth = 4 }));
     // Lists with no bound of their own share the one budget of 100 items, whatever the nesting.
-    // (and 4 + 128 more for the one string being built).
-    try std.testing.expectEqual(@as(usize, 9756 + 132), wire.maxArenaSize(Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
-    try std.testing.expect(wire.maxArenaSize(Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756 + 132);
+    // (4 + 128 more for the one string being built, and each item's wire array: 8 + 16 bytes).
+    try std.testing.expectEqual(@as(usize, 9756 + 132 + 24 * 100), wire.maxArenaSize(Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
+    try std.testing.expect(wire.maxArenaSize(Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756 + 132 + 24 * 100);
     // Lists of lists with bounds of their own multiply: three lists of at most four rows each.
     const Nest = struct {
         rows: []const []const Row,
@@ -4616,4 +4616,189 @@ test "a long string that is rewritten fits an arena of exactly the bound, while 
     for (0..3596) |_| try token.append(allocator, 'A');
     try token.appendSlice(allocator, "\\/AAA\"}");
     _ = try decodeWithin(zerde.json, Bytes, comptime wire.maxArenaSize(Bytes, .{}, bytes_cfg), token.items, bytes_cfg);
+}
+
+// ---- pooled transient, union variant bounds, strict mode, large limits -----------------------------
+
+test "a pooled list of long escaped strings fits an arena of exactly the bound" {
+    const Pooled = struct {
+        names: []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const cfg = .{ .max_items = 4, .max_string_len = 1000 };
+    const bound = comptime wire.maxArenaSize(Pooled, .{}, cfg);
+    // One string of 1000 bytes built while the list holds nothing else: its buffer is 1.5 times its length and 128 more.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "{\"names\":[\"");
+    for (0..999) |_| try input.append(allocator, 'a');
+    try input.appendSlice(allocator, "\\n\"]}");
+    const used = try decodeWithin(zerde.json, Pooled, bound, input.items, cfg);
+    try std.testing.expect(used <= bound);
+    // The smallest arena that works is found by trying: it holds the string's buffer, 1.5 times its length. (The bound
+    // charges each item of the budget a string, so the term for the buffer is not what decides it here; it is pinned
+    // by the figure of a pooled string in the bound figures above.)
+    var low: usize = 0;
+    var high: usize = bound;
+    while (low + 1 < high) {
+        const middle = (low + high) / 2;
+        const region = try allocator.alignedAlloc(u8, .@"16", input.items.len + middle);
+        defer allocator.free(region);
+        @memcpy(region[0..input.items.len], input.items);
+        var arena = std.heap.FixedBufferAllocator.init(region[input.items.len..]);
+        if (wire.decode(zerde.json, Pooled, &arena, @intFromPtr(region.ptr), region[0..input.items.len], .{}, cfg)) |_| {
+            high = middle;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            low = middle;
+        }
+    }
+    try std.testing.expect(high >= 1500);
+    try std.testing.expect(high <= bound);
+}
+
+test "a bound set on a union variant applies to its payload, and to the arena bound" {
+    const Choice = union(enum) {
+        raw: zerde.cbor.Raw,
+        text: []const u8,
+        none,
+        pub const serde = .{ .fields = .{ .raw = .{ .max_len = 64 }, .text = .{ .max_len = 5 } } };
+    };
+    const Holder = struct {
+        c: Choice,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // The typed read applies them.
+    const ok = try zerde.cbor.parseSlice(Holder, allocator, &.{ 0xa1, 0x61, 'c', 0xa1, 0x64, 't', 'e', 'x', 't', 0x65, 'h', 'e', 'l', 'l', 'o' });
+    defer zerde.free(allocator, ok);
+    try std.testing.expectEqualStrings("hello", ok.c.text);
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Holder, allocator, &.{ 0xa1, 0x61, 'c', 0xa1, 0x64, 't', 'e', 'x', 't', 0x66, 'h', 'e', 'l', 'l', 'o', '!' }));
+    var long_raw: std.ArrayList(u8) = .empty;
+    defer long_raw.deinit(allocator);
+    try long_raw.appendSlice(allocator, &.{ 0xa1, 0x61, 'c', 0xa1, 0x63, 'r', 'a', 'w', 0x58, 100 });
+    for (0..100) |_| try long_raw.append(allocator, 0);
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.cbor.parseSlice(Holder, allocator, long_raw.items));
+    try std.testing.expectError(error.LengthOutOfBounds, zerde.json.parseSlice(struct { c: union(enum) {
+        text: []const u8,
+        pub const serde = .{ .fields = .{ .text = .{ .max_len = 3 } } };
+    } }, allocator, "{\"c\":{\"text\":\"abcd\"}}"));
+    // The arena bound uses them: a 16 MiB string allowance does not make a 64-byte raw item cost 16 MiB.
+    const loose = .{ .max_string_len = 16 * 1024 * 1024 };
+    const bound = comptime wire.maxArenaSize(Holder, .{}, loose);
+    try std.testing.expect(bound < 100_000);
+    reflectVariantBounds: {
+        const variants = comptime zerde.reflect.variants(Choice, .{});
+        try std.testing.expectEqual(@as(usize, 64), variants[0].bounds.max_len);
+        try std.testing.expectEqual(@as(usize, 5), variants[1].bounds.max_len);
+        break :reflectVariantBounds;
+    }
+}
+
+test "a strict read rewrites no string and builds no list: the bound says so" {
+    const Req = Request(zerde.cbor.Raw);
+    const lenient_cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .max_depth = 16 };
+    const strict_cfg = .{ .max_items = 8192, .max_string_len = 262144, .max_input_bytes = 32768, .max_depth = 16, .mode = zerde.cbor.Mode.strict };
+    const lenient = comptime wire.maxArenaSize(Req, .{}, lenient_cfg);
+    const strict_bound = comptime wire.maxArenaSize(Req, .{}, strict_cfg);
+    try std.testing.expect(strict_bound < lenient);
+    // The effects list is a definite array of 64: 64 * 128 bytes of Effect and the wire copy, exactly, and the
+    // reader's keys for a raw item; no string, no growth.
+    try std.testing.expect(strict_bound < lenient - 2 * 32768 + 1);
+    // Strict input at the worst: a deterministic raw item that is a chain of maps used as keys, in 64 effects of
+    // definite strings and arrays, decoded into an arena of exactly the strict bound.
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(allocator);
+    try inner.appendSlice(allocator, &.{ 0xb9, 0x0b, 0xb8 });
+    for (0..3000) |key| {
+        if (key < 24) {
+            try inner.appendSlice(allocator, &.{ @intCast(key), 0x00 });
+        } else if (key < 256) {
+            try inner.appendSlice(allocator, &.{ 0x18, @intCast(key), 0x00 });
+        } else {
+            try inner.appendSlice(allocator, &.{ 0x19, @intCast(key >> 8), @intCast(key & 0xff), 0x00 });
+        }
+    }
+    for (0..5) |_| {
+        var next: std.ArrayList(u8) = .empty;
+        try next.append(allocator, 0xa1);
+        try next.appendSlice(allocator, inner.items);
+        try next.append(allocator, 0x00);
+        inner.deinit(allocator);
+        inner = next;
+    }
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &.{ 0xa1, 0x67, 'e', 'f', 'f', 'e', 'c', 't', 's', 0x81 });
+    // An effect's keys in the order a strict read needs: key, meta, payload, record_type.
+    try input.appendSlice(allocator, &.{ 0xa4, 0x63, 'k', 'e', 'y', 0x41, 1, 0x64, 'm', 'e', 't', 'a' });
+    try input.appendSlice(allocator, inner.items);
+    try input.appendSlice(allocator, &.{ 0x67, 'p', 'a', 'y', 'l', 'o', 'a', 'd', 0x41, 1, 0x6b, 'r', 'e', 'c', 'o', 'r', 'd', '_', 't', 'y', 'p', 'e', 0x61, 'a' });
+    const used = try decodeWithin(zerde.cbor, Req, strict_bound, input.items, strict_cfg);
+    try std.testing.expect(used <= strict_bound);
+    // Many effects, definite everything.
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(allocator);
+    try many.appendSlice(allocator, &.{ 0xa1, 0x67, 'e', 'f', 'f', 'e', 'c', 't', 's', 0x98, 64 });
+    for (0..64) |_| {
+        try many.appendSlice(allocator, &.{ 0xa4, 0x63, 'k', 'e', 'y', 0x41, 1, 0x64, 'm', 'e', 't', 'a', 0xa0 });
+        try many.appendSlice(allocator, &.{ 0x67, 'p', 'a', 'y', 'l', 'o', 'a', 'd', 0x41, 1, 0x6b, 'r', 'e', 'c', 'o', 'r', 'd', '_', 't', 'y', 'p', 'e', 0x61, 'a' });
+    }
+    const used_many = try decodeWithin(zerde.cbor, Req, strict_bound, many.items, strict_cfg);
+    try std.testing.expect(used_many <= strict_bound);
+    // The lenient reader would have been refused what the strict bound relies on: chunked text is not strict.
+    var chunked: std.ArrayList(u8) = .empty;
+    defer chunked.deinit(allocator);
+    try chunked.appendSlice(allocator, &.{ 0xa1, 0x67, 'e', 'f', 'f', 'e', 'c', 't', 's', 0x81, 0xa4, 0x63, 'k', 'e', 'y', 0x41, 1, 0x64, 'm', 'e', 't', 'a', 0xa0 });
+    try chunked.appendSlice(allocator, &.{ 0x67, 'p', 'a', 'y', 'l', 'o', 'a', 'd', 0x41, 1, 0x6b, 'r', 'e', 'c', 'o', 'r', 'd', '_', 't', 'y', 'p', 'e', 0x7f, 0x61, 'a', 0xff });
+    try std.testing.expectError(error.NonDeterministicEncoding, decodeWithin(zerde.cbor, Req, strict_bound, chunked.items, strict_cfg));
+}
+
+test "figures for a strict read, and for a union variant that holds a bounded list" {
+    const Row = struct {
+        a: u32,
+        b: u32,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const Rows = struct {
+        rows: []const Row,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 10 } } };
+    };
+    const Text = struct {
+        s: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 100 } } };
+    };
+    const Blob3 = struct {
+        b: zerde.ByteString,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .b = .{ .max_len = 90 } } };
+    };
+    const strict_cfg = .{ .mode = zerde.cbor.Mode.strict };
+    // Nothing is rewritten and each list is allocated once, at its exact size: 10 * 8 + 3, the wire array 10 * 8 + 16.
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(Text, .{}, strict_cfg));
+    try std.testing.expectEqual(@as(usize, 256), wire.maxArenaSize(Blob3, .{}, strict_cfg));
+    try std.testing.expectEqual(@as(usize, 83 + 96 + 256), wire.maxArenaSize(Rows, .{}, strict_cfg));
+    // A strict list that draws on the budget costs its size and alignment per item.
+    const Drawn = struct {
+        xs: []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    try std.testing.expectEqual(@as(usize, (16 + 8 + 8 + 16) * 10 + 256), wire.maxArenaSize(Drawn, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_items = 10 }));
+    // A variant with a list of its own bound: typed 139 + 35, wire 4 * 8 + 16, with no budget needed.
+    const Pick = union(enum) {
+        rows: []const Row,
+        none,
+        pub const serde = .{ .fields = .{ .rows = .{ .max_len = 4 } } };
+    };
+    try std.testing.expectEqual(@as(usize, 139 + 35 + 48 + 256), wire.maxArenaSize(Pick, .{}, .{}));
+}
+
+test "the bound is computed in 64 bits, so limits that overflow a 32-bit usize do not stop it" {
+    const Big = struct {
+        names: []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .names = .{ .max_len = 4096 } } };
+    };
+    // 4,096 strings of 4 MiB each is 16 GiB by the fields; the input of 8 MiB is what the bound rests on.
+    const cfg = .{ .max_items = 8192, .max_string_len = 4 * 1024 * 1024, .max_input_bytes = 8 * 1024 * 1024 };
+    const bound = comptime wire.maxArenaSize(Big, .{}, cfg);
+    try std.testing.expect(bound > 16 * 1024 * 1024 and bound < 20 * 1024 * 1024);
+    // (19,227,081 on a 64-bit target and 19,043,431 on wasm32, where slices are half the size: the arithmetic is in 64 bits.)
 }
