@@ -390,7 +390,7 @@ field of the writer too) bounds it: the most output one open container may hold 
 the arrays inside it). A write or a close that would pass it is `error.ContainerTooLarge`, decided from the size of the
 item before anything is allocated for it, so a megabyte of text into a small container costs nothing. Sizes are counted
 up to a few bytes high per item (a CBOR head as nine bytes, a JSON separator), never low. Output outside every container
-goes straight to the writer and is not counted. A map's index of entries (24 bytes each, at most one per two bytes of
+goes straight to the writer and is not counted. The size of a string is worked out only when a limit is set. A map's index of entries (24 bytes each, at most one per two bytes of
 the container) comes on top.
 
 ### Wire types with hooks

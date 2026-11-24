@@ -4,6 +4,7 @@
 //! only implements JSON syntax, tokenization, and container state management.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const diagnostic_mod = @import("diagnostic.zig");
 const typed = @import("typed.zig");
@@ -1185,6 +1186,13 @@ pub const ValueWriter = struct {
         try self.roomAt(self.depth, add);
     }
 
+    /// `room` for a string that takes `extra` bytes more than its escaped text. The text is measured only when there is a limit
+    /// to compare it with: an unbounded writer would scan every string a second time for nothing.
+    fn roomText(self: *ValueWriter, value: []const u8, extra: usize) !void {
+        if (self.max_container_bytes == std.math.maxInt(usize)) return;
+        try self.room(escapedLen(value) + extra);
+    }
+
     pub fn writeNull(self: *ValueWriter) !void {
         try self.beforeValue();
         try self.room(5);
@@ -1223,7 +1231,7 @@ pub const ValueWriter = struct {
             if (frame.kind == .object and frame.expect_key) {
                 const out = &frame.buf.writer;
                 // The key and its colon, and the comma that will join the entry to the one before it.
-                try self.room(escapedLen(value) + 3 + 1);
+                try self.roomText(value, 3 + 1);
                 frame.entry_start = frame.buf.written().len;
                 try writeStringText(out, value, self.trusted_text);
                 try out.writeByte(':');
@@ -1235,18 +1243,18 @@ pub const ValueWriter = struct {
             }
         }
         try self.beforeValue();
-        try self.room(escapedLen(value) + 1);
+        try self.roomText(value, 1);
         try writeStringText(self.sink(), value, self.trusted_text);
         try self.afterValue();
     }
 
     pub fn writeBytes(self: *ValueWriter, value: []const u8) !void {
         try self.beforeValue();
-        try self.room(switch (self.encoding) {
-            .string => escapedLen(value) + 1,
-            .base64 => std.base64.standard.Encoder.calcSize(value.len) + 3,
-            .base64url => std.base64.url_safe_no_pad.Encoder.calcSize(value.len) + 3,
-        });
+        switch (self.encoding) {
+            .string => try self.roomText(value, 1),
+            .base64 => try self.room(std.base64.standard.Encoder.calcSize(value.len) + 3),
+            .base64url => try self.room(std.base64.url_safe_no_pad.Encoder.calcSize(value.len) + 3),
+        }
         try writeBytesText(self.sink(), self.encoding, value);
         try self.afterValue();
     }
@@ -1710,8 +1718,12 @@ pub fn writeEscapedString(writer: *std.Io.Writer, bytes: []const u8) !void {
     try writeQuoted(writer, bytes);
 }
 
+/// Counts the scans of `escapedLen` in a test build, to show a write does not measure text it has no limit for.
+var escape_scans: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
 /// The bytes the JSON string literal of `value` takes between its quotes: the text, and the extra of each escape.
 fn escapedLen(value: []const u8) usize {
+    if (builtin.is_test) escape_scans += 1;
     var total = value.len;
     var at: usize = 0;
     while (true) {
@@ -2457,4 +2469,37 @@ test "a type can ask for bytewise field order" {
     defer out.deinit();
     try serializeWith(&out.writer, Example{ .zeta = 1, .alpha = 2 }, .{}, .{});
     try std.testing.expectEqualStrings("{\"alpha\":2,\"zeta\":1}", out.written());
+}
+
+test "the value writer measures a text for its container bound only when it has one" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const text = "a \"quoted\" text with é and \n an escape";
+    // Unbounded (the default): a key, a text and a byte string of the string encoding are written in one pass.
+    escape_scans = 0;
+    var open = valueWriter(std.testing.allocator, &out.writer, .{});
+    defer open.deinit();
+    try open.beginMap();
+    try open.writeText("key");
+    try open.writeText(text);
+    try open.writeText("bytes");
+    try open.writeBytes(text);
+    try open.endMap();
+    try std.testing.expectEqual(@as(usize, 0), escape_scans);
+    const unbounded = try std.testing.allocator.dupe(u8, out.written());
+    defer std.testing.allocator.free(unbounded);
+
+    // Bounded: each of the four is measured once, and the output is the same bytes.
+    out.clearRetainingCapacity();
+    escape_scans = 0;
+    var capped = valueWriter(std.testing.allocator, &out.writer, .{ .max_container_bytes = 1 << 20 });
+    defer capped.deinit();
+    try capped.beginMap();
+    try capped.writeText("key");
+    try capped.writeText(text);
+    try capped.writeText("bytes");
+    try capped.writeBytes(text);
+    try capped.endMap();
+    try std.testing.expectEqual(@as(usize, 4), escape_scans);
+    try std.testing.expectEqualStrings(unbounded, out.written());
 }
