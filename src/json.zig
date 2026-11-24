@@ -384,19 +384,14 @@ pub fn JsonDeserializer(comptime Config: type) type {
 
         /// Reads a `[N]u8` field in the configured `ReadConfig.bytes` encoding.
         pub fn readByteToken(self: *Self, allocator: Allocator) !StringToken {
-            const token = try self.readString(allocator);
             const codec = switch (bytesEncoding(Config, self.cfg)) {
-                .string => return token,
-                .base64 => std.base64.standard.Decoder,
-                .base64url => std.base64.url_safe_no_pad.Decoder,
+                .string => return self.readString(allocator),
+                .base64 => &std.base64.standard.Decoder,
+                .base64url => &std.base64.url_safe_no_pad.Decoder,
             };
-            defer token.deinit(allocator);
-
-            const decoded_len = codec.calcSizeForSlice(token.bytes) catch return error.InvalidBytes;
-            const buffer = try allocator.alloc(u8, decoded_len);
-            errdefer allocator.free(buffer);
-            codec.decode(buffer, token.bytes) catch return error.InvalidBytes;
-            return .{ .bytes = buffer, .allocated = true };
+            try self.count();
+            self.parser.skipWhitespace();
+            return self.parser.parseBytesToken(allocator, codec);
         }
 
         // The typed layer uses this to branch for optionals, enums, and skipping.
@@ -1510,6 +1505,9 @@ const Parser = struct {
         is_float: bool,
     };
 
+    /// What reading a base64 string adds to a string's errors.
+    const BytesError = Error || error{InvalidBytes};
+
     pub const Error = Allocator.Error || error{
         UnexpectedEndOfInput,
         UnexpectedToken,
@@ -1594,12 +1592,8 @@ const Parser = struct {
         return bytes;
     }
 
-    /// An escaped string is built a piece at a time; it stops at `max_string_len` instead of when it is whole.
-    fn withinLimit(self: *const Parser, builder: *const std.ArrayList(u8)) Error!void {
-        if (builder.items.len > self.max_string_len) return error.StringTooLong;
-    }
-
-    // Plain strings borrow from the input; escaped strings allocate rewritten bytes.
+    // Plain strings borrow from the input; an escaped string is measured first and written once into an
+    // exact allocation: the walk below runs twice over it, to count (and check) and to write.
     fn parseStringToken(self: *Parser, allocator: Allocator) Error!StringToken {
         const token = try self.parseStringTokenUnbounded(allocator);
         if (token.bytes.len > self.max_string_len) {
@@ -1609,38 +1603,90 @@ const Parser = struct {
         return token;
     }
 
+    /// Reads up to the first escape or the closing quote of the string at `self.index` (after its opening
+    /// quote): the input's own bytes if it has no escape, else null with `self.index` where the string began.
+    fn plainString(self: *Parser) Error!?[]const u8 {
+        const start = self.index;
+        while (true) {
+            self.index = bulk.findStringSpecial(self.input, self.index);
+            const c = self.consume() orelse return error.UnexpectedEndOfInput;
+            switch (c) {
+                '"' => return try self.validUtf8(self.input[start .. self.index - 1]),
+                '\\' => {
+                    self.index = start;
+                    return null;
+                },
+                0...31 => return error.InvalidStringCharacter,
+                else => {},
+            }
+        }
+    }
+
     fn parseStringTokenUnbounded(self: *Parser, allocator: Allocator) Error!StringToken {
         if (self.consume() != '"') return error.UnexpectedToken;
+        if (try self.plainString()) |plain| return .{ .bytes = plain, .allocated = false };
 
         const start = self.index;
-        var builder: std.ArrayList(u8) = .empty;
-        var builder_owned_here = true;
-        errdefer if (builder_owned_here) builder.deinit(allocator);
+        var measure: Measure = .{ .max = self.max_string_len };
+        try self.walkString(&measure);
+        const end = self.index;
+        self.index = start;
+        const buffer = try allocator.alloc(u8, measure.len);
+        errdefer allocator.free(buffer);
+        var write: Write = .{ .dest = buffer };
+        try self.walkString(&write);
+        std.debug.assert(self.index == end);
+        return .{ .bytes = buffer, .allocated = true };
+    }
 
+    /// The text of a string with no allocation to measure it: how long it is, checked against `max`, and its last two bytes.
+    const Measure = struct {
+        max: usize,
+        len: usize = 0,
+        tail: [2]u8 = .{ 0, 0 },
+        const checks = true;
+
+        fn put(self: *Measure, bytes: []const u8) Error!void {
+            self.len += bytes.len;
+            if (self.len > self.max) return error.StringTooLong;
+            if (bytes.len >= 2) {
+                self.tail = .{ bytes[bytes.len - 2], bytes[bytes.len - 1] };
+            } else if (bytes.len == 1) {
+                self.tail = .{ self.tail[1], bytes[0] };
+            }
+        }
+    };
+
+    /// The text of a string into the exact buffer `Measure` sized.
+    const Write = struct {
+        dest: []u8,
+        at: usize = 0,
+        const checks = false;
+
+        fn put(self: *Write, bytes: []const u8) Error!void {
+            @memcpy(self.dest[self.at..][0..bytes.len], bytes);
+            self.at += bytes.len;
+        }
+    };
+
+    /// Walks the string at `self.index` (after its opening quote) to its closing quote, giving each run of
+    /// plain bytes and each escape's UTF-8 bytes to `out.put`, in order. With `Out.checks` it also checks
+    /// every run is UTF-8 and a control character is refused; the pass that writes runs after one that checked.
+    fn walkString(self: *Parser, out: anytype) !void {
+        const Out = @typeInfo(@TypeOf(out)).pointer.child;
+        var run_start = self.index;
         while (true) {
             self.index = bulk.findStringSpecial(self.input, self.index);
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
-                '"' => {
-                    if (builder.items.len == 0) {
-                        return .{
-                            .bytes = try self.validUtf8(self.input[start .. self.index - 1]),
-                            .allocated = false,
-                        };
-                    }
-
-                    try builder.appendSlice(allocator, try self.validUtf8(self.input[start .. self.index - 1]));
-                    return .{
-                        .bytes = try builder.toOwnedSlice(allocator),
-                        .allocated = true,
-                    };
-                },
-                '\\' => {
-                    try builder.appendSlice(allocator, try self.validUtf8(self.input[start .. self.index - 1]));
-                    try self.appendEscape(allocator, &builder);
-                    try self.withinLimit(&builder);
-                    builder_owned_here = false;
-                    return self.finishEscapedString(allocator, builder);
+                '"', '\\' => {
+                    const run = self.input[run_start .. self.index - 1];
+                    try out.put(if (Out.checks) try self.validUtf8(run) else run);
+                    if (c == '"') return;
+                    var bytes: [4]u8 = undefined;
+                    const length = try self.escapeBytes(&bytes);
+                    try out.put(bytes[0..length]);
+                    run_start = self.index;
                 },
                 0...31 => return error.InvalidStringCharacter,
                 else => {},
@@ -1648,39 +1694,73 @@ const Parser = struct {
         }
     }
 
-    fn finishEscapedString(self: *Parser, allocator: Allocator, initial_builder: std.ArrayList(u8)) Error!StringToken {
-        var builder = initial_builder;
-        errdefer builder.deinit(allocator);
+    /// A string that holds base64 in the config's encoding, decoded into an exact allocation. One with no
+    /// escape is decoded from the input itself; one with escapes is measured, then unescaped through a
+    /// small buffer into the decoder, so the token is never built.
+    fn parseBytesToken(self: *Parser, allocator: Allocator, codec: *const std.base64.Base64Decoder) BytesError!StringToken {
+        if (self.consume() != '"') return error.UnexpectedToken;
+        if (try self.plainString()) |plain| {
+            if (plain.len > self.max_string_len) return error.StringTooLong;
+            const length = codec.calcSizeForSlice(plain) catch return error.InvalidBytes;
+            const buffer = try allocator.alloc(u8, length);
+            errdefer allocator.free(buffer);
+            codec.decode(buffer, plain) catch return error.InvalidBytes;
+            return .{ .bytes = buffer, .allocated = true };
+        }
 
-        var chunk_start = self.index;
-        while (true) {
-            self.index = bulk.findStringSpecial(self.input, self.index);
-            const c = self.consume() orelse return error.UnexpectedEndOfInput;
-            switch (c) {
-                '"' => {
-                    try builder.appendSlice(allocator, try self.validUtf8(self.input[chunk_start .. self.index - 1]));
-                    return .{
-                        .bytes = try builder.toOwnedSlice(allocator),
-                        .allocated = true,
-                    };
-                },
-                '\\' => {
-                    try builder.appendSlice(allocator, try self.validUtf8(self.input[chunk_start .. self.index - 1]));
-                    try self.appendEscape(allocator, &builder);
-                    try self.withinLimit(&builder);
-                    chunk_start = self.index;
-                },
-                0...31 => return error.InvalidStringCharacter,
-                else => {},
+        const start = self.index;
+        var measure: Measure = .{ .max = self.max_string_len };
+        try self.walkString(&measure);
+        const end = self.index;
+        self.index = start;
+        var length = codec.calcSizeUpperBound(measure.len) catch return error.InvalidBytes;
+        if (codec.pad_char) |pad| {
+            if (measure.len >= 1 and measure.tail[1] == pad) length -= 1;
+            if (measure.len >= 2 and measure.tail[0] == pad) length -= 1;
+        }
+        const buffer = try allocator.alloc(u8, length);
+        errdefer allocator.free(buffer);
+        var write: DecodeBase64 = .{ .codec = codec, .dest = buffer };
+        try self.walkString(&write);
+        try write.finish();
+        std.debug.assert(self.index == end);
+        return .{ .bytes = buffer, .allocated = true };
+    }
+
+    /// The text of a base64 string, decoded as it is unescaped: a chunk of 256 characters (a multiple of four, so
+    /// each decodes on its own) at a time into the exact buffer `Measure` sized.
+    const DecodeBase64 = struct {
+        codec: *const std.base64.Base64Decoder,
+        dest: []u8,
+        at: usize = 0,
+        chunk: [256]u8 = undefined,
+        filled: usize = 0,
+        const checks = false;
+
+        fn put(self: *DecodeBase64, bytes: []const u8) BytesError!void {
+            var rest = bytes;
+            while (rest.len != 0) {
+                const take = @min(rest.len, self.chunk.len - self.filled);
+                @memcpy(self.chunk[self.filled..][0..take], rest[0..take]);
+                self.filled += take;
+                rest = rest[take..];
+                if (self.filled == self.chunk.len) try self.flush();
             }
         }
-    }
 
-    fn appendEscape(self: *Parser, allocator: Allocator, builder: *std.ArrayList(u8)) Error!void {
-        var bytes: [4]u8 = undefined;
-        const length = try self.escapeBytes(&bytes);
-        try builder.appendSlice(allocator, bytes[0..length]);
-    }
+        fn finish(self: *DecodeBase64) BytesError!void {
+            if (self.filled != 0) try self.flush();
+            if (self.at != self.dest.len) return error.InvalidBytes;
+        }
+
+        fn flush(self: *DecodeBase64) BytesError!void {
+            const text = self.chunk[0..self.filled];
+            self.filled = 0;
+            const length = self.codec.calcSizeForSlice(text) catch return error.InvalidBytes;
+            self.codec.decode(self.dest[self.at..][0..length], text) catch return error.InvalidBytes;
+            self.at += length;
+        }
+    };
 
     /// The UTF-8 bytes of the escape after a backslash (up to four), which is consumed.
     fn escapeBytes(self: *Parser, out: *[4]u8) Error!usize {

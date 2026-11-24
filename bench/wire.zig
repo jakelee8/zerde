@@ -37,7 +37,7 @@ const Commit = struct {
 const read_cbor = .{ .mode = zerde.cbor.Mode.strict, .max_items = 40_000, .max_string_len = 1 << 20, .max_input_bytes = 8 << 20 };
 const read_json = .{ .bytes = zerde.json.BytesEncoding.base64, .max_items = 40_000, .max_string_len = 1 << 20, .max_input_bytes = 8 << 20 };
 
-const corpora = [_][]const u8{ @embedFile("corpus_code"), @embedFile("corpus_more_code"), @embedFile("corpus_prose") };
+const corpora = [_][]const u8{ @embedFile("wire_corpus_code"), @embedFile("wire_corpus_more_code"), @embedFile("wire_corpus_prose") };
 
 /// The effects: a put for every `lines_per_effect` lines of the corpora, a delete after each seventh.
 fn effects(allocator: std.mem.Allocator, keys: *std.ArrayList([8]u8)) ![]Effect {
@@ -73,8 +73,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
     const list = try effects(allocator, &keys);
     const commit: Commit = .{ .effects = list };
 
-    try measure(io, out, allocator, zerde.cbor, "cbor strict", commit, .{ .deterministic = true }, read_cbor);
-    try measure(io, out, allocator, zerde.json, "json", commit, .{ .bytes = zerde.json.BytesEncoding.base64 }, read_json);
+    try measure(io, out, allocator, zerde.cbor, "cbor strict", false, commit, .{ .deterministic = true }, read_cbor);
+    try measure(io, out, allocator, zerde.json, "json", false, commit, .{ .bytes = zerde.json.BytesEncoding.base64 }, read_json);
+    // The same JSON with every slash written as `\/`, as some producers do: the base64 and the text are all rewritten.
+    try measure(io, out, allocator, zerde.json, "json escaped", true, commit, .{ .bytes = zerde.json.BytesEncoding.base64 }, read_json);
     try out.flush();
 }
 
@@ -84,6 +86,7 @@ fn measure(
     allocator: std.mem.Allocator,
     comptime Format: type,
     name: []const u8,
+    escape_slashes: bool,
     commit: Commit,
     comptime write_cfg: anytype,
     comptime read_cfg: anytype,
@@ -91,6 +94,15 @@ fn measure(
     var encoded: std.Io.Writer.Allocating = .init(allocator);
     defer encoded.deinit();
     try zerde.serializeWith(Format, &encoded.writer, commit, .{}, write_cfg);
+    if (escape_slashes) {
+        var escaped: std.Io.Writer.Allocating = .init(allocator);
+        for (encoded.written()) |c| {
+            if (c == '/') try escaped.writer.writeByte('\\');
+            try escaped.writer.writeByte(c);
+        }
+        encoded.deinit();
+        encoded = escaped;
+    }
     const bound = comptime wire.maxArenaSize(Format, Commit, .{}, read_cfg);
 
     // One block holds the input and the arena, so a span is an offset from its start.

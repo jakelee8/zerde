@@ -676,18 +676,16 @@ const Amount = struct {
 
 /// What a decode takes of the arena, by what it is spent on, because each has its own limit:
 ///
-/// - `lists`: the arrays of lists (typed, and the wire copy of lists that are not scalars);
+/// - `lists`: the arrays of lists (the wire arrays);
 /// - `text`: the bytes of strings that are not borrowed from the input, which are the escaped ones
 ///   (JSON), the chunked ones (CBOR) and the bytes JSON decodes from base64, never a definite
-///   CBOR string or a plain JSON one, and never a `Raw` item;
+///   CBOR string or a plain JSON one, and never a `Raw` item; each is written once at its exact size;
 /// - `scratch`: what the reader keeps to check a `Raw` item, reused from one to the next, so the
 ///   most of any one and not their sum;
 /// - the largest list in the schema, for a bound of the lists that does not depend on the fields.
 const Cost = struct {
     lists: Amount = .{},
     text: Amount = .{},
-    /// The most one string takes while it is built, over what it holds when done (the most of any, not a sum).
-    transient: u64 = 0,
     scratch: u64 = 0,
     list_size: u64 = 0,
     list_align: u64 = 0,
@@ -696,7 +694,6 @@ const Cost = struct {
         return .{
             .lists = a.lists.plus(b.lists),
             .text = a.text.plus(b.text),
-            .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
@@ -714,7 +711,6 @@ const Cost = struct {
         return .{
             .lists = a.lists.most(b.lists),
             .text = a.text.most(b.text),
-            .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
@@ -776,11 +772,10 @@ fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const
 ///
 /// A string that is borrowed from the input (a definite CBOR string, a JSON string without an escape)
 /// and a `Raw` item cost nothing: their span points into the input. Only what is rewritten costs.
-/// Each such string costs what it holds when done, and one string at a time, at the top of the
-/// arena, costs more while its buffer grows (an array list grows in place to half again and a
-/// little more before it is cut to size): the bound adds the most of that over any one string, once.
-/// With `max_input_bytes` the strings together hold at most twice the input (a JSON base64 string
-/// is built, at most the input, then decoded, three quarters of it), and no string is longer than the
+/// Each such string is measured first and written once, so it costs what it holds and nothing more while
+/// it is built. With `max_input_bytes` the strings together hold at most the input (an escape takes two
+/// bytes of input or more for one, a chunk only adds a head, base64 decodes to three quarters of its
+/// text), and no string is longer than the
 /// input, if that is less than the sum of the fields' own bounds. A list costs the capacities an array
 /// list grows through, per list; lists together are charged at most `max_items` items, which is less
 /// than the sum of their `max_len` when those are generous.
@@ -822,23 +817,14 @@ fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: any
 
     // Text that is rewritten: from the fields, and, where the input and the items are bounded, from the input.
     var text = if (cost.text.pool == 0) cost.text.fixed else cost.text.total(bound("max_items", items, "the items of the input"));
-    var transient = cost.transient;
     if (limits.max_input_bytes) |input| {
-        // Every byte of a rewritten string comes from the input, at most twice: a JSON base64 string is
-        // built (at most the input), then decoded (three quarters of it). A string is built last in the
-        // arena, so its buffer grows in place and costs what it holds.
-        text = @min(text, 2 * input);
-        transient = @min(transient, building(input));
+        // Every byte of a rewritten string comes from the input, once: an escape takes two or more bytes of
+        // input for one, chunks only add heads, and base64 decodes to three quarters.
+        text = @min(text, input);
     }
-    const output = lists + text + transient + slack;
+    const output = lists + text + slack;
     if (output + cost.scratch > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
     return .{ .output = @intCast(output), .scratch = @intCast(cost.scratch) };
-}
-
-/// How much more than its final `n` bytes a string takes while it is built: its buffer is an array list,
-/// which grows in place (it is the last thing in the arena) to `n + n / 2 + 128` before it is cut to size.
-fn building(n: u64) u64 {
-    return n / 2 + 128;
 }
 
 /// The list bound of a field, if it has one of its own: a field's `max_len` is a number of items the
@@ -857,15 +843,15 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         .text => blk: {
             // A strict read has only definite strings, which it never rewrites: they are spans of the input.
             if (limits.strict) break :blk .{};
+            // A string with an escape or in chunks is measured first and written once, exactly sized.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a string");
-            break :blk .{ .text = .{ .fixed = n }, .transient = building(n) };
+            break :blk .{ .text = .{ .fixed = n } };
         },
         .byte_string => blk: {
             if (limits.strict) break :blk .{};
-            // The token it is read from (base64 is a third longer) and the bytes it decodes to.
+            // The bytes only: base64 is decoded from the input, or from the unescaped text a chunk at a time.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a byte string");
-            const token = tighter(limits.max_string_len, @max(n, n / 3 * 4 + 8)).?;
-            break :blk .{ .text = .{ .fixed = token + n }, .transient = building(token) };
+            break :blk .{ .text = .{ .fixed = n } };
         },
         .raw => blk: {
             // A strict read keeps no record of a key (it compares neighbours, and refuses a composite key that
@@ -897,7 +883,6 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             break :blk own.plus(.{
                 .lists = .{ .pool = element.lists.pool },
                 .text = .{ .pool = element.text.pool },
-                .transient = element.transient,
                 .scratch = element.scratch,
             });
         },

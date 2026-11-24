@@ -494,7 +494,7 @@ reads it by offset out of linear memory (TypeScript over WebAssembly, say) with 
   slice or an optional); a type that recurses through a list is charged down to `max_depth`.
   The bound is worked out in 64 bits and is a compile error only when it does not fit the target's `usize`. A bound set on a
   union variant (`serde.fields.<variant>`) applies to its payload, in the read and in the bound. Only what is
-  rewritten costs: the strings together hold at most twice the input (a JSON base64 string is built, then decoded), and one string at a time, at the top of the arena, costs half again and 128 bytes more while its buffer grows, which the bound adds once for the largest; a list the capacities an array list grows through, and a `Raw` item
+  rewritten costs: a rewritten string (a JSON string with an escape, a chunked CBOR string, bytes decoded from base64) is measured first and written once, so it costs its length and nothing while it is built, and the strings together hold at most the input; a list the capacities an array list grows through, and a `Raw` item
   only what the CBOR reader keeps to check its map keys (once, reused from one item to the next). It is a compile error when
   something a decode reaches has no bound, when a struct accepts unknown members (set `deny_unknown_fields`) or collects
   extras. It is not tight, but is within a small factor of the worst input: tests decode adversarial requests (escaped

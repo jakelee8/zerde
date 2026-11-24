@@ -450,6 +450,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "corpus_code", .module = b.createModule(.{ .root_source_file = b.path("tests/typed_tests.zig") }) },
                 .{ .name = "corpus_more_code", .module = b.createModule(.{ .root_source_file = b.path("src/cbor.zig") }) },
                 .{ .name = "corpus_prose", .module = b.createModule(.{ .root_source_file = b.path("README.md") }) },
+                // The wire benchmark's corpus is files that do not change with the code it measures, so rows compare.
+                .{ .name = "wire_corpus_code", .module = b.createModule(.{ .root_source_file = b.path("bench/common.zig") }) },
+                .{ .name = "wire_corpus_more_code", .module = b.createModule(.{ .root_source_file = b.path("vendor/zig-bson/src/root.zig") }) },
+                .{ .name = "wire_corpus_prose", .module = b.createModule(.{ .root_source_file = b.path("bench/BIN.md") }) },
             },
         }),
     });

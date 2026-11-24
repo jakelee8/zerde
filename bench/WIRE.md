@@ -5,7 +5,9 @@
 in strict CBOR and in JSON (bytes as base64, the text with its escapes). The corpus is this repository's own
 text, so its size follows the files: compare rows by bytes and effects, not by the totals alone. "Arena used"
 is `end_index` when the decode is done, "peak" the furthest byte it wrote, "bound" is `wire.maxArenaSize`.
-Time is ns for one decode, 200 decodes, two runs back to back under `flock`, load about 2.
+Time is ns for one decode, 200 decodes, two runs back to back under `flock`, load about 2. The corpus changed between the
+first section and the second (the files this benchmark read were edited by the work itself), so each section compares
+its own before and after, measured in the same session on the same input.
 
 ## 2026-11-23 - 879332e before, direct decode after
 
@@ -23,3 +25,28 @@ Time is ns for one decode, 200 decodes, two runs back to back under `flock`, loa
   spread (0.97 to 1.01 times). The sink adds no cost measured.
 - The corpus grew by four effects between the two rows because the repository's files did; per effect the figures
   above hold.
+
+## 2026-11-23 - 41c3439 before, exact-size strings after
+
+A rewritten string (a JSON string with an escape, a chunked CBOR string, base64 bytes) is measured first and
+written once, exactly sized; a base64 string with escapes is decoded from its unescaped text a chunk at a time, so
+its token is never built; a skipped chunked string is checked and not buffered. The corpus here is fixed files
+(`bench/common.zig`, `vendor/zig-bson/src/root.zig`, `bench/BIN.md`), so later rows compare; "json escaped" is the
+same JSON with every `/` written as `\/`, as some producers do. Input 301,382 B and 195 effects in CBOR, 358,403 B
+(358,651 B escaped) in JSON.
+
+| Read | Arena used (before, after) | Bound (before, after) | Time, two runs (before; after) |
+| --- | --- | --- | --- |
+| strict CBOR | 5,462 B, 5,462 B | 114,947 B, 114,947 B | 43,147 and 43,559 ns; 41,918 and 41,063 ns |
+| JSON | 315,587 B, 315,587 B | 17,799,272 B, 8,886,248 B | 369,190 and 362,979 ns; 420,359 and 415,063 ns |
+| JSON, slashes escaped | 321,999 B, 315,587 B | 17,799,272 B, 8,886,248 B | 389,474 and 371,400 ns; 455,824 and 473,887 ns |
+
+- Memory: the arena used is the same for plain JSON (nothing there was rewritten that was not already exact) and falls
+  2% when the base64 is escaped (the token of each payload is no longer built before it is decoded). The bound falls to
+  half (17.8 MB to 8.9 MB) because it no longer charges the base64 token or the growth of a string buffer; this
+  is the memory this item saves, since the used arena is not what the bound measures.
+- Time: JSON costs 13 to 15% more (plain) and 17 to 28% more (escaped), the second scan the item names (the measure
+  pass, which also UTF-8 checks, and the write pass, which does not). Compute against memory: on this corpus the
+  memory saved is the bound and the transient growth, which a fixed arena of exactly the bound cares about, and the
+  time paid is the second scan of each base64 or escaped string. Strict CBOR is unchanged. Whoever decides for the kernel
+  frames (strict CBOR, no rewrite) pays nothing.

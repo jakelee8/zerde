@@ -945,7 +945,8 @@ pub fn CborDeserializer(comptime Config: type) type {
         }
 
         /// The content of the string whose head is `header`: borrowed from the input when it is
-        /// one definite chunk, else assembled from the chunks of an indefinite one. Each chunk of an
+        /// one definite chunk, else joined from the chunks of an indefinite one: they are measured and
+        /// checked first, then copied once into an allocation of exactly their length. Each chunk of an
         /// indefinite string is a definite string of the same type (RFC 8949 §3.2.3), and a text
         /// chunk is valid UTF-8 on its own, so a code point cannot straddle two chunks.
         fn finishString(self: *Self, allocator: Allocator, header: Header) !StringToken {
@@ -957,22 +958,52 @@ pub fn CborDeserializer(comptime Config: type) type {
                 return .{ .bytes = raw, .allocated = false };
             }
 
-            var assembled: std.ArrayList(u8) = .empty;
-            errdefer assembled.deinit(allocator);
+            const start = self.index;
+            const total = try self.measureChunks(header.major);
+            const end = self.index;
+            self.index = start;
+            const joined = try allocator.alloc(u8, total);
+            errdefer allocator.free(joined);
+            var at: usize = 0;
+            // The chunks are checked; only their heads are read again, up to the break at `end - 1`.
+            while (self.index < end - 1) {
+                const chunk = try parseHeader(self.input, &self.index);
+                const raw = try self.takeBytes(chunk.value);
+                @memcpy(joined[at..][0..raw.len], raw);
+                at += raw.len;
+            }
+            self.index = end;
+            return .{ .bytes = joined, .allocated = true };
+        }
+
+        /// The length of the chunks of an indefinite string of type `major`, which are all checked as they are
+        /// counted, and the index after its break.
+        fn measureChunks(self: *Self, major: u8) !usize {
+            var total: usize = 0;
             while (true) {
                 if (self.index >= self.input.len) return error.UnexpectedEndOfInput;
                 if (self.input[self.index] == 0xff) {
                     self.index += 1;
-                    break;
+                    return total;
                 }
                 const chunk = try parseHeader(self.input, &self.index);
-                if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;
-                if (chunk.value > self.max_string_len - assembled.items.len) return error.StringTooLong;
+                if (chunk.major != major or chunk.indefinite) return error.InvalidStringChunk;
+                if (chunk.value > self.max_string_len - total) return error.StringTooLong;
                 const raw = try self.takeBytes(chunk.value);
-                if (is_text and !self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
-                try assembled.appendSlice(allocator, raw);
+                if (major == 3 and !self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
+                total += raw.len;
             }
-            return .{ .bytes = try assembled.toOwnedSlice(allocator), .allocated = true };
+        }
+
+        /// Checks the string whose head is `header`, and keeps nothing: no buffer for the chunks of an indefinite one.
+        fn skipString(self: *Self, header: Header) !void {
+            if (header.indefinite) {
+                _ = try self.measureChunks(header.major);
+                return;
+            }
+            if (header.value > self.max_string_len) return error.StringTooLong;
+            const raw = try self.takeBytes(header.value);
+            if (header.major == 3 and !self.trusted_text and !bulk.validUtf8(raw)) return error.InvalidUtf8;
         }
 
         /// Skips one data item, checking that it is well-formed and that every map in it has
@@ -985,10 +1016,7 @@ pub fn CborDeserializer(comptime Config: type) type {
             switch (header.major) {
                 0, 1 => {},
                 7 => try self.checkFloat(header),
-                2, 3 => {
-                    const token = try self.finishString(self.allocator, header);
-                    token.deinit(self.allocator);
-                },
+                2, 3 => try self.skipString(header),
                 4 => {
                     if (depth >= self.max_depth) return error.CborNestingTooDeep;
                     if (header.indefinite) {
@@ -1078,10 +1106,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 // 5.6.1): a float key is checked for it there, and a key that holds one inside is refused here.
                 switch (header.major) {
                     0, 1, 7 => {},
-                    2, 3 => {
-                        const token = try self.finishString(self.allocator, header);
-                        token.deinit(self.allocator);
-                    },
+                    2, 3 => try self.skipString(header),
                     else => {
                         self.index = start;
                         self.items -= 1;

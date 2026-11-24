@@ -4727,27 +4727,26 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     // Worked by hand: a list of ten 8-byte rows grows through one capacity of 17 (17 * 8 + 3 bytes), is copied to
     // its exact size (83) and its wire array is 10 * 8 + 16; and the slack is 256.
     try std.testing.expectEqual(@as(usize, 139 + 83 + 256), wire.maxArenaSize(zerde.json, Rows, .{}, .{}));
-    // A string of at most 100 bytes costs 100 and, while it is built, 50 + 128 more; with an input of 10 bytes
-    // the strings hold at most 20, and one is built from at most 10 bytes: 5 + 128 more.
-    try std.testing.expectEqual(@as(usize, 100 + 178 + 256), wire.maxArenaSize(zerde.json, Text, .{}, .{}));
-    try std.testing.expectEqual(@as(usize, 20 + 133 + 256), wire.maxArenaSize(zerde.json, Text, .{}, .{ .max_input_bytes = 10 }));
-    // Two strings: both held, and only the larger one being built at a time.
+    // A string of at most 100 bytes costs 100 (it is measured first and written once, exactly sized); with an input of 10 bytes
+    // the strings hold at most 10.
+    try std.testing.expectEqual(@as(usize, 100 + 256), wire.maxArenaSize(zerde.json, Text, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 10 + 256), wire.maxArenaSize(zerde.json, Text, .{}, .{ .max_input_bytes = 10 }));
+    // Two strings: both held.
     const Two = struct {
         a: []const u8,
         b: []const u8,
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .a = .{ .max_len = 100 }, .b = .{ .max_len = 40 } } };
     };
-    try std.testing.expectEqual(@as(usize, 140 + 178 + 256), wire.maxArenaSize(zerde.json, Two, .{}, .{}));
-    // Bytes: the token it is read from (a third longer: 128, built with 64 + 128 more) and the 90 it decodes to.
-    try std.testing.expectEqual(@as(usize, 128 + 90 + 192 + 256), wire.maxArenaSize(zerde.json, Blob2, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 140 + 256), wire.maxArenaSize(zerde.json, Two, .{}, .{}));
+    // Bytes: the 90 they decode to; the base64 is decoded from the input, or from its unescaped text a chunk at a time.
+    try std.testing.expectEqual(@as(usize, 90 + 256), wire.maxArenaSize(zerde.json, Blob2, .{}, .{}));
     // A raw item of 400 bytes: its keys at 101 levels (four bytes each), or at the two the config allows below the
     // two that hold it; a raw item itself is never copied.
     try std.testing.expectEqual(@as(usize, 187419), wire.maxArenaSize(zerde.cbor, Raws, .{}, .{}));
     try std.testing.expectEqual(@as(usize, 24751), wire.maxArenaSize(zerde.cbor, Raws, .{}, .{ .max_depth = 4 }));
     // Lists with no bound of their own share the one budget of 100 items, whatever the nesting.
-    // (4 + 128 more for the one string being built, and each item's wire array: 8 + 16 bytes).
-    try std.testing.expectEqual(@as(usize, 8688), wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
-    try std.testing.expect(wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 8688);
+    try std.testing.expectEqual(@as(usize, 8556), wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
+    try std.testing.expect(wire.maxArenaSize(zerde.json, Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 8556);
     // Lists of lists with bounds of their own multiply: three lists of at most four rows each.
     const Nest = struct {
         rows: []const []const Row,
@@ -4774,7 +4773,110 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     // Charged per item: the array of 8-byte wire lists, grown and copied, over the items of the budget: 75 an item.
     try std.testing.expectEqual(@as(usize, 75 * 100 + 256), wire.maxArenaSize(zerde.json, Drawn, .{}, .{ .max_items = 100 }));
     // Strings in a list with a max_len and elem bounds: five of at most twenty bytes (the list of 8-byte spans grows through 139 and is copied to 43; 182 in all).
-    try std.testing.expectEqual(@as(usize, 182 + 100 + 138 + 256), wire.maxArenaSize(zerde.json, Times, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 182 + 100 + 256), wire.maxArenaSize(zerde.json, Times, .{}, .{}));
+}
+// ---- a rewritten string is measured first and written once, at its exact length ---------------------------
+
+/// The bytes of an arena that `input` decodes into, when it is given `size` bytes and no more.
+fn decodeInExactly(comptime Format: type, comptime T: type, size: usize, input: []const u8, comptime format_cfg: anytype) !usize {
+    const region = try allocator.alignedAlloc(u8, .@"16", input.len + size);
+    defer allocator.free(region);
+    @memcpy(region[0..input.len], input);
+    var arena = std.heap.FixedBufferAllocator.init(region[input.len..]);
+    _ = try wire.decode(Format, T, &arena, @intFromPtr(region.ptr), region[0..input.len], .{}, format_cfg);
+    return arena.end_index;
+}
+
+const TextBox = struct {
+    s: []const u8,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 100 } } };
+};
+const BytesBox = struct {
+    b: zerde.ByteString,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .b = .{ .max_len = 1000 } } };
+};
+const BigBytes = struct {
+    b: zerde.ByteString,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .b = .{ .max_len = 4096 } } };
+};
+
+test "a JSON string with escapes and a chunked CBOR string are allocated once, at their length" {
+    // "a", a newline, "b", é (two bytes) and an emoji from a surrogate pair: nine bytes, and an arena of nine bytes.
+    try std.testing.expectEqual(@as(usize, 9), try decodeInExactly(zerde.json, TextBox, 9, "{\"s\":\"a\\nb\\u00e9\\ud83d\\ude00\"}", .{}));
+    try std.testing.expectError(error.OutOfMemory, decodeInExactly(zerde.json, TextBox, 8, "{\"s\":\"a\\nb\\u00e9\\ud83d\\ude00\"}", .{}));
+    // A CBOR string in three chunks: three bytes, one allocation.
+    try std.testing.expectEqual(@as(usize, 3), try decodeInExactly(zerde.cbor, TextBox, 3, &.{ 0xa1, 0x61, 's', 0x7f, 0x61, 'a', 0x60, 0x62, 'b', 'c', 0xff }, .{}));
+    // The bound is the length of the string.
+    try std.testing.expectEqual(@as(usize, 100 + 256), wire.maxArenaSize(zerde.json, TextBox, .{}, .{}));
+    // The errors are the ones the reader gave: a bad escape, a control character, a lone surrogate, bad UTF-8, a long string.
+    try std.testing.expectError(error.InvalidStringEscape, decodeInExactly(zerde.json, TextBox, 64, "{\"s\":\"ab\\q\"}", .{}));
+    try std.testing.expectError(error.InvalidStringCharacter, decodeInExactly(zerde.json, TextBox, 64, "{\"s\":\"a\\nb\x01\"}", .{}));
+    try std.testing.expectError(error.InvalidUnicodeSurrogate, decodeInExactly(zerde.json, TextBox, 64, "{\"s\":\"a\\nb\\ud800\"}", .{}));
+    try std.testing.expectError(error.InvalidUtf8, decodeInExactly(zerde.json, TextBox, 64, "{\"s\":\"a\\nb\xff\"}", .{}));
+    try std.testing.expectError(error.UnexpectedEndOfInput, decodeInExactly(zerde.json, TextBox, 64, "{\"s\":\"a\\nb", .{}));
+    try std.testing.expectError(error.LengthOutOfBounds, decodeInExactly(zerde.json, TextBox, 400, "{\"s\":\"\\n" ++ comptime longName(100, 'x') ++ "\"}", .{}));
+    try std.testing.expectError(error.InvalidUtf8, decodeInExactly(zerde.cbor, TextBox, 64, &.{ 0xa1, 0x61, 's', 0x7f, 0x61, 'a', 0x61, 0xff, 0xff }, .{}));
+    try std.testing.expectError(error.InvalidStringChunk, decodeInExactly(zerde.cbor, TextBox, 64, &.{ 0xa1, 0x61, 's', 0x7f, 0x41, 'a', 0xff }, .{}));
+    // A skipped chunked string is checked and not allocated: the allocator given here fails on its first allocation.
+    var none = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try zerde.cbor.validate(none.allocator(), &.{ 0x82, 0x7f, 0x61, 'a', 0x62, 'b', 'c', 0xff, 0x5f, 0x41, 1, 0xff });
+    try std.testing.expectError(error.InvalidUtf8, zerde.cbor.validate(none.allocator(), &.{ 0x81, 0x7f, 0x61, 0xff, 0xff }));
+    try std.testing.expectError(error.InvalidStringChunk, zerde.cbor.validate(none.allocator(), &.{ 0x81, 0x7f, 0x41, 'a', 0xff }));
+}
+
+test "base64 bytes in JSON are decoded from the input, or from their unescaped text, into one allocation of their length" {
+    const std_cfg = .{ .bytes = zerde.json.BytesEncoding.base64 };
+    const url_cfg = .{ .bytes = zerde.json.BytesEncoding.base64url };
+    // "AA//AAAA" is six bytes whether or not its slashes are escaped, and an arena of six bytes is enough for both:
+    // the escaped token is not built first.
+    try std.testing.expectEqual(@as(usize, 6), try decodeInExactly(zerde.json, BytesBox, 6, "{\"b\":\"AA//AAAA\"}", std_cfg));
+    try std.testing.expectEqual(@as(usize, 6), try decodeInExactly(zerde.json, BytesBox, 6, "{\"b\":\"AA\\/\\/AAAA\"}", std_cfg));
+    // Padding that is escaped counts: "AA==" is one byte; and unpadded URL-safe text with a dash and an underscore.
+    try std.testing.expectEqual(@as(usize, 1), try decodeInExactly(zerde.json, BytesBox, 1, "{\"b\":\"AA\\u003d\\u003d\"}", std_cfg));
+    try std.testing.expectEqual(@as(usize, 3), try decodeInExactly(zerde.json, BytesBox, 3, "{\"b\":\"AA\\u002d_\"}", url_cfg));
+    try std.testing.expectEqual(@as(usize, 2), try decodeInExactly(zerde.json, BytesBox, 2, "{\"b\":\"AA\\u0041\"}", url_cfg));
+    // A long escaped token is decoded a chunk at a time and gives the same bytes as the same token with no escape.
+    var escaped: std.ArrayList(u8) = .empty;
+    defer escaped.deinit(allocator);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(allocator);
+    try escaped.appendSlice(allocator, "{\"b\":\"");
+    try plain.appendSlice(allocator, "{\"b\":\"");
+    for (0..300) |index| {
+        try escaped.appendSlice(allocator, if (index % 50 == 49) "AAAA\\/AAA" else "AAAAAAAAAAAA");
+        try plain.appendSlice(allocator, if (index % 50 == 49) "AAAA/AAA" else "AAAAAAAAAAAA");
+    }
+    try escaped.appendSlice(allocator, "\"}");
+    try plain.appendSlice(allocator, "\"}");
+    var region: Region = .{};
+    @memcpy(region.bytes[0..escaped.items.len], escaped.items);
+    @memcpy(region.bytes[8192..][0..plain.items.len], plain.items);
+    // 294 groups of nine bytes and six of six: 2,682 bytes, in an arena of exactly that.
+    var arena_escaped = std.heap.FixedBufferAllocator.init(region.bytes[16384..][0..2682]);
+    const from_escaped = try wire.decode(zerde.json, BigBytes, &arena_escaped, region.base(), region.bytes[0..escaped.items.len], .{}, std_cfg);
+    var arena_plain = std.heap.FixedBufferAllocator.init(region.bytes[24576..][0..2682]);
+    const from_plain = try wire.decode(zerde.json, BigBytes, &arena_plain, region.base(), region.bytes[8192..][0..plain.items.len], .{}, std_cfg);
+    try std.testing.expectEqual(@as(u32, 2682), from_escaped.b.len);
+    try std.testing.expectEqualSlices(u8, try region.memory().bytesOf(from_plain.b), try region.memory().bytesOf(from_escaped.b));
+    // The slashes decoded to something: the groups are not all zero.
+    try std.testing.expect(std.mem.indexOfNone(u8, try region.memory().bytesOf(from_escaped.b), &.{0}) != null);
+    // Padding inside the token, at the end of a chunk, is not padding: the whole is refused, as a decode of it whole is.
+    var padded: std.ArrayList(u8) = .empty;
+    defer padded.deinit(allocator);
+    try padded.appendSlice(allocator, "{\"b\":\"");
+    for (0..63) |_| try padded.appendSlice(allocator, "AAAA");
+    try padded.appendSlice(allocator, "AA==AAAA\\/AAA\"}");
+    try std.testing.expectError(error.InvalidBytes, decodeInExactly(zerde.json, BytesBox, 400, padded.items, std_cfg));
+    // Errors: a character outside the alphabet, a bad length, a bad escape, a token too long for max_len.
+    try std.testing.expectError(error.InvalidBytes, decodeInExactly(zerde.json, BytesBox, 64, "{\"b\":\"AA\\n=\"}", std_cfg));
+    try std.testing.expectError(error.InvalidBytes, decodeInExactly(zerde.json, BytesBox, 64, "{\"b\":\"AAA\\/A\"}", std_cfg));
+    try std.testing.expectError(error.InvalidStringEscape, decodeInExactly(zerde.json, BytesBox, 64, "{\"b\":\"AA\\q\"}", std_cfg));
+    try std.testing.expectError(error.InvalidBytes, decodeInExactly(zerde.json, BytesBox, 64, "{\"b\":\"A\"}", std_cfg));
+    // A token longer than max_len allows is refused before anything is allocated for it (a bound of 1,000 bytes allows 1,340 characters; the arena here is 100).
+    const too_long = "{\"b\":\"" ++ comptime longName(1345, 'A') ++ "\"}";
+    try std.testing.expectError(error.LengthOutOfBounds, decodeInExactly(zerde.json, BytesBox, 100, too_long, std_cfg));
+    // The bound is the bytes only.
+    try std.testing.expectEqual(@as(usize, 1000 + 256), wire.maxArenaSize(zerde.json, BytesBox, .{}, std_cfg));
 }
 
 test "a long string that is rewritten fits an arena of exactly the bound, while its buffer grows and after" {
@@ -4784,8 +4886,8 @@ test "a long string that is rewritten fits an arena of exactly the bound, while 
     };
     const cfg = .{ .max_string_len = 4096 };
     const bound = comptime wire.maxArenaSize(zerde.json, Long, .{}, cfg);
-    // The buffer of a 2700-byte string is 1.5 times that and 128 more while it is built.
-    try std.testing.expect(bound >= 2700 + 1350 + 128);
+    // A rewritten string is written once, at its length, so it costs nothing more while it is built.
+    try std.testing.expectEqual(@as(usize, 2700 + 256), bound);
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(allocator);
     try plain.appendSlice(allocator, "{\"s\":\"");
@@ -4889,7 +4991,7 @@ test "a pooled list of long escaped strings fits an arena of exactly the bound" 
             low = middle;
         }
     }
-    try std.testing.expect(high >= 1500);
+    try std.testing.expect(high >= 1000);
     try std.testing.expect(high <= bound);
 }
 
@@ -5049,7 +5151,7 @@ test "the bound is computed in 64 bits, so limits that overflow a 32-bit usize d
     // 4,096 strings of 4 MiB each is 16 GiB by the fields; the input of 8 MiB is what the bound rests on.
     const cfg = .{ .max_items = 8192, .max_string_len = 4 * 1024 * 1024, .max_input_bytes = 8 * 1024 * 1024 };
     const bound = comptime wire.maxArenaSize(zerde.json, Big, .{}, cfg);
-    try std.testing.expect(bound > 16 * 1024 * 1024 and bound < 20 * 1024 * 1024);
+    try std.testing.expect(bound > 8 * 1024 * 1024 and bound < 16 * 1024 * 1024);
     // (19,227,081 on a 64-bit target and 19,043,431 on wasm32, where slices are half the size: the arithmetic is in 64 bits.)
 }
 
@@ -5087,12 +5189,12 @@ test "a union's key is not allocated: eight nested unions fit the bound of a sch
 }
 
 test "figures: a field's own limit against the config's" {
-    // The field's max_len and the config's max_string_len: the smaller is the bound (50, and 25 + 128 to build it).
+    // The field's max_len and the config's max_string_len: the smaller is the bound (50).
     const Both = struct {
         s: []const u8,
         pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 100 } } };
     };
-    try std.testing.expectEqual(@as(usize, 50 + 153 + 256), wire.maxArenaSize(zerde.json, Both, .{}, .{ .max_string_len = 50 }));
+    try std.testing.expectEqual(@as(usize, 50 + 256), wire.maxArenaSize(zerde.json, Both, .{}, .{ .max_string_len = 50 }));
 }
 
 const RecTree = union(enum) {
