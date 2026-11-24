@@ -4491,18 +4491,27 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     // Worked by hand: a list of ten 8-byte rows grows through one capacity of 17 (17 * 8 + 3 bytes), is copied to
     // its exact size (83) and its wire array is 10 * 8 + 16; and the slack is 256.
     try std.testing.expectEqual(@as(usize, 139 + 83 + 96 + 256), wire.maxArenaSize(Rows, .{}, .{}));
-    // A string of at most 100 bytes costs 100; with an input of 10 bytes it costs at most twice that.
-    try std.testing.expectEqual(@as(usize, 100 + 256), wire.maxArenaSize(Text, .{}, .{}));
-    try std.testing.expectEqual(@as(usize, 20 + 256), wire.maxArenaSize(Text, .{}, .{ .max_input_bytes = 10 }));
-    // Bytes: the token it is read from (a third longer: 128) and the 90 it decodes to.
-    try std.testing.expectEqual(@as(usize, 128 + 90 + 256), wire.maxArenaSize(Blob2, .{}, .{}));
+    // A string of at most 100 bytes costs 100 and, while it is built, 50 + 128 more; with an input of 10 bytes
+    // the strings hold at most 20, and one is built from at most 10 bytes: 5 + 128 more.
+    try std.testing.expectEqual(@as(usize, 100 + 178 + 256), wire.maxArenaSize(Text, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 20 + 133 + 256), wire.maxArenaSize(Text, .{}, .{ .max_input_bytes = 10 }));
+    // Two strings: both held, and only the larger one being built at a time.
+    const Two = struct {
+        a: []const u8,
+        b: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .a = .{ .max_len = 100 }, .b = .{ .max_len = 40 } } };
+    };
+    try std.testing.expectEqual(@as(usize, 140 + 178 + 256), wire.maxArenaSize(Two, .{}, .{}));
+    // Bytes: the token it is read from (a third longer: 128, built with 64 + 128 more) and the 90 it decodes to.
+    try std.testing.expectEqual(@as(usize, 128 + 90 + 192 + 256), wire.maxArenaSize(Blob2, .{}, .{}));
     // A raw item of 400 bytes: its keys at 101 levels (four bytes each), or at the two the config allows below the
     // two that hold it; a raw item itself is never copied.
     try std.testing.expectEqual(@as(usize, 187419), wire.maxArenaSize(Raws, .{}, .{}));
     try std.testing.expectEqual(@as(usize, 24751), wire.maxArenaSize(Raws, .{}, .{ .max_depth = 4 }));
     // Lists with no bound of their own share the one budget of 100 items, whatever the nesting.
-    try std.testing.expectEqual(@as(usize, 9756), wire.maxArenaSize(Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
-    try std.testing.expect(wire.maxArenaSize(Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756);
+    // (and 4 + 128 more for the one string being built).
+    try std.testing.expectEqual(@as(usize, 9756 + 132), wire.maxArenaSize(Pool, .{}, .{ .max_items = 100, .max_string_len = 8 }));
+    try std.testing.expect(wire.maxArenaSize(Pool, .{}, .{ .max_items = 200, .max_string_len = 8 }) > 9756 + 132);
     // Lists of lists with bounds of their own multiply: three lists of at most four rows each.
     const Nest = struct {
         rows: []const []const Row,
@@ -4529,5 +4538,82 @@ test "arena bound figures, from small schemas, for the parts of the model" {
     // Charged per item: 87 for the array of 16-byte lists over two items, 8 + 16 for its wire array: 111 an item.
     try std.testing.expectEqual(@as(usize, 111 * 100 + 256), wire.maxArenaSize(Drawn, .{}, .{ .max_items = 100 }));
     // Strings in a list with a max_len and elem bounds: five of at most twenty bytes.
-    try std.testing.expectEqual(@as(usize, 650), wire.maxArenaSize(Times, .{}, .{}));
+    try std.testing.expectEqual(@as(usize, 650 + 138), wire.maxArenaSize(Times, .{}, .{}));
+}
+
+test "a long string that is rewritten fits an arena of exactly the bound, while its buffer grows and after" {
+    const Long = struct {
+        s: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 2700 } } };
+    };
+    const cfg = .{ .max_string_len = 4096 };
+    const bound = comptime wire.maxArenaSize(Long, .{}, cfg);
+    // The buffer of a 2700-byte string is 1.5 times that and 128 more while it is built.
+    try std.testing.expect(bound >= 2700 + 1350 + 128);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(allocator);
+    try plain.appendSlice(allocator, "{\"s\":\"");
+    for (0..2699) |_| try plain.append(allocator, 'a');
+    try plain.appendSlice(allocator, "\\n\"}");
+    _ = try decodeWithin(zerde.json, Long, bound, plain.items, cfg);
+    _ = try decodeWithin(zerde.json, Long, bound, plain.items, .{ .max_string_len = 4096, .max_input_bytes = 8192 });
+    // Every byte an escape.
+    var escapes: std.ArrayList(u8) = .empty;
+    defer escapes.deinit(allocator);
+    try escapes.appendSlice(allocator, "{\"s\":\"");
+    for (0..2700) |_| try escapes.appendSlice(allocator, "\\n");
+    try escapes.appendSlice(allocator, "\"}");
+    _ = try decodeWithin(zerde.json, Long, bound, escapes.items, cfg);
+    // CBOR chunks: one long and one short, and one byte each.
+    var chunks: std.ArrayList(u8) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.appendSlice(allocator, &.{ 0xa1, 0x61, 's', 0x7f, 0x79, 0x0a, 0x8b });
+    for (0..2699) |_| try chunks.append(allocator, 'a');
+    try chunks.appendSlice(allocator, &.{ 0x61, 'b', 0xff });
+    _ = try decodeWithin(zerde.cbor, Long, bound, chunks.items, cfg);
+    var singles: std.ArrayList(u8) = .empty;
+    defer singles.deinit(allocator);
+    try singles.appendSlice(allocator, &.{ 0xa1, 0x61, 's', 0x7f });
+    for (0..2700) |_| try singles.appendSlice(allocator, &.{ 0x61, 'a' });
+    try singles.append(allocator, 0xff);
+    _ = try decodeWithin(zerde.cbor, Long, bound, singles.items, cfg);
+
+    // An optional and a union variant: the same, with 999 bytes and an escape.
+    const Optional = struct {
+        s: ?[]const u8 = null,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .s = .{ .max_len = 1000, .optional = .absent } } };
+    };
+    const Variant = union(enum) { a: []const u8, b };
+    const Holder2 = struct {
+        v: Variant,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    var small: std.ArrayList(u8) = .empty;
+    defer small.deinit(allocator);
+    for (0..999) |_| try small.append(allocator, 'a');
+    var optional_input: std.ArrayList(u8) = .empty;
+    defer optional_input.deinit(allocator);
+    try optional_input.appendSlice(allocator, "{\"s\":\"");
+    try optional_input.appendSlice(allocator, small.items);
+    try optional_input.appendSlice(allocator, "\\n\"}");
+    const small_cfg = .{ .max_string_len = 1000 };
+    _ = try decodeWithin(zerde.json, Optional, comptime wire.maxArenaSize(Optional, .{}, small_cfg), optional_input.items, small_cfg);
+    var variant_input: std.ArrayList(u8) = .empty;
+    defer variant_input.deinit(allocator);
+    try variant_input.appendSlice(allocator, "{\"v\":{\"a\":\"");
+    try variant_input.appendSlice(allocator, small.items);
+    try variant_input.appendSlice(allocator, "\\n\"}}");
+    _ = try decodeWithin(zerde.json, Holder2, comptime wire.maxArenaSize(Holder2, .{}, small_cfg), variant_input.items, small_cfg);
+    // Base64 whose token is built and then decoded: 2700 bytes of bytes are a token of 3600.
+    const Bytes = struct {
+        b: zerde.ByteString,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .b = .{ .max_len = 2700 } } };
+    };
+    const bytes_cfg = .{ .max_string_len = 8192, .bytes = zerde.json.BytesEncoding.base64 };
+    var token: std.ArrayList(u8) = .empty;
+    defer token.deinit(allocator);
+    try token.appendSlice(allocator, "{\"b\":\"");
+    for (0..3596) |_| try token.append(allocator, 'A');
+    try token.appendSlice(allocator, "\\/AAA\"}");
+    _ = try decodeWithin(zerde.json, Bytes, comptime wire.maxArenaSize(Bytes, .{}, bytes_cfg), token.items, bytes_cfg);
 }

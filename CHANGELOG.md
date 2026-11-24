@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fixed (`zerde.wire.maxArenaSize`): the bound now adds the most one rewritten string takes while its buffer grows (half again and 128 bytes over its length), so a string over about 260 bytes fits an arena of exactly the bound; its doc states one rule for the text cap
 - fixed (`zerde.wire`): a bool is a `u8` checked as 0 or 1 on `fromWire` and `encode`, and a list of bools is converted, not aliased (an invalid bool byte was accepted)
 - changed (`zerde.wire.maxArenaSize`): lists with no bound of their own share the `max_items` budget instead of multiplying per level; only rewritten text and the reader's key scratch are charged, text at most twice `max_input_bytes`, which `decode` now enforces (`error.InputTooLarge`); an array list's growth is computed from the standard library's capacities; adversarial tests decode into an arena of exactly the bound
 - fixed (JSON): `max_len` of a string or bytes field is applied while an escaped string is built (`readStringMax`, `readByteTokenMax`), so it is `error.LengthOutOfBounds` and not an arena that ran out

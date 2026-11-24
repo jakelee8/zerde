@@ -553,6 +553,8 @@ const Amount = struct {
 const Cost = struct {
     lists: Amount = .{},
     text: Amount = .{},
+    /// The most one string takes while it is built, over what it holds when done (the most of any, not a sum).
+    transient: usize = 0,
     scratch: usize = 0,
     list_size: usize = 0,
     list_align: usize = 0,
@@ -562,6 +564,7 @@ const Cost = struct {
         return .{
             .lists = a.lists.plus(b.lists),
             .text = a.text.plus(b.text),
+            .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
@@ -580,6 +583,7 @@ const Cost = struct {
         return .{
             .lists = a.lists.most(b.lists),
             .text = a.text.most(b.text),
+            .transient = @max(a.transient, b.transient),
             .scratch = @max(a.scratch, b.scratch),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
@@ -634,12 +638,15 @@ fn bounded(limit: usize) bool {
 /// `max_string_len`, `max_depth`, and `max_input_bytes`, which `decode` enforces.
 ///
 /// A string that is borrowed from the input (a definite CBOR string, a JSON string without an escape)
-/// and a `Raw` item cost nothing: their span points into the input. Only what is rewritten costs,
-/// and that is at most the input, so with `max_input_bytes` the bound for text is the input times
-/// five (the growth of the buffer a string is built in) and a fixed cost for each such string, if that
-/// is less than the sum of the fields' own bounds. A list costs the capacities an array list grows
-/// through, per list; lists together are charged at most `max_items` items, which is less than the
-/// sum of their `max_len` when those are generous.
+/// and a `Raw` item cost nothing: their span points into the input. Only what is rewritten costs.
+/// Each such string costs what it holds when done, and one string at a time, at the top of the
+/// arena, costs more while its buffer grows (an array list grows in place to half again and a
+/// little more before it is cut to size): the bound adds the most of that over any one string, once.
+/// With `max_input_bytes` the strings together hold at most twice the input (a JSON base64 string
+/// is built, at most the input, then decoded, three quarters of it), and no string is longer than the
+/// input, if that is less than the sum of the fields' own bounds. A list costs the capacities an array
+/// list grows through, per list; lists together are charged at most `max_items` items, which is less
+/// than the sum of their `max_len` when those are generous.
 ///
 /// It is a compile error when something a decode reaches has no bound, when a struct accepts unknown
 /// members (they would cost without limit: set `deny_unknown_fields`), or when it collects extras.
@@ -659,14 +666,22 @@ pub fn maxArenaSize(comptime T: type, comptime serde_cfg: anytype, comptime form
 
     // Text that is rewritten: from the fields, and, where the input and the items are bounded, from the input.
     var text = if (cost.text.pool == 0) cost.text.fixed else cost.text.total(bound("max_items", items, "the items of the input"));
+    var transient = cost.transient;
     if (comptime bounded(limits.max_input_bytes)) {
         // Every byte of a rewritten string comes from the input, at most twice: a JSON base64 string is
         // built (at most the input), then decoded (three quarters of it). A string is built last in the
         // arena, so its buffer grows in place and costs what it holds.
         const input: usize = limits.max_input_bytes;
         text = @min(text, 2 * input);
+        transient = @min(transient, building(input));
     }
-    return lists + text + cost.scratch + slack;
+    return lists + text + transient + cost.scratch + slack;
+}
+
+/// How much more than its final `n` bytes a string takes while it is built: its buffer is an array list,
+/// which grows in place (it is the last thing in the arena) to `n + n / 2 + 128` before it is cut to size.
+fn building(n: usize) usize {
+    return n / 2 + 128;
 }
 
 /// The list bound of a field, if it has one of its own: a field's `max_len` is a number of items the
@@ -681,12 +696,13 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
         .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
         .text => blk: {
             const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a string");
-            break :blk .{ .text = .{ .fixed = n } };
+            break :blk .{ .text = .{ .fixed = n }, .transient = building(n) };
         },
         .byte_string => blk: {
             // The token it is read from (base64 is a third longer) and the bytes it decodes to.
             const n: usize = bound(@typeName(T), @min(bounds.max_len, limits.max_string_len), "a byte string");
-            break :blk .{ .text = .{ .fixed = @min(limits.max_string_len, @max(n, n / 3 * 4 + 8)) + n } };
+            const token = @min(limits.max_string_len, @max(n, n / 3 * 4 + 8));
+            break :blk .{ .text = .{ .fixed = token + n }, .transient = building(token) };
         },
         .raw => blk: {
             // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
@@ -715,6 +731,7 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             break :blk own.plus(.{
                 .lists = .{ .pool = element.lists.pool },
                 .text = .{ .pool = element.text.pool },
+                .transient = element.transient,
                 .scratch = element.scratch,
             });
         },

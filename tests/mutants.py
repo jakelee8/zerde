@@ -392,9 +392,15 @@ MUTANTS = [
     ("wire.zig", "        text = @min(text, 2 * input);", "        text = @min(text, 4 * input);"),
     ("wire.zig", "        lists = @min(lists, per_item * items);", "        _ = per_item;"),
     ("wire.zig", "        if (input.len > format_cfg.max_input_bytes) return error.InputTooLarge;", "        _ = input;"),
-    ("wire.zig", "            break :blk .{ .text = .{ .fixed = n } };", "            break :blk .{ .text = .{ .fixed = n / 2 } };"),
-    ("wire.zig", "            break :blk .{ .text = .{ .fixed = @min(limits.max_string_len, @max(n, n / 3 * 4 + 8)) + n } };", "            break :blk .{ .text = .{ .fixed = n } };"),
+    ("wire.zig", "            break :blk .{ .text = .{ .fixed = n }, .transient = building(n) };", "            break :blk .{ .text = .{ .fixed = n / 2 }, .transient = building(n) };"),
+    ("wire.zig", "            break :blk .{ .text = .{ .fixed = token + n }, .transient = building(token) };", "            break :blk .{ .text = .{ .fixed = n }, .transient = building(token) };"),
     ("wire.zig", "        return .{ .fixed = a.fixed * n, .pool = a.pool };", "        return .{ .fixed = a.fixed, .pool = a.pool };"),
+    ("wire.zig", "    return n / 2 + 128;", "    return 0;"),
+    ("wire.zig", "    return lists + text + transient + cost.scratch + slack;", "    return lists + text + cost.scratch + slack;"),
+    ("wire.zig", "                .transient = element.transient,\n", "                .transient = 0,\n"),
+    ("wire.zig", "        transient = @min(transient, building(input));", "        transient = 0;"),
+    ("wire.zig", "            break :blk .{ .text = .{ .fixed = token + n }, .transient = building(token) };", "            break :blk .{ .text = .{ .fixed = token + n }, .transient = 0 };"),
+    ("wire.zig", "            .transient = @max(a.transient, b.transient),\n            .scratch = @max(a.scratch, b.scratch),\n            .list_size = @max(a.list_size, b.list_size),\n            .list_align = @max(a.list_align, b.list_align),\n            .list_wire = @max(a.list_wire, b.list_wire),\n        };\n    }\n\n    fn times", "            .transient = a.transient + b.transient,\n            .scratch = @max(a.scratch, b.scratch),\n            .list_size = @max(a.list_size, b.list_size),\n            .list_align = @max(a.list_align, b.list_align),\n            .list_wire = @max(a.list_wire, b.list_wire),\n        };\n    }\n\n    fn times"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
