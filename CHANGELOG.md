@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- changed: a write checks every `Raw` and extras value it puts out as it is (well-formed, UTF-8, nesting), and a deterministic CBOR write refuses one that is not deterministic; added `cbor.canonicalize` (the deterministic form of an item) and `cbor.validate`; the encode hook `Encoder` now enforces its stated lengths, the nesting bound, UTF-8, raw items and, in a deterministic write, ascending keys, and has `finish`
+- fixed: the CBOR text writer and the JSON string writer refuse text that is not UTF-8, as the readers do
+- fixed: `parseSliceAliasedWith` ignored the read configuration but `max_input_bytes`
+- fixed: a decode hook that stopped short, and a slice element when an allocation failed, leaked; `max_len` stopped nothing before a chunked CBOR string was joined; a `max_depth` above 128 was clamped, it is now a compile error
+- changed: `zerde.Raw` is `cbor.Raw` and `json.Raw`, so a Raw cannot be written in the other format
+
 - added `zerde.bulk`: word-at-a-time scans for the end of a JSON string, escaping by runs, and UTF-8 validation, used by the JSON and CBOR backends; 3 to 5 times faster scanning and escaping, and 4 times faster validation of ASCII text on WebAssembly without SIMD; `zig build bench-bulk`
 - added `zerde.reflect`: comptime reflection of fields (wire keys, kinds, bounds, optional policies, defaults, extras), write order, union variants and enums, for generators
 - added wire-type hooks `zerdeDecode` (over a pull reader), `zerdeEncode` (over a streaming `Encoder`) and `zerdeFree`, for CBOR and JSON; `error.HookIncomplete`; `cbor.PullReader` and `json.PullReader` now hold a pointer to their deserializer

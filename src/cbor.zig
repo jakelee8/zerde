@@ -255,6 +255,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         /// How many entries an extras map holds, for the head of the map it joins.
         pub fn extrasCount(self: *Self, bytes: []const u8) !usize {
             _ = self;
+            if (bytes.len != 0) try verifyItem(bytes, deterministic);
             return @intCast((try extrasHead(bytes)).remaining);
         }
 
@@ -303,8 +304,11 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
 
         pub const raw_format: typed.RawFormat = .cbor;
 
-        /// Writes an item that was read as `cbor.Raw`, unchanged.
+        /// Writes an item that was read as `cbor.Raw`: it is checked first, and in a deterministic
+        /// write must already be deterministic (see `canonicalize`), so the output is what the write
+        /// promises whatever mode the item was read in.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
+            try verifyItem(value, deterministic);
             try self.writer.writeAll(value);
         }
 
@@ -395,6 +399,9 @@ pub fn CborDeserializer(comptime Config: type) type {
         owns_input: bool,
         can_borrow_strings: bool,
         strict: bool = false,
+        /// `canonicalItem` writes the deterministic encoding (preferred floats; no tags) instead of
+        /// the form that compares keys.
+        canon_det: bool = false,
         max_depth: usize = max_nesting,
         max_items: usize = std.math.maxInt(usize),
         max_string_len: usize = std.math.maxInt(usize),
@@ -1037,11 +1044,17 @@ pub fn CborDeserializer(comptime Config: type) type {
                 },
                 5 => try self.canonicalMap(header),
                 6 => {
+                    if (self.canon_det) return error.UnexpectedTag;
                     try self.appendHead(6, header.value);
                     try self.canonicalItem();
                 },
                 else => switch (header.ai) {
-                    25, 26, 27 => {
+                    25, 26, 27 => if (self.canon_det) {
+                        var buffer: [9]u8 = undefined;
+                        var fixed = std.Io.Writer.fixed(&buffer);
+                        try writePreferredFloat(&fixed, floatValue(header));
+                        try self.key_bytes.appendSlice(self.allocator, fixed.buffered());
+                    } else {
                         try self.key_bytes.append(self.allocator, 0xfb);
                         var be: [8]u8 = undefined;
                         std.mem.writeInt(u64, &be, keyFloatBits(header.ai, header.value), .big);
@@ -1070,6 +1083,10 @@ pub fn CborDeserializer(comptime Config: type) type {
                 }
             };
             std.sort.pdq(CanonicalEntry, entries.items, Sort{ .bytes = self.key_bytes.items }, Sort.less);
+            if (entries.items.len > 1) for (entries.items[0 .. entries.items.len - 1], entries.items[1..]) |a, b| {
+                const keys = self.key_bytes.items;
+                if (std.mem.eql(u8, keys[a.start..a.key_end], keys[b.start..b.key_end])) return error.DuplicateField;
+            };
 
             var sorted: std.ArrayList(u8) = .empty;
             defer sorted.deinit(self.allocator);
@@ -1163,6 +1180,15 @@ pub fn CborDeserializer(comptime Config: type) type {
 /// The bits that stand for a float key, widened to a double. RFC 8949 section 5.6.1: two floats are
 /// the same key when they are numerically equal, so -0.0 is 0.0, and two NaNs are the same key when
 /// they have the same significand after zero-extension to 64 bits (their sign is not compared).
+/// The value of a float head, widened to a double.
+fn floatValue(header: Header) f64 {
+    return switch (header.ai) {
+        25 => @floatCast(@as(f16, @bitCast(@as(u16, @intCast(header.value))))),
+        26 => @floatCast(@as(f32, @bitCast(@as(u32, @intCast(header.value))))),
+        else => @bitCast(header.value),
+    };
+}
+
 fn keyFloatBits(ai: u8, value: u64) u64 {
     const sig_bits: u6 = switch (ai) {
         25 => 10,
@@ -1258,6 +1284,107 @@ fn skipTrusted(input: []const u8, index: *usize, depth: usize) !void {
             }
         },
     }
+}
+
+/// Checks, without allocating, that `input` is exactly one item the writer may put out as it is:
+/// well-formed with text that is UTF-8 and nesting within 128. With `deterministic` it is also an
+/// item a strict read accepts (RFC 8949 §4.2.1 and §4.2.2; no tag), which includes map keys that
+/// ascend strictly, so none repeats. Without it a repeated key is not looked for: that needs an
+/// allocation, which `validate` has.
+fn verifyItem(input: []const u8, deterministic: bool) !void {
+    var index: usize = 0;
+    try checkItem(input, &index, 0, deterministic);
+    if (index != input.len) return error.TrailingCharacters;
+}
+
+fn checkItem(input: []const u8, index: *usize, depth: usize, deterministic: bool) anyerror!void {
+    var header = try parseHeader(input, index);
+    while (header.major == 6) {
+        // A tag adds no nesting; a strict reader refuses it.
+        if (deterministic) return error.UnexpectedTag;
+        header = try parseHeader(input, index);
+    }
+    if (deterministic) {
+        if (header.indefinite or !isShortestHead(header)) return error.NonDeterministicEncoding;
+        if (header.major == 7 and !isPreferredFloat(header)) return error.NonDeterministicEncoding;
+    }
+    switch (header.major) {
+        0, 1, 7 => {},
+        2, 3 => if (header.indefinite) {
+            while (true) {
+                if (index.* >= input.len) return error.UnexpectedEndOfInput;
+                if (input[index.*] == 0xff) {
+                    index.* += 1;
+                    break;
+                }
+                const chunk = try parseHeader(input, index);
+                if (chunk.major != header.major or chunk.indefinite) return error.InvalidStringChunk;
+                try checkString(input, index, chunk);
+            }
+        } else try checkString(input, index, header),
+        else => {
+            if (depth >= max_nesting) return error.CborNestingTooDeep;
+            const per: u64 = if (header.major == 5) 2 else 1;
+            if (header.indefinite) {
+                while (true) {
+                    if (index.* >= input.len) return error.UnexpectedEndOfInput;
+                    if (input[index.*] == 0xff) {
+                        index.* += 1;
+                        break;
+                    }
+                    var step: u64 = 0;
+                    while (step < per) : (step += 1) try checkItem(input, index, depth + 1, deterministic);
+                }
+            } else {
+                var previous: ?[]const u8 = null;
+                var count: u64 = 0;
+                while (count < header.value) : (count += 1) {
+                    const key_start = index.*;
+                    try checkItem(input, index, depth + 1, deterministic);
+                    if (per == 2) {
+                        if (deterministic) {
+                            const key = input[key_start..index.*];
+                            if (previous) |before| if (!std.mem.lessThan(u8, before, key)) return error.NonDeterministicEncoding;
+                            previous = key;
+                        }
+                        try checkItem(input, index, depth + 1, deterministic);
+                    }
+                }
+            }
+        },
+    }
+}
+
+fn checkString(input: []const u8, index: *usize, header: Header) !void {
+    if (header.value > input.len - index.*) return error.UnexpectedEndOfInput;
+    const end = index.* + @as(usize, @intCast(header.value));
+    if (header.major == 3 and !bulk.validUtf8(input[index.*..end])) return error.InvalidUtf8;
+    index.* = end;
+}
+
+/// Checks that `bytes` is exactly one well-formed CBOR item, and has no map with a repeated key.
+pub fn validate(allocator: Allocator, bytes: []const u8) !void {
+    var d = CborDeserializer(ReadConfig).initBorrowed(allocator, bytes, .{});
+    defer d.deinit(allocator);
+    try d.skipItem(0);
+    if (d.index != bytes.len) return error.TrailingCharacters;
+}
+
+/// The deterministic encoding (RFC 8949 §4.2.1 and §4.2.2) of the one well-formed item in
+/// `bytes`: shortest heads, definite lengths, the shortest exact float, maps in the order of their
+/// encoded keys, text and byte strings joined. It is what a strict read accepts, so a `cbor.Raw` or
+/// an extras field read leniently can be written in a deterministic write after it. A tag is
+/// `error.UnexpectedTag`, as a strict read refuses it, and a repeated key `error.DuplicateField`.
+/// The caller owns the result.
+pub fn canonicalize(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var d = CborDeserializer(ReadConfig).initBorrowed(allocator, bytes, .{});
+    defer d.deinit(allocator);
+    try d.skipItem(0);
+    if (d.index != bytes.len) return error.TrailingCharacters;
+    d.index = 0;
+    d.canon_det = true;
+    try d.canonicalItem();
+    return allocator.dupe(u8, d.key_bytes.items);
 }
 
 /// A pull reader over a CBOR input: `next` returns the events of one item in order, for a shape
@@ -1436,60 +1563,179 @@ pub fn valueWriter(allocator: Allocator, writer: *std.Io.Writer, comptime cfg: a
 }
 
 /// A writer for a wire type's encode hook: items go out as they are written, with no buffering and
-/// no allocation, so a container's length is stated up front and the caller writes exactly that many
-/// items (twice as many for a map, keys and values alternately). Keys are written in the order the
-/// output needs: for deterministic CBOR, ascending by encoded bytes. The ends are no-ops here and
-/// are there so a hook reads the same for every format.
+/// no allocation, and it keeps the guarantees of `ValueWriter` that it can without either:
+///
+/// - a container's length is stated up front (twice as many items for a map, keys and values
+///   alternately) and met exactly: one more item, or an end before the last, is `error.LengthMismatch`;
+/// - nesting is at most 128 (`error.CborNestingTooDeep`) and `finish` says the one item is complete;
+/// - text is UTF-8 (`error.InvalidUtf8`) and `writeRaw` takes one well-formed item, in the
+///   deterministic form when the write is deterministic (see `canonicalize` for making one);
+/// - with `deterministic`, a map's keys come in ascending order of their encoded bytes, each after
+///   the one before (`error.NonDeterministicEncoding`; a repeated key is `error.DuplicateField`).
+///   Such a key is a scalar or a `writeRaw` item, at most `key_capacity` bytes encoded, because the
+///   writer keeps the key before it to compare (`error.KeyTooLong`). Without `deterministic` keys
+///   are written as given.
+///
+/// The ends only check; they are there so a hook reads the same for every format.
 pub const Encoder = struct {
     writer: *std.Io.Writer,
     deterministic: bool,
+    frames: [max_nesting]Frame = undefined,
+    depth: usize = 0,
+    root_done: bool = false,
+    /// The encoded keys last written by the maps that are open, one after another: a map keeps the
+    /// key before the one being written at `Frame.keys`, and the next map's start is after it.
+    key_buf: [key_capacity]u8 = undefined,
+    key_top: usize = 0,
+
+    /// The most an encoded map key can take in a deterministic write, with the key before it.
+    pub const key_capacity = 1024;
+
+    const Frame = struct {
+        kind: ContainerKind,
+        /// Items still to write: elements, or keys and values.
+        remaining: u64,
+        /// Where this map's previous key starts in `key_buf` and how long it is.
+        keys: usize = 0,
+        prev_len: usize = 0,
+    };
 
     pub fn writeNull(self: *Encoder) !void {
-        try self.writer.writeByte(0xf6);
+        try self.put(writeBytesOf, .{&[_]u8{0xf6}});
     }
 
     pub fn writeBool(self: *Encoder, value: bool) !void {
-        try self.writer.writeByte(if (value) 0xf5 else 0xf4);
+        try self.put(writeBytesOf, .{if (value) &[_]u8{0xf5} else &[_]u8{0xf4}});
     }
 
     pub fn writeInt(self: *Encoder, value: i128) !void {
-        try encodeInt(self.writer, value);
+        try self.put(encodeInt, .{value});
     }
 
     pub fn writeFloat(self: *Encoder, value: f64) !void {
-        if (self.deterministic) try writePreferredFloat(self.writer, value) else try encodeFloat(self.writer, value);
+        if (self.deterministic) try self.put(writePreferredFloat, .{value}) else try self.put(encodeFloat, .{value});
     }
 
     pub fn writeText(self: *Encoder, value: []const u8) !void {
-        try writeTextString(self.writer, value);
+        try self.put(writeTextString, .{value});
     }
 
     pub fn writeBytes(self: *Encoder, value: []const u8) !void {
-        try writeMajorValue(self.writer, 2, value.len);
-        try self.writer.writeAll(value);
+        try self.put(writeByteString, .{value});
     }
 
-    /// An item that is already CBOR, unchanged.
+    /// An item that is already CBOR: one well-formed item, and in a deterministic write one that
+    /// is deterministic (`error.NonDeterministicEncoding`, `error.UnexpectedTag`).
     pub fn writeRaw(self: *Encoder, bytes: []const u8) !void {
-        try self.writer.writeAll(bytes);
+        try verifyItem(bytes, self.deterministic);
+        try self.put(writeBytesOf, .{bytes});
     }
 
     pub fn beginArray(self: *Encoder, len: usize) !void {
-        try writeMajorValue(self.writer, 4, len);
+        try self.open(.array, 4, len, len);
     }
 
     pub fn endArray(self: *Encoder) !void {
-        _ = self;
+        try self.close(.array);
     }
 
     pub fn beginMap(self: *Encoder, len: usize) !void {
-        try writeMajorValue(self.writer, 5, len);
+        const items = std.math.mul(u64, len, 2) catch return error.LengthMismatch;
+        try self.open(.object, 5, len, items);
     }
 
     pub fn endMap(self: *Encoder) !void {
-        _ = self;
+        try self.close(.object);
+    }
+
+    /// After the item: it is complete, and nothing is open.
+    pub fn finish(self: *Encoder) !void {
+        if (self.depth != 0 or !self.root_done) return error.LengthMismatch;
+    }
+
+    /// Writes one scalar with `write(writer, args...)`. A key of a deterministic map is encoded into
+    /// the key buffer first, compared with the key before it, and then written.
+    fn put(self: *Encoder, comptime write: anytype, args: anytype) !void {
+        try self.beginItem();
+        if (self.keyPosition()) {
+            const frame = &self.frames[self.depth - 1];
+            const start = frame.keys + frame.prev_len;
+            var fixed = std.Io.Writer.fixed(self.key_buf[start..]);
+            @call(.auto, write, .{&fixed} ++ args) catch |err| return if (err == error.WriteFailed) error.KeyTooLong else err;
+            try self.acceptKey(frame, fixed.buffered().len);
+        } else {
+            try @call(.auto, write, .{self.writer} ++ args);
+        }
+        self.endItem();
+    }
+
+    /// Checks the room for one more item, and that it is not an array or map where a key goes.
+    fn beginItem(self: *Encoder) !void {
+        if (self.depth == 0) {
+            if (self.root_done) return error.LengthMismatch;
+            return;
+        }
+        if (self.frames[self.depth - 1].remaining == 0) return error.LengthMismatch;
+    }
+
+    fn endItem(self: *Encoder) void {
+        if (self.depth == 0) {
+            self.root_done = true;
+        } else {
+            self.frames[self.depth - 1].remaining -= 1;
+        }
+    }
+
+    /// Whether the next item is a map key whose place in the order is checked.
+    fn keyPosition(self: *const Encoder) bool {
+        if (!self.deterministic or self.depth == 0) return false;
+        const frame = &self.frames[self.depth - 1];
+        return frame.kind == .object and frame.remaining % 2 == 0;
+    }
+
+    /// The key just encoded at `key_buf[start..][0..len]` must sort after the one before it; it
+    /// then takes that one's place, and goes out.
+    fn acceptKey(self: *Encoder, frame: *Frame, len: usize) !void {
+        const start = frame.keys + frame.prev_len;
+        const key = self.key_buf[start..][0..len];
+        if (frame.prev_len != 0) {
+            const before = self.key_buf[frame.keys..][0..frame.prev_len];
+            if (std.mem.eql(u8, before, key)) return error.DuplicateField;
+            if (!std.mem.lessThan(u8, before, key)) return error.NonDeterministicEncoding;
+        }
+        try self.writer.writeAll(key);
+        std.mem.copyForwards(u8, self.key_buf[frame.keys..][0..len], key);
+        frame.prev_len = len;
+        self.key_top = frame.keys + len;
+    }
+
+    fn open(self: *Encoder, kind: ContainerKind, major: u8, len: usize, items: u64) !void {
+        try self.beginItem();
+        if (self.keyPosition()) return error.UnexpectedType;
+        if (self.depth >= self.frames.len) return error.CborNestingTooDeep;
+        try writeMajorValue(self.writer, major, len);
+        self.frames[self.depth] = .{ .kind = kind, .remaining = items, .keys = self.key_top };
+        self.depth += 1;
+    }
+
+    fn close(self: *Encoder, kind: ContainerKind) !void {
+        if (self.depth == 0 or self.frames[self.depth - 1].kind != kind) return error.UnbalancedContainers;
+        const frame = &self.frames[self.depth - 1];
+        if (frame.remaining != 0) return error.LengthMismatch;
+        self.key_top = frame.keys;
+        self.depth -= 1;
+        self.endItem();
     }
 };
+
+fn writeBytesOf(writer: *std.Io.Writer, bytes: []const u8) !void {
+    try writer.writeAll(bytes);
+}
+
+fn writeByteString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writeMajorValue(writer, 2, value.len);
+    try writer.writeAll(value);
+}
 
 // The writer's methods share these names, so the file-level writers get others.
 const encodeInt = writeInt;
@@ -1572,10 +1818,19 @@ pub const ValueWriter = struct {
         try self.afterItem();
     }
 
-    /// Writes an item that is already CBOR, unchanged: a `Raw` that was read, say.
+    /// Writes an item that is already CBOR: a `Raw` that was read, say. It is checked, and a
+    /// deterministic writer puts it in the deterministic form first (`canonicalize`), so a Raw read
+    /// leniently comes out as a strict read accepts it.
     pub fn writeRaw(self: *ValueWriter, bytes: []const u8) !void {
         try self.beforeItem();
-        try self.sink().writeAll(bytes);
+        if (self.deterministic) {
+            const canonical = try canonicalize(self.allocator, bytes);
+            defer self.allocator.free(canonical);
+            try self.sink().writeAll(canonical);
+        } else {
+            try validate(self.allocator, bytes);
+            try self.sink().writeAll(bytes);
+        }
         try self.afterItem();
     }
 

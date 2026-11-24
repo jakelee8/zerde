@@ -220,6 +220,7 @@ fn serializeValue(
         }
         var encoder = serializer.encoder();
         try value.zerdeEncode(&encoder);
+        try encoder.finish();
         return;
     }
     switch (@typeInfo(T)) {

@@ -330,7 +330,8 @@ the writer merges them among the declared members in key order (`field_order` `.
 default write they follow the declared members. In JSON the object keeps the input order and its
 members follow the declared ones. An extras entry that repeats a declared member is
 `error.DuplicateField` on write, so no output has a member twice. A `Raw` built by hand must be in the
-form a read leaves: a definite CBOR map in key order, or a JSON object.
+form a read leaves: a definite CBOR map in key order, or a JSON object. The extras are checked as any
+`Raw` is on write (see below), in full before the first byte of the map.
 
 ### Pull reader
 
@@ -369,8 +370,13 @@ that is an array of zero or one item, a union as `[tag, payload]`). Declare any 
 - `pub fn zerdeEncode(self: T, encoder: anytype) anyerror!void`: writes one item through an `Encoder`:
   `writeNull`, `writeBool`, `writeInt`, `writeFloat`, `writeText`, `writeBytes`, `writeRaw`, and
   `beginArray(len)`/`endArray`, `beginMap(len)`/`endMap`. It streams, with no buffering and no
-  allocation, so the caller states each length up front and writes a map's entries in the order the output
-  needs (for deterministic CBOR, ascending by encoded key).
+  allocation, so the caller states each length up front and meets it exactly (twice as many items
+  for a map: key, value, ...), and writes a map's entries in the order the output needs. It keeps the
+  guarantees of `cbor.valueWriter` that it can: a wrong count is `error.LengthMismatch`, nesting is at most
+  128, text must be UTF-8, `writeRaw` takes one checked item, and the item is complete when the hook returns.
+  In a deterministic CBOR write each key must sort after the one before it by its encoded bytes
+  (`error.NonDeterministicEncoding`, `error.DuplicateField`); a key is a scalar or `writeRaw` item of at most
+  1024 encoded bytes (`error.KeyTooLong`, `error.UnexpectedType` for an array or map).
 - `pub fn zerdeFree(self: T, allocator: std.mem.Allocator) void`: what `zerde.free` calls to release what
   `zerdeDecode` allocated. Without it the value is left alone.
 
@@ -413,6 +419,19 @@ whitespace around it. The read checks it as the mode and limits say, so a strict
 non-deterministic item inside it, and a lenient read takes any well-formed one (CBOR tags included).
 A `cbor.Raw` cannot be written as JSON, nor a `json.Raw` as CBOR: that does not compile. It is
 copied, or borrowed from the input in an aliased parse, like a `ByteString`.
+
+A write checks a `Raw` again, whatever made it, and refuses what would not read back: malformed CBOR
+or JSON, text that is not UTF-8, nesting beyond 128 (`error.InvalidUtf8`, `error.CborNestingTooDeep`,
+`error.TrailingCharacters`, and the parse errors). A deterministic CBOR write also refuses a `Raw` that is not
+itself deterministic, with `error.NonDeterministicEncoding` (or `error.UnexpectedTag`), because it promises
+that equal values give equal bytes and cannot do it for bytes it must put out as they are. The write
+has no allocator, so it does not rewrite them: `zerde.cbor.canonicalize(allocator, bytes)` returns the
+deterministic form of an item (shortest heads, definite lengths, joined strings, the shortest exact
+float, maps in key order; a tag or a repeated key is an error), and a lenient read's `Raw` or extras
+field goes through it before a deterministic write. A non-deterministic write puts a well-formed `Raw`
+back as it is. `zerde.cbor.validate(allocator, bytes)` checks that one item is well-formed with no
+repeated key. The checks that need no allocation do not look for a repeated key outside a deterministic
+write.
 
 ### Reader modes and limits
 

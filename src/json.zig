@@ -149,6 +149,7 @@ pub fn JsonSerializer(comptime Config: type) type {
             var parser: Parser = .{ .input = bytes };
             parser.skipWhitespace();
             if (parser.consume() != '{') return error.UnexpectedToken;
+            try verifyText(bytes);
             return .{ .bytes = bytes, .pos = parser.index };
         }
 
@@ -199,8 +200,9 @@ pub fn JsonSerializer(comptime Config: type) type {
 
         pub const raw_format: typed.RawFormat = .json;
 
-        /// Writes JSON text that was read as `json.Raw`, unchanged.
+        /// Writes JSON text that was read as `json.Raw`, after checking it is one JSON value.
         pub fn emitRaw(self: *Self, value: []const u8) !void {
+            try verifyText(value);
             try self.writer.writeAll(value);
         }
 
@@ -799,13 +801,17 @@ pub fn PullReader(comptime Config: type) type {
 
 /// A writer for a wire type's encode hook: values go out as they are written, with no buffering
 /// and no allocation. A map's items are keys (text) and values alternately, in the order the caller
-/// wants them written, and the lengths given to `beginArray` and `beginMap` are ignored. Bytes follow
-/// the config's `bytes` encoding, and a NaN or infinity is refused.
+/// wants them written. It keeps the guarantees of `ValueWriter` that it can without buffering: the
+/// lengths given to `beginArray` and `beginMap` are met exactly (`error.LengthMismatch`; JSON does not
+/// state them, but the same hook writes CBOR), nesting is at most 128, text is UTF-8, `writeRaw` takes
+/// one valid JSON value, and `finish` says the one item is complete. Bytes follow the config's `bytes`
+/// encoding, and a NaN or infinity is refused.
 pub const Encoder = struct {
     writer: *std.Io.Writer,
     encoding: BytesEncoding,
-    frames: [128]struct { kind: ContainerKind, first: bool, expect_key: bool } = undefined,
+    frames: [128]struct { kind: ContainerKind, first: bool, expect_key: bool, remaining: u64 } = undefined,
     depth: usize = 0,
+    root_done: bool = false,
 
     pub fn writeNull(self: *Encoder) !void {
         try self.beforeValue();
@@ -837,11 +843,13 @@ pub const Encoder = struct {
         if (self.depth != 0) {
             const frame = &self.frames[self.depth - 1];
             if (frame.kind == .object and frame.expect_key) {
+                if (frame.remaining == 0) return error.LengthMismatch;
                 if (!frame.first) try self.writer.writeByte(',');
                 frame.first = false;
                 try writeEscapedString(self.writer, value);
                 try self.writer.writeByte(':');
                 frame.expect_key = false;
+                frame.remaining -= 1;
                 return;
             }
         }
@@ -856,44 +864,54 @@ pub const Encoder = struct {
         self.afterValue();
     }
 
-    /// JSON text that is already valid, unchanged.
+    /// One JSON value that is already text, checked first.
     pub fn writeRaw(self: *Encoder, text: []const u8) !void {
+        try verifyText(text);
         try self.beforeValue();
         try self.writer.writeAll(text);
         self.afterValue();
     }
 
     pub fn beginArray(self: *Encoder, len: usize) !void {
-        _ = len;
         try self.beforeValue();
-        try self.push(.array);
+        try self.push(.array, len);
         try self.writer.writeByte('[');
     }
 
     pub fn endArray(self: *Encoder) !void {
         if (self.depth == 0 or self.frames[self.depth - 1].kind != .array) return error.UnbalancedContainers;
+        if (self.frames[self.depth - 1].remaining != 0) return error.LengthMismatch;
         try self.writer.writeByte(']');
         self.depth -= 1;
         self.afterValue();
     }
 
     pub fn beginMap(self: *Encoder, len: usize) !void {
-        _ = len;
         try self.beforeValue();
-        try self.push(.object);
+        try self.push(.object, std.math.mul(u64, len, 2) catch return error.LengthMismatch);
         try self.writer.writeByte('{');
     }
 
     pub fn endMap(self: *Encoder) !void {
         if (self.depth == 0 or self.frames[self.depth - 1].kind != .object or !self.frames[self.depth - 1].expect_key) return error.UnbalancedContainers;
+        if (self.frames[self.depth - 1].remaining != 0) return error.LengthMismatch;
         try self.writer.writeByte('}');
         self.depth -= 1;
         self.afterValue();
     }
 
+    /// After the item: it is complete, and nothing is open.
+    pub fn finish(self: *Encoder) !void {
+        if (self.depth != 0 or !self.root_done) return error.LengthMismatch;
+    }
+
     fn beforeValue(self: *Encoder) !void {
-        if (self.depth == 0) return;
+        if (self.depth == 0) {
+            if (self.root_done) return error.LengthMismatch;
+            return;
+        }
         const frame = &self.frames[self.depth - 1];
+        if (frame.remaining == 0) return error.LengthMismatch;
         switch (frame.kind) {
             .array => {
                 if (!frame.first) try self.writer.writeByte(',');
@@ -904,14 +922,18 @@ pub const Encoder = struct {
     }
 
     fn afterValue(self: *Encoder) void {
-        if (self.depth == 0) return;
+        if (self.depth == 0) {
+            self.root_done = true;
+            return;
+        }
         const frame = &self.frames[self.depth - 1];
+        frame.remaining -= 1;
         if (frame.kind == .object) frame.expect_key = true;
     }
 
-    fn push(self: *Encoder, kind: ContainerKind) !void {
+    fn push(self: *Encoder, kind: ContainerKind, len: u64) !void {
         if (self.depth >= self.frames.len) return error.JsonNestingTooDeep;
-        self.frames[self.depth] = .{ .kind = kind, .first = true, .expect_key = true };
+        self.frames[self.depth] = .{ .kind = kind, .first = true, .expect_key = true, .remaining = len };
         self.depth += 1;
     }
 };
@@ -1017,8 +1039,9 @@ pub const ValueWriter = struct {
         try self.afterValue();
     }
 
-    /// Writes JSON text that is already valid, unchanged: a `Raw` that was read, say.
+    /// Writes JSON text that is already valid: a `Raw` that was read, say. It is checked first.
     pub fn writeRaw(self: *ValueWriter, text: []const u8) !void {
+        try verifyText(text);
         try self.beforeValue();
         try self.sink().writeAll(text);
         try self.afterValue();
@@ -1321,10 +1344,22 @@ fn effectiveBorrowStrings(cfg: anytype) bool {
     return false;
 }
 
+/// Checks, without allocating, that `text` is exactly one JSON value (whitespace around it allowed)
+/// that the writer may put out as it is: well-formed, strings valid, nesting within 128. A repeated
+/// member name is not looked for: that needs an allocation.
+fn verifyText(text: []const u8) !void {
+    var parser: Parser = .{ .input = text, .checked = true };
+    try parser.skipValueTrusted(0);
+    parser.skipWhitespace();
+    if (parser.index != text.len) return error.TrailingCharacters;
+}
+
 const Parser = struct {
     input: []const u8,
     index: usize = 0,
     max_string_len: usize = std.math.maxInt(usize),
+    /// `skipValueTrusted` checks the strings it steps over (escapes, control characters, UTF-8).
+    checked: bool = false,
 
     const NumberSlice = struct {
         slice: []const u8,
@@ -1552,13 +1587,43 @@ const Parser = struct {
         }
     }
 
-    /// Steps over a value that is already known to be valid, without checking it again. Too deep
-    /// nesting is an error, not a trap.
+    /// Steps over a string literal and checks it: UTF-8, no control character, valid escapes.
+    fn skipStringChecked(self: *Parser) Error!void {
+        if (self.consume() != '"') return error.UnexpectedToken;
+        const start = self.index;
+        while (true) {
+            self.index = bulk.findStringSpecial(self.input, self.index);
+            switch (self.consume() orelse return error.UnexpectedEndOfInput) {
+                '"' => {
+                    _ = try validUtf8(self.input[start .. self.index - 1]);
+                    return;
+                },
+                '\\' => switch (self.consume() orelse return error.UnexpectedEndOfInput) {
+                    '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
+                    'u' => {
+                        const first = try self.parseHex4();
+                        if (std.unicode.utf16IsHighSurrogate(first)) {
+                            if (self.consume() != '\\' or self.consume() != 'u') return error.InvalidUnicodeSurrogate;
+                            if (!std.unicode.utf16IsLowSurrogate(try self.parseHex4())) return error.InvalidUnicodeSurrogate;
+                        } else if (std.unicode.utf16IsLowSurrogate(first)) {
+                            return error.InvalidUnicodeSurrogate;
+                        }
+                    },
+                    else => return error.InvalidStringEscape,
+                },
+                0...31 => return error.InvalidStringCharacter,
+                else => {},
+            }
+        }
+    }
+
+    /// Steps over a value that is already known to be valid, without checking it again, unless
+    /// `checked`. Too deep nesting is an error, not a trap.
     fn skipValueTrusted(self: *Parser, depth: usize) Error!void {
         if (depth > 128) return error.JsonNestingTooDeep;
         self.skipWhitespace();
         switch (self.peek() orelse return error.UnexpectedEndOfInput) {
-            '"' => try self.skipStringTrusted(),
+            '"' => if (self.checked) try self.skipStringChecked() else try self.skipStringTrusted(),
             '{', '[' => {
                 const object = self.consume().? == '{';
                 self.skipWhitespace();
@@ -1569,7 +1634,7 @@ const Parser = struct {
                 while (true) {
                     if (object) {
                         self.skipWhitespace();
-                        try self.skipStringTrusted();
+                        if (self.checked) try self.skipStringChecked() else try self.skipStringTrusted();
                         self.skipWhitespace();
                         if (self.consume() != ':') return error.UnexpectedToken;
                     }

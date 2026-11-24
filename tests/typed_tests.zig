@@ -1177,8 +1177,18 @@ test "a CBOR Raw is the item's own bytes, whatever its spelling" {
     try std.testing.expectEqual(@as(u8, 7), decoded.id);
     try std.testing.expectEqualSlices(u8, &meta, decoded.meta.bytes);
     try std.testing.expectEqual(@as(?u8, 9), decoded.after);
-    // It is written back unchanged inside the deterministic map around it.
-    try expectCborBytes(&([_]u8{ 0xa3, 0x62, 'i', 'd', 0x07, 0x64, 'm', 'e', 't', 'a' } ++ meta ++ [_]u8{ 0x65, 'a', 'f', 't', 'e', 'r', 0x09 }), decoded, .{}, .{ .deterministic = true });
+    // A default write puts it back unchanged inside the map around it.
+    try expectCborBytes(&([_]u8{ 0xbf, 0x62, 'i', 'd', 0x07, 0x64, 'm', 'e', 't', 'a' } ++ meta ++ [_]u8{ 0x65, 'a', 'f', 't', 'e', 'r', 0x09, 0xff }), decoded, .{}, .{});
+    // A deterministic write promises deterministic bytes, so it refuses what is not, and takes it
+    // once canonicalized: the map sorted, definite, the chunks joined, the head shortened.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.serializeWith(zerde.cbor, &out.writer, decoded, .{}, .{ .deterministic = true }));
+    const canonical = try zerde.cbor.canonicalize(allocator, decoded.meta.bytes);
+    defer allocator.free(canonical);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa2, 0x61, 'j', 0x62, 'a', 'b', 0x61, 'k', 0x82, 0x01, 0x02 }, canonical);
+    const fixed = Framed{ .id = 7, .meta = .{ .bytes = canonical }, .after = 9 };
+    try expectCborBytes(&([_]u8{ 0xa3, 0x62, 'i', 'd', 0x07, 0x64, 'm', 'e', 't', 'a' } ++ [_]u8{ 0xa2, 0x61, 'j', 0x62, 'a', 'b', 0x61, 'k', 0x82, 0x01, 0x02 } ++ [_]u8{ 0x65, 'a', 'f', 't', 'e', 'r', 0x09 }), fixed, .{}, .{ .deterministic = true });
     // Any item can be raw: a scalar, an array, a tagged value.
     inline for (.{ &[_]u8{ 0x82, 0x01, 0x02 }, &[_]u8{ 0xc1, 0x1a, 0x00, 0x00, 0x00, 0x01 }, &[_]u8{0xf5} }) |item| {
         const bytes = [_]u8{ 0xa2, 0x62, 'i', 'd', 0x00, 0x64, 'm', 'e', 't', 'a' } ++ item.*;
@@ -2366,9 +2376,17 @@ test "an encode hook for a map writes its entries in the order it chooses" {
             try encoder.endMap();
         }
     };
-    const dict = Dict{ .keys = &.{ "a", "bb", "c" } };
-    try expectCborBytes(&.{ 0xa3, 0x61, 'a', 0x00, 0x62, 'b', 'b', 0x01, 0x61, 'c', 0x02 }, dict, .{}, .{ .deterministic = true });
-    try expectJsonText("{\"a\":0,\"bb\":1,\"c\":2}", dict, .{}, .{});
+    // Deterministic CBOR needs the keys in the order of their encoded bytes: a, c, bb.
+    const dict = Dict{ .keys = &.{ "a", "c", "bb" } };
+    try expectCborBytes(&.{ 0xa3, 0x61, 'a', 0x00, 0x61, 'c', 0x01, 0x62, 'b', 'b', 0x02 }, dict, .{}, .{ .deterministic = true });
+    try expectJsonText("{\"a\":0,\"c\":1,\"bb\":2}", dict, .{}, .{});
+    // Without it the hook's order stands.
+    const unsorted = Dict{ .keys = &.{ "a", "bb", "c" } };
+    try expectCborBytes(&.{ 0xa3, 0x61, 'a', 0x00, 0x62, 'b', 'b', 0x01, 0x61, 'c', 0x02 }, unsorted, .{}, .{});
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.serializeWith(zerde.cbor, &sink.writer, unsorted, .{}, .{ .deterministic = true }));
+    try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.cbor, &sink.writer, Dict{ .keys = &.{ "a", "a" } }, .{}, .{ .deterministic = true }));
     // A JSON hook must write a key where a key is due, and close what it opens.
     const Bad = struct {
         pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
@@ -2542,6 +2560,8 @@ test "a JSON encode hook refuses NaN and nests no deeper than 128" {
 
         pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
             for (0..self.depth) |_| try encoder.beginArray(1);
+            try encoder.writeNull();
+            for (0..self.depth) |_| try encoder.endArray();
         }
     };
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -2708,4 +2728,499 @@ test "every JSON entry point applies the limits" {
     try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceAliasedWith(struct { a: zerde.json.Raw }, allocator, "{\"a\":[1]}", .{}, .{ .max_depth = 1 }));
     try std.testing.expectError(error.StringTooLong, zerde.json.parseSliceAliasedWith(struct { a: []const u8 }, allocator, "{\"a\":\"xyz\"}", .{}, .{ .max_string_len = 2 }));
     try std.testing.expectEqual(@as(u8, 1), (try zerde.json.parseSliceAliasedWith(OneA, allocator, input, .{}, .{})).a);
+}
+
+// ---- a deterministic write is deterministic: Raw, extras and the encode hook -------------------------------------
+
+/// A hook that runs `script(encoder)`, for what a hook can get wrong.
+fn Scripted(comptime script: anytype) type {
+    return struct {
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            _ = self;
+            try script(encoder);
+        }
+    };
+}
+
+fn expectHookCbor(comptime script: anytype, comptime deterministic: bool, expected: anyerror![]const u8) !void {
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+    const result = zerde.serializeWith(zerde.cbor, &sink.writer, Scripted(script){}, .{}, .{ .deterministic = deterministic });
+    if (expected) |bytes| {
+        try result;
+        try std.testing.expectEqualSlices(u8, bytes, sink.written());
+    } else |err| try std.testing.expectError(err, result);
+}
+
+test "a CBOR encode hook meets the lengths it states" {
+    const S = struct {
+        fn two(e: anytype) !void {
+            try e.beginArray(2);
+            try e.writeInt(1);
+            try e.endArray();
+        }
+        fn one(e: anytype) !void {
+            try e.beginArray(1);
+            try e.writeInt(1);
+            try e.writeInt(2);
+        }
+        fn evenMap(e: anytype) !void {
+            try e.beginMap(1);
+            try e.writeText("k");
+            try e.endMap();
+        }
+        fn exact(e: anytype) !void {
+            try e.beginArray(2);
+            try e.writeInt(1);
+            try e.writeInt(2);
+            try e.endArray();
+        }
+        fn two_items(e: anytype) !void {
+            try e.writeInt(1);
+            try e.writeInt(2);
+        }
+        fn nothing(e: anytype) !void {
+            _ = e;
+        }
+        fn stray_end(e: anytype) !void {
+            try e.endArray();
+        }
+        fn wrong_end(e: anytype) !void {
+            try e.beginArray(0);
+            try e.endMap();
+        }
+        fn unfinished(e: anytype) !void {
+            try e.beginArray(0);
+        }
+    };
+    inline for ([_]bool{ false, true }) |deterministic| {
+        try expectHookCbor(S.two, deterministic, error.LengthMismatch);
+        try expectHookCbor(S.one, deterministic, error.LengthMismatch);
+        try expectHookCbor(S.evenMap, deterministic, error.LengthMismatch);
+        try expectHookCbor(S.exact, deterministic, &.{ 0x82, 0x01, 0x02 });
+        try expectHookCbor(S.two_items, deterministic, error.LengthMismatch);
+        try expectHookCbor(S.nothing, deterministic, error.LengthMismatch);
+        try expectHookCbor(S.stray_end, deterministic, error.UnbalancedContainers);
+        try expectHookCbor(S.wrong_end, deterministic, error.UnbalancedContainers);
+        try expectHookCbor(S.unfinished, deterministic, error.LengthMismatch);
+    }
+}
+
+test "a CBOR encode hook is bound to the nesting a reader accepts, to UTF-8 and to well-formed raw items" {
+    const S = struct {
+        fn nested(comptime depth: usize) fn (anytype) anyerror!void {
+            return struct {
+                fn run(e: anytype) anyerror!void {
+                    for (0..depth) |_| try e.beginArray(1);
+                    try e.writeNull();
+                    for (0..depth) |_| try e.endArray();
+                }
+            }.run;
+        }
+        fn badText(e: anytype) !void {
+            try e.writeText("\xff");
+        }
+        fn badKey(e: anytype) !void {
+            try e.beginMap(1);
+            try e.writeText("\xc3");
+        }
+        fn rawJunk(e: anytype) !void {
+            try e.writeRaw(&.{ 0xff, 0xff });
+        }
+        fn rawShort(e: anytype) !void {
+            try e.writeRaw(&.{ 0x82, 0x01 });
+        }
+        fn rawTrailing(e: anytype) !void {
+            try e.writeRaw(&.{ 0x01, 0x02 });
+        }
+        fn rawText(e: anytype) !void {
+            try e.writeRaw(&.{ 0x61, 0xff });
+        }
+        fn rawGood(e: anytype) !void {
+            try e.writeRaw(&.{ 0x82, 0x01, 0x02 });
+        }
+    };
+    inline for ([_]bool{ false, true }) |deterministic| {
+        try expectHookCbor(S.nested(127), deterministic, &(@as([127]u8, @splat(0x81)) ++ [_]u8{0xf6}));
+        try expectHookCbor(S.nested(129), deterministic, error.CborNestingTooDeep);
+        try expectHookCbor(S.badText, deterministic, error.InvalidUtf8);
+        try expectHookCbor(S.badKey, deterministic, error.InvalidUtf8);
+        try expectHookCbor(S.rawJunk, deterministic, error.InvalidAdditionalInfo);
+        try expectHookCbor(S.rawShort, deterministic, error.UnexpectedEndOfInput);
+        try expectHookCbor(S.rawTrailing, deterministic, error.TrailingCharacters);
+        try expectHookCbor(S.rawText, deterministic, error.InvalidUtf8);
+        try expectHookCbor(S.rawGood, deterministic, &.{ 0x82, 0x01, 0x02 });
+    }
+}
+
+test "a deterministic CBOR encode hook writes keys in ascending order, nested maps included" {
+    const S = struct {
+        fn nested(e: anytype) !void {
+            try e.beginMap(2);
+            try e.writeText("b");
+            try e.beginMap(2);
+            try e.writeInt(1);
+            try e.writeNull();
+            try e.writeInt(2);
+            try e.writeNull();
+            try e.endMap();
+            // The key before this one is "b", not an inner key: "c" follows it.
+            try e.writeText("c");
+            try e.writeBool(true);
+            try e.endMap();
+        }
+        fn outer_back(e: anytype) !void {
+            try e.beginMap(2);
+            try e.writeText("b");
+            try e.beginMap(1);
+            try e.writeText("zz");
+            try e.writeNull();
+            try e.endMap();
+            try e.writeText("a");
+            try e.writeNull();
+            try e.endMap();
+        }
+        fn inner_fresh(e: anytype) !void {
+            // Each map starts its own order: "a" in the inner map is fine after "b" in the outer.
+            try e.beginMap(1);
+            try e.writeText("b");
+            try e.beginMap(2);
+            try e.writeText("a");
+            try e.writeNull();
+            try e.writeText("c");
+            try e.writeNull();
+            try e.endMap();
+            try e.endMap();
+        }
+        fn inner_unsorted(e: anytype) !void {
+            try e.beginMap(1);
+            try e.writeText("b");
+            try e.beginMap(2);
+            try e.writeText("c");
+            try e.writeNull();
+            try e.writeText("a");
+            try e.writeNull();
+        }
+        fn mixed(e: anytype) !void {
+            // Integers sort before text, by their encoded bytes: 1, 255, "a".
+            try e.beginMap(3);
+            try e.writeInt(1);
+            try e.writeNull();
+            try e.writeInt(255);
+            try e.writeNull();
+            try e.writeText("a");
+            try e.writeNull();
+            try e.endMap();
+        }
+        fn mixed_back(e: anytype) !void {
+            try e.beginMap(2);
+            try e.writeText("a");
+            try e.writeNull();
+            try e.writeInt(1);
+        }
+        fn array_key(e: anytype) !void {
+            try e.beginMap(1);
+            try e.beginArray(0);
+        }
+        fn raw_key(e: anytype) !void {
+            try e.beginMap(2);
+            try e.writeRaw(&.{0x01});
+            try e.writeNull();
+            try e.writeRaw(&.{0x02});
+            try e.writeNull();
+            try e.endMap();
+        }
+        fn long_key(e: anytype) !void {
+            try e.beginMap(1);
+            try e.writeText(&@as([2000]u8, @splat('k')));
+        }
+        fn long_value(e: anytype) !void {
+            try e.beginMap(1);
+            try e.writeText("k");
+            try e.writeText(&@as([2000]u8, @splat('v')));
+            try e.endMap();
+        }
+    };
+    try expectHookCbor(S.nested, true, &.{ 0xa2, 0x61, 'b', 0xa2, 0x01, 0xf6, 0x02, 0xf6, 0x61, 'c', 0xf5 });
+    try expectHookCbor(S.outer_back, true, error.NonDeterministicEncoding);
+    try expectHookCbor(S.inner_fresh, true, &.{ 0xa1, 0x61, 'b', 0xa2, 0x61, 'a', 0xf6, 0x61, 'c', 0xf6 });
+    try expectHookCbor(S.inner_unsorted, true, error.NonDeterministicEncoding);
+    try expectHookCbor(S.mixed, true, &.{ 0xa3, 0x01, 0xf6, 0x18, 0xff, 0xf6, 0x61, 'a', 0xf6 });
+    try expectHookCbor(S.mixed_back, true, error.NonDeterministicEncoding);
+    try expectHookCbor(S.array_key, true, error.UnexpectedType);
+    try expectHookCbor(S.raw_key, true, &.{ 0xa2, 0x01, 0xf6, 0x02, 0xf6 });
+    try expectHookCbor(S.long_key, true, error.KeyTooLong);
+    // The key buffer is for keys only: a long value streams, and a default write has no key limit.
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+    try zerde.serializeWith(zerde.cbor, &sink.writer, Scripted(S.long_value){}, .{}, .{ .deterministic = true });
+    sink.clearRetainingCapacity();
+    // (The hook's map is never closed, which `finish` refuses: the length error is the only one.)
+    try std.testing.expectError(error.LengthMismatch, zerde.serializeWith(zerde.cbor, &sink.writer, Scripted(S.long_key){}, .{}, .{}));
+}
+
+test "a deterministic write of a Raw or of extras is deterministic, or refused" {
+    // Lenient reads keep what they were given.
+    const lenient_cases = [_][]const u8{
+        &.{ 0x18, 0x01 }, // 1 in a longer head
+        &.{ 0x9f, 0x01, 0xff }, // indefinite array
+        &.{ 0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0 }, // 1.0 as a double
+        &.{ 0xa2, 0x61, 'b', 0x01, 0x61, 'a', 0x02 }, // keys out of order
+        &.{ 0xc1, 0x01 }, // a tag
+        &.{ 0x7f, 0x61, 'a', 0xff }, // chunked text
+    };
+    for (lenient_cases) |meta| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        try input.appendSlice(allocator, &.{ 0xa2, 0x62, 'i', 'd', 0x01, 0x64, 'm', 'e', 't', 'a' });
+        try input.appendSlice(allocator, meta);
+        const decoded = try zerde.cbor.parseSlice(Framed, allocator, input.items);
+        defer zerde.free(allocator, decoded);
+        // The default write puts it back.
+        var plain = try writeCbor(decoded, .{}, .{});
+        defer plain.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, plain.written(), meta) != null);
+        // A deterministic write refuses it...
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const refused = zerde.serializeWith(zerde.cbor, &out.writer, decoded, .{}, .{ .deterministic = true });
+        try std.testing.expect(std.meta.isError(refused));
+        // ...and writes what canonicalize gives, which a strict read accepts as it stands.
+        if (zerde.cbor.canonicalize(allocator, meta)) |canonical| {
+            defer allocator.free(canonical);
+            var det = try writeCbor(Framed{ .id = 1, .meta = .{ .bytes = canonical } }, .{}, .{ .deterministic = true });
+            defer det.deinit();
+            const again = try zerde.cbor.parseSliceWith(Framed, allocator, det.written(), .{}, .{ .mode = .strict });
+            defer zerde.free(allocator, again);
+            try std.testing.expectEqualSlices(u8, canonical, again.meta.bytes);
+        } else |err| try std.testing.expectEqual(error.UnexpectedTag, err);
+    }
+    // Extras are one Raw: the same rule.
+    const loose = [_]u8{ 0xa3, 0x62, 'i', 'd', 0x01, 0x64, 'n', 'a', 'm', 'e', 0x61, 'n', 0x61, 'z', 0x18, 0x01 };
+    const kept = try zerde.cbor.parseSlice(WithExtras, allocator, &loose);
+    defer zerde.free(allocator, kept);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.serializeWith(zerde.cbor, &out.writer, kept, .{}, .{ .deterministic = true }));
+    const canonical = try zerde.cbor.canonicalize(allocator, kept.rest.bytes);
+    defer allocator.free(canonical);
+    var det = try writeCbor(WithExtras{ .id = 1, .name = "n", .rest = .{ .bytes = canonical } }, .{}, .{ .deterministic = true });
+    defer det.deinit();
+    const strict_read = try zerde.cbor.parseSliceWith(WithExtras, allocator, det.written(), .{}, .{ .mode = .strict });
+    defer zerde.free(allocator, strict_read);
+    try std.testing.expectEqual(@as(u8, 1), strict_read.id);
+}
+
+test "canonicalize gives the deterministic form, and refuses what has none" {
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = &.{ 0x18, 0x01 }, .out = &.{0x01} },
+        .{ .in = &.{ 0x9f, 0x01, 0xff }, .out = &.{ 0x81, 0x01 } },
+        .{ .in = &.{ 0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0 }, .out = &.{ 0xf9, 0x3c, 0x00 } },
+        .{ .in = &.{ 0xfa, 0x47, 0xc3, 0x50, 0x00 }, .out = &.{ 0xfa, 0x47, 0xc3, 0x50, 0x00 } }, // 100000.0 needs a single
+        .{ .in = &.{ 0xf9, 0x7e, 0x01 }, .out = &.{ 0xf9, 0x7e, 0x00 } }, // a NaN with a payload
+        .{ .in = &.{ 0xfb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0 }, .out = &.{ 0xf9, 0x7c, 0x00 } }, // infinity
+        .{ .in = &.{ 0xa2, 0x61, 'b', 0x01, 0x61, 'a', 0x02 }, .out = &.{ 0xa2, 0x61, 'a', 0x02, 0x61, 'b', 0x01 } },
+        .{ .in = &.{ 0xbf, 0x61, 'a', 0x7f, 0x61, 'x', 0x61, 'y', 0xff, 0xff }, .out = &.{ 0xa1, 0x61, 'a', 0x62, 'x', 'y' } },
+        .{ .in = &.{ 0xa2, 0x62, 'b', 'b', 0x01, 0x61, 'c', 0x02 }, .out = &.{ 0xa2, 0x61, 'c', 0x02, 0x62, 'b', 'b', 0x01 } },
+        // The canonical form is what a strict read accepts, so it is its own canonical form.
+        .{ .in = &.{ 0xa1, 0x61, 'a', 0xf9, 0x3c, 0x00 }, .out = &.{ 0xa1, 0x61, 'a', 0xf9, 0x3c, 0x00 } },
+    };
+    for (cases) |case| {
+        const got = try zerde.cbor.canonicalize(allocator, case.in);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(u8, case.out, got);
+        // Strict mode accepts what it gives.
+        var d = try zerde.cbor.pullReader(allocator, got, .{ .mode = .strict });
+        defer d.deinit();
+        while (try d.next()) |_| {}
+    }
+    try std.testing.expectError(error.UnexpectedTag, zerde.cbor.canonicalize(allocator, &.{ 0xc1, 0x01 }));
+    try std.testing.expectError(error.DuplicateField, zerde.cbor.canonicalize(allocator, &.{ 0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02 }));
+    try std.testing.expectError(error.TrailingCharacters, zerde.cbor.canonicalize(allocator, &.{ 0x01, 0x02 }));
+    try std.testing.expectError(error.UnexpectedEndOfInput, zerde.cbor.canonicalize(allocator, &.{ 0x82, 0x01 }));
+    try std.testing.expectError(error.InvalidUtf8, zerde.cbor.canonicalize(allocator, &.{ 0x61, 0xff }));
+    try std.testing.expectError(error.TrailingCharacters, zerde.cbor.validate(allocator, &.{ 0x01, 0x02 }));
+    try zerde.cbor.validate(allocator, &.{ 0xc1, 0x01 });
+}
+
+test "the value writer puts a Raw in canonical form when deterministic, and checks it either way" {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var det = zerde.cbor.valueWriter(allocator, &out.writer, .{ .deterministic = true });
+    defer det.deinit();
+    try det.beginArray();
+    try det.writeRaw(&.{ 0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0 });
+    try det.writeRaw(&.{ 0xbf, 0x61, 'b', 0x01, 0x61, 'a', 0x02, 0xff });
+    try std.testing.expectError(error.UnexpectedTag, det.writeRaw(&.{ 0xc1, 0x01 }));
+    try std.testing.expectError(error.UnexpectedEndOfInput, det.writeRaw(&.{0x82}));
+    try det.endArray();
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, 0xf9, 0x3c, 0x00, 0xa2, 0x61, 'a', 0x02, 0x61, 'b', 0x01 }, out.written());
+    out.clearRetainingCapacity();
+    var plain = zerde.cbor.valueWriter(allocator, &out.writer, .{});
+    defer plain.deinit();
+    try plain.writeRaw(&.{ 0xc1, 0x18, 0x01 });
+    try std.testing.expectEqualSlices(u8, &.{ 0xc1, 0x18, 0x01 }, out.written());
+    try std.testing.expectError(error.DuplicateField, plain.writeRaw(&.{ 0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02 }));
+}
+
+test "a JSON encode hook meets its lengths, and checks text and raw values" {
+    const S = struct {
+        fn two(e: anytype) !void {
+            try e.beginArray(2);
+            try e.writeInt(1);
+            try e.endArray();
+        }
+        fn extra(e: anytype) !void {
+            try e.beginArray(1);
+            try e.writeInt(1);
+            try e.writeInt(2);
+        }
+        fn exact(e: anytype) !void {
+            try e.beginMap(1);
+            try e.writeText("k");
+            try e.writeInt(2);
+            try e.endMap();
+        }
+        fn nothing(e: anytype) !void {
+            _ = e;
+        }
+        fn twice(e: anytype) !void {
+            try e.writeInt(1);
+            try e.writeInt(2);
+        }
+        fn rawBad(e: anytype) !void {
+            try e.writeRaw("[1,");
+        }
+        fn rawText(e: anytype) !void {
+            try e.writeRaw("\"\xff\"");
+        }
+        fn rawEscape(e: anytype) !void {
+            try e.writeRaw("\"\\q\"");
+        }
+        fn rawSurrogate(e: anytype) !void {
+            try e.writeRaw("\"\\ud800\"");
+        }
+        fn rawTrailing(e: anytype) !void {
+            try e.writeRaw("1 2");
+        }
+        fn rawGood(e: anytype) !void {
+            try e.writeRaw(" {\"a\":[1,\"\\u00e9\\ud83d\\ude00\"]} ");
+        }
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    inline for (.{
+        .{ S.two, error.LengthMismatch },
+        .{ S.extra, error.LengthMismatch },
+        .{ S.nothing, error.LengthMismatch },
+        .{ S.twice, error.LengthMismatch },
+        .{ S.rawBad, error.UnexpectedEndOfInput },
+        .{ S.rawText, error.InvalidUtf8 },
+        .{ S.rawEscape, error.InvalidStringEscape },
+        .{ S.rawSurrogate, error.InvalidUnicodeSurrogate },
+        .{ S.rawTrailing, error.TrailingCharacters },
+    }) |case| {
+        out.clearRetainingCapacity();
+        try std.testing.expectError(case[1], zerde.serializeWith(zerde.json, &out.writer, Scripted(case[0]){}, .{}, .{}));
+    }
+    out.clearRetainingCapacity();
+    try zerde.serializeWith(zerde.json, &out.writer, Scripted(S.exact){}, .{}, .{});
+    try std.testing.expectEqualStrings("{\"k\":2}", out.written());
+    out.clearRetainingCapacity();
+    try zerde.serializeWith(zerde.json, &out.writer, Scripted(S.rawGood){}, .{}, .{});
+}
+
+test "raw items are checked in full: keys in order, chunks, depth, escapes, extras" {
+    // CBOR: a deterministic write refuses a repeated or unordered key in a raw map.
+    const dup_key = [_]u8{ 0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02 };
+    const unordered = [_]u8{ 0xa2, 0x61, 'b', 0x01, 0x61, 'a', 0x02 };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    inline for (.{ dup_key, unordered }) |bytes| {
+        out.clearRetainingCapacity();
+        try std.testing.expectError(error.NonDeterministicEncoding, zerde.serializeWith(zerde.cbor, &out.writer, Framed{ .id = 1, .meta = .{ .bytes = &bytes } }, .{}, .{ .deterministic = true }));
+    }
+    // A chunk of another kind, and a chunk that is itself indefinite, are not a string.
+    inline for (.{ &[_]u8{ 0x7f, 0x41, 'a', 0xff }, &[_]u8{ 0x5f, 0x61, 'a', 0xff }, &[_]u8{ 0x7f, 0x7f, 0xff, 0xff } }) |bytes| {
+        out.clearRetainingCapacity();
+        try std.testing.expectError(error.InvalidStringChunk, zerde.serializeWith(zerde.cbor, &out.writer, Framed{ .id = 1, .meta = .{ .bytes = bytes } }, .{}, .{}));
+    }
+    // 129 arrays are too deep for any reader of this library; 128 are not.
+    const deep = try nestedCbor(129, 0x81);
+    defer allocator.free(deep);
+    out.clearRetainingCapacity();
+    try std.testing.expectError(error.CborNestingTooDeep, zerde.serializeWith(zerde.cbor, &out.writer, Framed{ .id = 1, .meta = .{ .bytes = deep } }, .{}, .{}));
+
+    // The key buffer is freed as each nested map closes: many nests of long keys fit.
+    const Many = struct {
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            _ = self;
+            try encoder.beginMap(40);
+            for (0..40) |index| {
+                try encoder.writeInt(@intCast(index));
+                try encoder.beginMap(1);
+                try encoder.writeText(&@as([300]u8, @splat('k')));
+                try encoder.writeNull();
+                try encoder.endMap();
+            }
+            try encoder.endMap();
+        }
+    };
+    out.clearRetainingCapacity();
+    try zerde.serializeWith(zerde.cbor, &out.writer, Many{}, .{}, .{ .deterministic = true });
+    // Maps in an array: each frees its keys too.
+    const InArray = struct {
+        pub fn zerdeEncode(self: @This(), encoder: anytype) anyerror!void {
+            _ = self;
+            try encoder.beginArray(40);
+            for (0..40) |_| {
+                try encoder.beginMap(1);
+                try encoder.writeText(&@as([300]u8, @splat('k')));
+                try encoder.writeNull();
+                try encoder.endMap();
+            }
+            try encoder.endArray();
+        }
+    };
+    out.clearRetainingCapacity();
+    try zerde.serializeWith(zerde.cbor, &out.writer, InArray{}, .{}, .{ .deterministic = true });
+
+    // JSON: a raw value is checked wherever it is written.
+    out.clearRetainingCapacity();
+    try std.testing.expectError(error.UnexpectedEndOfInput, zerde.serializeWith(zerde.json, &out.writer, FramedJson{ .id = 1, .meta = .{ .bytes = "[1," } }, .{}, .{}));
+    try std.testing.expectError(error.InvalidUtf8, zerde.serializeWith(zerde.json, &out.writer, WithExtrasJson{ .id = 1, .name = "n", .rest = .{ .bytes = "{\"a\":\"\xff\"}" } }, .{}, .{}));
+    var json = zerde.json.valueWriter(allocator, &out.writer, .{});
+    defer json.deinit();
+    try std.testing.expectError(error.UnexpectedEndOfInput, json.writeRaw("[1,"));
+    const S = struct {
+        fn lowSurrogate(e: anytype) !void {
+            try e.writeRaw("\"\\udc00\"");
+        }
+        fn unpairedHigh(e: anytype) !void {
+            try e.writeRaw("\"\\ud800\\u0041\"");
+        }
+        fn control(e: anytype) !void {
+            try e.writeRaw("\"a\x01\"");
+        }
+        fn shortMap(e: anytype) !void {
+            try e.beginMap(2);
+            try e.writeText("k");
+            try e.writeNull();
+            try e.endMap();
+        }
+        fn emptyMapKey(e: anytype) !void {
+            try e.beginMap(0);
+            try e.writeText("k");
+        }
+    };
+    inline for (.{
+        .{ S.lowSurrogate, error.InvalidUnicodeSurrogate },
+        .{ S.unpairedHigh, error.InvalidUnicodeSurrogate },
+        .{ S.control, error.InvalidStringCharacter },
+        .{ S.shortMap, error.LengthMismatch },
+        .{ S.emptyMapKey, error.LengthMismatch },
+    }) |case| {
+        out.clearRetainingCapacity();
+        try std.testing.expectError(case[1], zerde.serializeWith(zerde.json, &out.writer, Scripted(case[0]){}, .{}, .{}));
+    }
 }
