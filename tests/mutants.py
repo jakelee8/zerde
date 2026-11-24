@@ -655,6 +655,8 @@ MUTANTS = [
     ('zon_read.zig', 'try self.checkLiteral(ast, ast_node, ZonGen.parseStrLit(&ast, ast_node, &discard.writer) catch unreachable);\n                return .long;', '_ = ZonGen.parseStrLit(&ast, ast_node, &discard.writer) catch unreachable;\n                return .long;'),
     ('zon_read.zig', 'var fixed: std.Io.Writer = .fixed(buffer);', 'var fixed: std.Io.Writer = .fixed(buffer[0..cap -| 1]);'),
     ('zon_read.zig', 'switch (try self.readStringShort(cap, &buffer)) {', 'switch (blk2: {\n                        _ = &buffer;\n                        break :blk2 typed.ShortText{ .text = (try self.readString(self.allocator)).bytes };\n                    }) {'),
+    ('msgpack.zig', 'fn readStringLike(self: *Self, allocator: Allocator, len: usize) !StringToken {\n            _ = allocator;', 'fn readStringLike(self: *Self, allocator: Allocator, len: usize) !StringToken {\n            _ = try allocator.dupe(u8, "k");'),
+    ('zon_read.zig', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = allocator;', 'pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {\n            _ = try allocator.dupe(u8, "k");'),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

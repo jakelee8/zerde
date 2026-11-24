@@ -8104,3 +8104,37 @@ test "BSON and msgpack read a declared key and an enum name without allocating" 
     const got = try zerde.parseSliceAliased(zerde.msgpack, NamedFields, allocator, &msgpack);
     try std.testing.expectEqual(NameColor.red, got.c);
 }
+
+/// Reads `{a: 1, c: "red"}` member by member and hands every key and string read the failing allocator, so a read
+/// that allocates for a key or a name, even to free it again, is `error.OutOfMemory` here whatever the document built.
+fn expectKeyReadsFree(deserializer: anytype) !void {
+    const none = std.testing.failing_allocator;
+    try deserializer.beginObject();
+    const first = (try deserializer.nextObjectField(none)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("a", first.bytes);
+    try std.testing.expect(!first.allocated);
+    _ = try deserializer.readNumber();
+    const second = (try deserializer.nextObjectField(none)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("c", second.bytes);
+    try std.testing.expect(!second.allocated);
+    const name = try deserializer.readString(none);
+    try std.testing.expectEqualStrings("red", name.bytes);
+    try std.testing.expect(!name.allocated);
+    try std.testing.expectEqual(@as(?zerde.typed.StringToken, null), try deserializer.nextObjectField(none));
+}
+
+test "a key and a string are read by every format with no allocation, whatever the allocator" {
+    var toml = try zerde.toml.sliceDeserializer(allocator, "a = 1\nc = \"red\"\n", .{});
+    defer toml.deinit(allocator);
+    try expectKeyReadsFree(&toml);
+    var yaml = try zerde.yaml.sliceDeserializer(allocator, "a: 1\nc: red\n", .{});
+    defer yaml.deinit(allocator);
+    try expectKeyReadsFree(&yaml);
+    var zon = try zerde.zon.sliceDeserializer(allocator, ".{ .a = 1, .c = .red }", .{});
+    defer zon.deinit(allocator);
+    try expectKeyReadsFree(&zon);
+    var msgpack = try zerde.msgpack.sliceDeserializer(allocator, &.{ 0x82, 0xa1, 'a', 0x01, 0xa1, 'c', 0xa3, 'r', 'e', 'd' }, .{});
+    try expectKeyReadsFree(&msgpack);
+    var bson = try zerde.bson.sliceDeserializer(allocator, &.{ 23, 0, 0, 0, 0x10, 'a', 0, 1, 0, 0, 0, 0x02, 'c', 0, 4, 0, 0, 0, 'r', 'e', 'd', 0, 0 }, .{});
+    try expectKeyReadsFree(&bson);
+}
