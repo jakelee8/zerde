@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- added `zerde.wire`: `Wire(T)`, a fixed-layout (C) type generated from a schema type, with `Span`, `Opt`, tagged unions as `{ tag, payload }`; `decode`, `encode`, `toWire`, `fromWire`, `describe` (offsets of every member), and `Hooked(T)` for a decode hook; `PullReader.readTyped` and `userData`, a `user_data` word on the CBOR and JSON deserializers, and `zerde.typed` exported
+- fixed: a type with a `zerdeDecode` or `zerdeEncode` hook and no `zerdeFree` was walked into by `zerde.free`; it is left alone, as documented
 - added `reader.raw()` to both pull readers (the next item whole, as its bytes) and `.validate = fn (allocator, bytes) !void` for a `Raw` field in `serde.fields`, run after the read has checked the item
 - added `.elem` in `serde.fields`: the bounds (`min_len`, `max_len`, `min`, `max`, and an `elem` of their own) of each element of an array field
 - added `trusted_text` to the CBOR and JSON read and write configs: skip the UTF-8 check of text for an item that is known to be valid (escapes, control characters, mode and limits are still checked); `bench/BULK.md` has the cost it removes

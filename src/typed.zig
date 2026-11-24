@@ -1272,6 +1272,8 @@ fn freeTypedPartial(comptime T: type, allocator: Allocator, value: T, borrowed_s
         if (!borrowed_strings) value.zerdeFree(allocator);
         return;
     }
+    // A wire type with hooks and no `zerdeFree` is left alone, as the README says.
+    if (comptime hasHook(T, "zerdeDecode") or hasHook(T, "zerdeEncode")) return;
     switch (@typeInfo(T)) {
         .bool, .int, .comptime_int, .float, .comptime_float, .@"enum" => {},
         .optional => {

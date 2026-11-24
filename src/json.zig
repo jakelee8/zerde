@@ -320,6 +320,8 @@ pub fn JsonDeserializer(comptime Config: type) type {
         parser: Parser,
         owns_input: bool,
         can_borrow_strings: bool,
+        /// A word the caller keeps with the deserializer, for decode hooks to read (`PullReader.userData`).
+        user_data: usize = 0,
         stack: [128]Container = undefined,
         stack_len: usize = 0,
         max_depth: usize = 128,
@@ -711,6 +713,23 @@ pub fn PullReader(comptime Config: type) type {
                 self.d.deinit(self.allocator);
                 self.allocator.destroy(self.d);
             }
+        }
+
+        /// The whole item as a `T`, read by the typed layer with the deserializer's mode and limits and
+        /// `serde_cfg`: for a decode hook whose type is a schema type with some fixed layout around
+        /// it. Only before the first event; it takes the item, so the reader is done after it.
+        pub fn readTyped(self: *Self, comptime T: type, allocator: Allocator, comptime serde_cfg: anytype) !T {
+            self.release();
+            if (self.done or self.d.stack_len != self.base) return error.InvalidJsonState;
+            const value = try typed.deserialize(T, allocator, self.d, serde_cfg);
+            self.done = self.d.stack_len == self.base;
+            return value;
+        }
+
+        /// The caller's word set on the deserializer (`user_data`), such as the base address of the
+        /// spans a wire type writes.
+        pub fn userData(self: *const Self) usize {
+            return self.d.user_data;
         }
 
         /// The next event, or null after the value is complete.

@@ -17,7 +17,8 @@ const yaml_impl = @import("yaml.zig");
 const zon_impl = @import("zon.zig");
 const diagnostic_impl = @import("diagnostic.zig");
 const meta = @import("meta.zig");
-const typed = @import("typed.zig");
+/// The typed walk, for a caller that builds its own deserializer (to set `user_data`, say).
+pub const typed = @import("typed.zig");
 
 pub const FieldCase = meta.FieldCase;
 /// A variable-length byte string field; see `typed.ByteString`.
@@ -35,6 +36,8 @@ pub const DiagnosticPathSegment = diagnostic_impl.PathSegment;
 
 /// Reflection over schema types, for generators; see `reflect.zig`.
 pub const reflect = @import("reflect.zig");
+/// Fixed-layout wire types generated from schema types; see `wire.zig`.
+pub const wire = @import("wire.zig");
 /// Word-at-a-time scans over strings, used by the JSON and CBOR backends.
 pub const bulk = @import("bulk.zig");
 pub const bin = bin_impl;

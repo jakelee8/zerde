@@ -448,6 +448,37 @@ back as it is. `zerde.cbor.validate(allocator, bytes)` checks that one item is w
 repeated key. The checks that need no allocation do not look for a repeated key outside a deterministic
 write.
 
+### Fixed-layout wire types
+
+`zerde.wire` generates, from a schema type, the same value laid out the way C lays out a struct, for code that
+reads it by offset out of linear memory (TypeScript over WebAssembly, say) with no parser:
+
+- `wire.Wire(T)` is the type: integers, floats and bools as they are; an enum as its integer tag; `[N]T` as `[N]Wire(T)`;
+  text, a `ByteString`, a `Raw` and any slice as `wire.Span` (`extern struct { offset: u32, len: u32 }`: `len` counts bytes,
+  or elements for a slice, which is written as a contiguous `Wire(element)` array); `?T` as `wire.Opt(Wire(T))` (a presence
+  byte, 0 or 1, then the value, zero when absent); a struct as an `extern struct` of its members in declaration order; a tagged
+  union as `extern struct { tag: u8, payload: extern union { ... } }`, the tag being the variant's index in declaration order and a
+  variant without payload having no member in the union.
+- `wire.decode(Format, T, allocator, base, input, serde_cfg, format_cfg)` reads one `T` from `input` (CBOR or JSON) and returns
+  its `Wire(T)`. The read is the typed read, aliased, with every rule of `T` and of the config (strict mode, limits, bounds,
+  validators, integer keys, optional policies): the message is read into `T`, then copied, so there is no second set of rules to
+  drift. Text and byte strings stay in `input` (the input must stay put while the wire value is read); arrays and the typed
+  intermediate are written into `allocator`, meant to be a fixed buffer. Spans are offsets from `base`: 0 on wasm32, where an offset
+  is a linear-memory address, or the address of a region that holds both the input and the arena on a native target. An offset or an
+  end that does not fit `u32`, or an address before `base`, is `error.OffsetOutOfRange`; nothing is truncated.
+- `wire.encode(Format, T, allocator, base, wire, writer, serde_cfg, format_cfg)` writes a wire value as the typed value would be
+  written (same order, keys, optional policy, determinism). It rebuilds the typed value first, so it needs an allocator for the arrays
+  (the writers stream and keep no memory), and an invalid enum value, tag or presence byte is `error.InvalidTag`.
+  `wire.toWire` and `wire.fromWire` are the conversions, and `wire.spanOf` and `wire.bytesOf` convert a span.
+- `wire.describe(T, cfg)` returns the layout as a comptime tree (`Node`: kind, size, alignment, and for each member its name, wire key
+  and `@offsetOf` offset), so a generator of accessors for another language needs no layout rule of its own.
+- `wire.Hooked(T)` is a struct field type for a wire value inside a larger typed message: its decode hook reads a `T` with
+  `reader.readTyped(T, allocator, serde_cfg)` and converts it, taking the base from `reader.userData()`, the word a caller sets on
+  a deserializer it builds itself (`d.user_data = base`; `zerde.typed.deserialize` reads through it). It has no encode hook: an
+  encode hook streams and has no allocator to rebuild the typed value in, so write a wire value with `wire.encode`.
+
+A type with no wire layout (a hook type, `i128`, a tuple, an untagged union, a nested optional) is a compile error.
+
 ### Reader modes and limits
 
 CBOR `ReadConfig.mode` is `.lenient` (the default, everything above) or `.strict`. A strict read

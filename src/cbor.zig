@@ -409,6 +409,8 @@ pub fn CborDeserializer(comptime Config: type) type {
         can_borrow_strings: bool,
         strict: bool = false,
         trusted_text: bool = false,
+        /// A word the caller keeps with the deserializer, for decode hooks to read (`PullReader.userData`).
+        user_data: usize = 0,
         /// `canonicalItem` writes the deterministic encoding (preferred floats; no tags) instead of
         /// the form that compares keys.
         canon_det: bool = false,
@@ -1441,6 +1443,23 @@ pub fn PullReader(comptime Config: type) type {
                 self.d.deinit(self.allocator);
                 self.allocator.destroy(self.d);
             }
+        }
+
+        /// The whole item as a `T`, read by the typed layer with the deserializer's mode and limits and
+        /// `serde_cfg`: for a decode hook whose type is a schema type with some fixed layout around
+        /// it. Only before the first event; it takes the item, so the reader is done after it.
+        pub fn readTyped(self: *Self, comptime T: type, allocator: Allocator, comptime serde_cfg: anytype) !T {
+            self.release();
+            if (self.done or self.d.stack_len != self.base) return error.InvalidCborState;
+            const value = try typed.deserialize(T, allocator, self.d, serde_cfg);
+            self.done = self.d.stack_len == self.base;
+            return value;
+        }
+
+        /// The caller's word set on the deserializer (`user_data`), such as the base address of the
+        /// spans a wire type writes.
+        pub fn userData(self: *const Self) usize {
+            return self.d.user_data;
         }
 
         /// The next event, or null after the item is complete.
