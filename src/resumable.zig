@@ -55,7 +55,7 @@ pub fn Writer(comptime Format: type, comptime T: type, comptime serde_cfg: anyty
 
         /// The smallest window `fill` can make progress in: the largest token the schema writes, which is a
         /// number or a head and the longest field name, escaped.
-        pub const min_window: usize = typed.atomic_room + 6 * longestKey(T, serde_cfg, 0) + 7;
+        pub const min_window: usize = typed.atomic_room + 6 * longestKey(T, serde_cfg, &.{}) + 7;
 
         pub fn init() Self {
             return .{ .serializer = Format.serializer(@as(*std.Io.Writer, undefined), format_cfg) };
@@ -80,31 +80,32 @@ pub fn Writer(comptime Format: type, comptime T: type, comptime serde_cfg: anyty
     };
 }
 
-/// The length of the longest field name or variant name that writing a `T` can put out, looking through containers
-/// to a depth of 16 (a type that recurses repeats its names by then).
-fn longestKey(comptime T: type, comptime cfg: anytype, comptime depth: usize) usize {
+/// The length of the longest field name or variant name that writing a `T` can put out, looking through every type it
+/// reaches. `path` holds the types around this one: a type that recurses adds no name on its second visit.
+fn longestKey(comptime T: type, comptime cfg: anytype, comptime path: []const type) usize {
     @setEvalBranchQuota(1_000_000);
-    if (depth == 16) return 0;
+    inline for (path) |Seen| if (Seen == T) return 0;
+    const inner = path ++ &[_]type{T};
     return comptime blk: {
         var longest: usize = 0;
         switch (@typeInfo(T)) {
             .@"struct" => |info| {
                 if (typed.isRaw(T) or T == typed.ByteString) break :blk 0;
-                for (info.field_types) |FieldType| longest = @max(longest, longestKey(FieldType, cfg, depth + 1));
+                for (info.field_types) |FieldType| longest = @max(longest, longestKey(FieldType, cfg, inner));
                 longest = @max(longest, typed.longestFieldName(T, cfg));
             },
             .@"union" => |info| {
                 for (info.field_types) |PayloadType| {
-                    if (PayloadType != void) longest = @max(longest, longestKey(PayloadType, cfg, depth + 1));
+                    if (PayloadType != void) longest = @max(longest, longestKey(PayloadType, cfg, inner));
                 }
                 for (info.field_names) |name| longest = @max(longest, name.len);
             },
             .@"enum" => |info| for (info.field_names) |name| {
                 longest = @max(longest, name.len);
             },
-            .optional => |info| longest = longestKey(info.child, cfg, depth + 1),
-            .array => |info| longest = longestKey(info.child, cfg, depth + 1),
-            .pointer => |info| longest = longestKey(info.child, cfg, depth + 1),
+            .optional => |info| longest = longestKey(info.child, cfg, inner),
+            .array => |info| longest = longestKey(info.child, cfg, inner),
+            .pointer => |info| longest = longestKey(info.child, cfg, inner),
             else => {},
         }
         break :blk longest;
@@ -139,38 +140,40 @@ fn wrapFrames(comptime T: type) usize {
 }
 
 /// The most frames one step from a container to the next below it can take, anywhere in the type `T` reaches, looking through
-/// a depth of 16 (a type that recurses repeats its steps by then): the frames of the value inside (`wrapFrames`), and one more for
-/// a struct field that is a nested optional or an optional that must be absent rather than null, which has a frame of its own.
-fn mostFrames(comptime T: type, comptime cfg: anytype, comptime depth: usize) usize {
+/// every type it reaches (`path` holds the types around this one; a type that recurses adds no step on its second visit): the
+/// frames of the value inside (`wrapFrames`), and one more for a struct field that is a nested optional or an optional that
+/// must be absent rather than null, which has a frame of its own.
+fn mostFrames(comptime T: type, comptime cfg: anytype, comptime path: []const type) usize {
     @setEvalBranchQuota(1_000_000);
-    if (depth == 16) return 0;
+    inline for (path) |Seen| if (Seen == T) return 0;
+    const inner = path ++ &[_]type{T};
     return comptime blk: {
         var most: usize = 0;
         switch (@typeInfo(T)) {
-            .optional => |info| most = mostFrames(info.child, cfg, depth + 1),
+            .optional => |info| most = mostFrames(info.child, cfg, inner),
             .array => |info| if (info.child != u8) {
-                most = @max(wrapFrames(info.child), mostFrames(info.child, cfg, depth + 1));
+                most = @max(wrapFrames(info.child), mostFrames(info.child, cfg, inner));
             },
             .pointer => |info| switch (info.size) {
-                .one => most = mostFrames(info.child, cfg, depth + 1),
+                .one => most = mostFrames(info.child, cfg, inner),
                 .slice => if (info.child != u8) {
-                    most = @max(wrapFrames(info.child), mostFrames(info.child, cfg, depth + 1));
+                    most = @max(wrapFrames(info.child), mostFrames(info.child, cfg, inner));
                 },
                 else => {},
             },
             .@"union" => |info| for (info.field_types) |PayloadType| {
-                if (PayloadType != void) most = @max(most, @max(wrapFrames(PayloadType), mostFrames(PayloadType, cfg, depth + 1)));
+                if (PayloadType != void) most = @max(most, @max(wrapFrames(PayloadType), mostFrames(PayloadType, cfg, inner)));
             },
             .@"struct" => |info| {
                 if (typed.isRaw(T) or T == typed.ByteString) break :blk 0;
                 if (typed.isSortedMap(T)) {
-                    break :blk @max(wrapFrames(T.Value), mostFrames(T.Value, cfg, depth + 1));
+                    break :blk @max(wrapFrames(T.Value), mostFrames(T.Value, cfg, inner));
                 }
                 for (info.field_names, info.field_types) |name, FieldType| {
                     const nested = @typeInfo(FieldType) == .optional and @typeInfo(@typeInfo(FieldType).optional.child) == .optional;
                     const absent = @typeInfo(FieldType) == .optional and meta.effectiveOptionalPolicy(T, name, cfg) == .absent;
                     const own: usize = if (nested or absent) 1 else 0;
-                    most = @max(most, @max(own + wrapFrames(FieldType), mostFrames(FieldType, cfg, depth + 1)));
+                    most = @max(most, @max(own + wrapFrames(FieldType), mostFrames(FieldType, cfg, inner)));
                 }
             },
             else => {},
@@ -182,7 +185,7 @@ fn mostFrames(comptime T: type, comptime cfg: anytype, comptime depth: usize) us
 /// How many frames a read of `T` needs at `depth` open containers: the root's, and for each container after it the most one
 /// step takes. The walk indexes its frames and does not check, so this is a bound that holds for every input the depth allows.
 fn frameCount(comptime T: type, comptime cfg: anytype, comptime depth: usize) usize {
-    return wrapFrames(T) + depth * mostFrames(T, cfg, 0);
+    return wrapFrames(T) + depth * mostFrames(T, cfg, &.{});
 }
 
 /// A resumable read of a `T` into `Sink`'s layout (`typed.TypedSink` for the Zig value, `wire.WireSink` for the fixed
@@ -194,7 +197,7 @@ fn frameCount(comptime T: type, comptime cfg: anytype, comptime depth: usize) us
 pub fn Reading(comptime Sink: type, comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype, comptime positions: bool) type {
     const ReaderType = chunk.Reader(@TypeOf(cbor_cfg));
     const depth = depthOf(cbor_cfg);
-    const StateType = typed_resume.State(frameCount(T, serde_cfg, depth), longestKey(T, serde_cfg, 0), depth, positions);
+    const StateType = typed_resume.State(frameCount(T, serde_cfg, depth), longestKey(T, serde_cfg, &.{}), depth, positions);
     return struct {
         reader: ReaderType,
         state: StateType = .{},

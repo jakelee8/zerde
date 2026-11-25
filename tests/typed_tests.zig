@@ -7015,6 +7015,30 @@ test "a resumable read gives the value of the whole strict read, for every way t
     try expectChunked(WireMsg, .{}, chunk_read, .{ .id = .{ 0, 0, 0, 0 }, .effects = &.{}, .grid = &.{}, .pair = .{ 0, 65535 } });
 }
 
+/// A struct of one field `d` of type `Inner`, read with no unknown member.
+fn OneFieldOf(comptime Inner: type) type {
+    return struct {
+        d: Inner,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+}
+
+const DeepLeaf = struct {
+    a_field_name_longer_than_any_other: u8,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+
+/// `DeepLeaf` inside `levels` structs.
+fn DeepOf(comptime levels: usize) type {
+    return if (levels == 0) DeepLeaf else OneFieldOf(DeepOf(levels - 1));
+}
+
+test "a resumable read sizes its key buffer and frames over the whole type, however deep the longest name is" {
+    // Seventeen structs, the longest name in the innermost.
+    const D0 = DeepOf(16);
+    try expectChunked(D0, .{}, chunk_read, std.mem.zeroes(D0));
+}
+
 const ChunkInner = struct {
     a: u8,
     b: ?[]const u8 = null,
