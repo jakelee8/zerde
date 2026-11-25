@@ -25,6 +25,7 @@
 - `sliceDeserializer` and `readerDeserializer` of CBOR, JSON, MessagePack and BSON allocate while reading. A caller that uses one directly must call `deinit`, also for borrowed input. `parseSlice*`, `deserialize*` and `value.parse*` already do.
 - `cbor.CborSerializer` takes a second comptime parameter after `Config`: `deterministic`. `cbor.serializer` builds the type from the write config.
 - A field `rename` that is not valid UTF-8 is a compile error.
+- A struct with a `check` that holds a text or byte string is a compile error under `wire.StreamResumable`: the string stays in the stream and the check read output bytes at its stream offset (or got `error.OffsetOutOfRange`) instead of the text. A `Raw` and a sorted map's key are copied into the output and keep working.
 - `reflect.Kind` has a new value, `.@"packed"`, so a `switch` over every value of it no longer compiles until it handles it.
 
 ### Added
@@ -112,6 +113,7 @@
 - Named `ReadConfig` values (`json.ReadConfig{ .borrow_strings = true }`) compile. Only anonymous literals did.
 - BSON: a dynamic `Value` can be read from a document. The root had no kind.
 - The ZON reader freed memory twice when a document had compile errors.
+- The documented bound of a wire decode (`wire.regionSizes`, `resumableRegionSizes`, `streamRegionSizes`, `maxArenaSize`) was not enough for a type with a struct `check`. The check runs on a typed copy that the sink rebuilds in the output region once the read has filled it, and no size counted that rebuild (a list of non-scalar elements can take twice its wire size). Each size now adds the largest rebuild over the structs with a `check`, so a region of the documented size is enough; the sizes grow for such a type. A stream read checked the wrong bytes of a text that stays in the stream; see Breaking.
 
 ## 0.1.0
 

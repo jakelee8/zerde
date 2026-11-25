@@ -394,7 +394,7 @@ MUTANTS = [
     ("wire.zig", "            break :blk .{ .text = .{ .fixed = n } };\n        },\n        .byte_string", "            break :blk .{ .text = .{ .fixed = n / 2 } };\n        },\n        .byte_string"),
     ("wire.zig", "            break :blk .{ .text = .{ .fixed = n } };\n        },\n        .raw", "            break :blk .{ .text = .{ .fixed = n / 2 } };\n        },\n        .raw"),
     ("wire.zig", "        return .{ .fixed = a.fixed * n, .pool = a.pool };", "        return .{ .fixed = a.fixed, .pool = a.pool };"),
-    ("wire.zig", "    const output = lists + text + slack;", "    const output = lists + text;"),
+    ("wire.zig", "    const output = lists + text + check + slack;", "    const output = lists + text + check;"),
     ("wire.zig", "        .strict = has_mode and @field(format_cfg, \"mode\") == cbor.Mode.strict,", "        .strict = false,"),
     ("wire.zig", "    if (!strict) return growth(n, size, alignment);", "    return growth(n, size, alignment);"),
     ("wire.zig", "    if (!strict) return growthPerItem(budget, size, alignment);", "    return growthPerItem(budget, size, alignment);"),
@@ -753,8 +753,34 @@ MUTANTS = [
     ("msgpack.zig", "if (comptime !meta.isPacked(T)) return false;", "if (comptime meta.isPacked(T)) return false;"),
     ("resumable.zig", "if (typed.isRaw(T) or T == typed.ByteString or meta.isPacked(T)) break :blk 0;\n                for (info.field_types) |FieldType| longest", "if (typed.isRaw(T) or T == typed.ByteString) break :blk 0;\n                for (info.field_types) |FieldType| longest"),
     ("resumable.zig", ".@\"struct\" => if (typed.isRaw(T) or T == typed.ByteString or meta.isPacked(T)) 0 else 1,", ".@\"struct\" => if (typed.isRaw(T) or T == typed.ByteString) 0 else 1,"),
+    # the arena a check needs
+    ("wire.zig", "const output = lists + text + check + slack;", "const output = lists + text + slack;"),
+    ("wire.zig", "most = listsOf(rebuildOwned(T, .{}, cfg, limits, depth), limits, true);", "most = 0;"),
+    ("wire.zig", "if (limits.in_stream and holdsStreamText(T, cfg, limits, depth)) {", "if (false) {"),
+    ("wire.zig", ".text, .byte_string => true,\n        .list => holdsStreamText(", ".text, .byte_string => false,\n        .list => holdsStreamText("),
+    ("wire.zig", "                if (@hasDecl(T, \"zerde_sorted_entry\") and std.mem.eql(u8, field.name, \"key\")) continue;\n", ""),
+    ("wire.zig", ".list => holdsStreamText(@typeInfo(T).pointer.child, cfg, limits, depth + 1),", ".list => false,"),
+    ("wire.zig", ".array => holdsStreamText(@typeInfo(T).array.child, cfg, limits, depth + 1),", ".array => false,"),
+    ("wire.zig", ".optional => holdsStreamText(@typeInfo(T).optional.child, cfg, limits, depth),", ".optional => false,"),
+    ("wire.zig", "if (holdsStreamText(field.type, cfg, limits, depth + 1)) break :blk true;", "if (false) break :blk true;"),
+    ("wire.zig", "if (variant.type != void and holdsStreamText(variant.type, cfg, limits, depth + 1)) break :blk true;", "if (false) break :blk true;"),
+    ("wire.zig", ".list => checkBytes(@typeInfo(T).pointer.child, cfg, limits, depth + 1),", ".list => 0,"),
+    ("wire.zig", ".array => checkBytes(@typeInfo(T).array.child, cfg, limits, depth + 1),", ".array => 0,"),
+    ("wire.zig", ".optional => checkBytes(@typeInfo(T).optional.child, cfg, limits, depth),", ".optional => 0,"),
+    ("wire.zig", "if (!field.extras) most = @max(most, checkBytes(field.type, cfg, limits, depth + 1));", "_ = field;"),
+    ("wire.zig", "if (variant.type != void) most = @max(most, checkBytes(variant.type, cfg, limits, depth + 1));", "_ = variant;"),
+    ("wire.zig", "    if (depth > limits.max_depth) return 0;\n    return switch (comptime reflect.kindOf(T)) {\n        .list => checkBytes(", "    return switch (comptime reflect.kindOf(T)) {\n        .list => checkBytes("),
+    ("wire.zig", "    if (depth > limits.max_depth) return .{};\n    return switch (comptime reflect.kindOf(T)) {\n        .bool, .int, .float, .byte_array, .@\"enum\", .@\"packed\", .text,", "    return switch (comptime reflect.kindOf(T)) {\n        .bool, .int, .float, .byte_array, .@\"enum\", .@\"packed\", .text,"),
+    ("wire.zig", "            if (comptime isScalarList(Elem)) break :blk .{};\n            const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};\n            const element = rebuildOwned(", "            const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};\n            const element = rebuildOwned("),
+    ("wire.zig", "listBytes(n, @sizeOf(Elem), @alignOf(Elem), true);\n                break :blk own.plus(element.times(n));", "listBytes(n, @sizeOf(Elem), @alignOf(Elem), true);\n                break :blk own.plus(element);"),
+    ("wire.zig", ".array => rebuildOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),", ".array => rebuildOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1),"),
+    ("wire.zig", ".optional => rebuildOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),", ".optional => .{},"),
+    ("wire.zig", "            if (comptime typed.isSortedMap(T)) break :blk rebuildOwned([]const T.Entry, bounds, cfg, limits, depth);\n", ""),
+    ("wire.zig", "total = total.plus(rebuildOwned(field.type, field.bounds, cfg, limits, depth + 1));", "total = total.most(rebuildOwned(field.type, field.bounds, cfg, limits, depth + 1));"),
+    ("wire.zig", "if (variant.type != void) most = most.most(rebuildOwned(variant.type, variant.bounds, cfg, limits, depth + 1));", "if (variant.type != void) most = most.plus(rebuildOwned(variant.type, variant.bounds, cfg, limits, depth + 1));"),
 ]
-# Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
+# Not reproducible by a source mutation (equivalent or structural): the `+ element.lists.fixed` of the shared-budget list in
+# `rebuildOwned` (the per-item bound in `listsOf` is always the smaller whenever that term is not 0), the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
 # the unreachable else branch of JSON parseStringToken, the compile-time UTF-8 check of a name
 # (`writeName` in cbor.zig, `quotedName` in json.zig), the reset of `high` after an escape in the

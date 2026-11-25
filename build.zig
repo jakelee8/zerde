@@ -394,6 +394,12 @@ pub fn build(b: *std.Build) void {
         .{ "tests/compile_fail/packed_bounds.zig", "bounds do not apply to a packed struct, which is one integer: packed_bounds.Flags" },
         .{ "tests/compile_fail/packed_serde.zig", "and a packed struct is one integer: packed_serde.Renamed" },
         .{ "tests/compile_fail/packed_wide.zig", "a backing integer of at most 64 bits: packed_wide.Wide" },
+        .{ "tests/compile_fail/stream_check_text.zig", "and this one's struct holds some: stream_check_text.Checked" },
+        .{ "tests/compile_fail/stream_check_list.zig", "and this one's struct holds some: stream_check_list.Checked" },
+        .{ "tests/compile_fail/stream_check_optional.zig", "and this one's struct holds some: stream_check_optional.Checked" },
+        .{ "tests/compile_fail/stream_check_array.zig", "and this one's struct holds some: stream_check_array.Checked" },
+        .{ "tests/compile_fail/stream_check_union.zig", "and this one's struct holds some: stream_check_union.Checked" },
+        .{ "tests/compile_fail/stream_check_map.zig", "and this one's struct holds some: stream_check_map.Checked" },
     }) |case| {
         const compile_fail = b.addTest(.{
             .root_module = b.createModule(.{

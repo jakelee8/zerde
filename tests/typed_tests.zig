@@ -9034,3 +9034,293 @@ test "a packed struct costs a resumable read and write what an integer costs: no
         );
     }
 }
+
+// ---- the arena a `check` needs --------------------------------------------------------------------------------
+
+const CheckedLine = struct {
+    name: []const u8,
+    n: u32,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .name = .{ .max_len = 8 } } };
+};
+
+/// A list whose typed element (24 bytes) is twice its wire element (12), so the rebuild of a `check` is the larger part of the arena.
+const CheckedRows = struct {
+    rows: []const CheckedLine,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 64 } } };
+    pub fn check(self: CheckedRows) !void {
+        for (self.rows) |row| if (row.n == 0) return error.EmptyRow;
+    }
+};
+
+fn checkedRows(count: usize) [64]CheckedLine {
+    var rows: [64]CheckedLine = undefined;
+    for (&rows, 0..) |*row, index| row.* = .{ .name = "row", .n = if (index < count) @intCast(index + 1) else 0 };
+    return rows;
+}
+
+/// The bytes a region must hold for a read that used `used` of it and then rebuilt `rows` typed elements for its `check`.
+fn checkPeak(used: usize, rows: usize) usize {
+    return std.mem.alignForward(usize, used, @alignOf(CheckedLine)) + rows * @sizeOf(CheckedLine);
+}
+
+test "the output region holds the rebuild a check needs, and no less than the read and the rebuild take" {
+    try std.testing.expect(@sizeOf(wire.Wire(CheckedLine)) * 2 == @sizeOf(CheckedLine));
+    const rows = checkedRows(64);
+    const value: CheckedRows = .{ .rows = &rows };
+    const cbor_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    const json_read = .{ .max_string_len = 8, .max_items = 500 };
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        const read = if (Format == zerde.cbor) cbor_read else json_read;
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try zerde.serializeWith(Format, &out.writer, value, .{}, if (Format == zerde.cbor) .{ .deterministic = true } else .{});
+        const sizes = comptime wire.regionSizes(Format, CheckedRows, .{}, read);
+        // The input first, then the output region at an aligned address: every span is an offset into this one buffer.
+        var region: Region = .{};
+        const input = region.bytes[0..out.written().len];
+        @memcpy(input, out.written());
+        const output = region.bytes[std.mem.alignForward(usize, input.len, 16)..];
+        var scratch: [1024]u8 = undefined;
+        const decoded = try wire.decodeInto(Format, CheckedRows, output[0..sizes.output], scratch[0..sizes.scratch], region.base(), input, .{}, read);
+        // The rebuild of all 64 rows follows the read, in the same region.
+        const peak = checkPeak(decoded.used, 64);
+        try std.testing.expect(peak <= sizes.output);
+        // Without the rebuild's term the region is smaller than the peak: the read's own bytes and the slack are not enough.
+        try std.testing.expect(decoded.used + 256 < peak);
+        _ = try wire.decodeInto(Format, CheckedRows, output[0..peak], scratch[0..sizes.scratch], region.base(), input, .{}, read);
+        try std.testing.expectError(error.OutOfMemory, wire.decodeInto(Format, CheckedRows, output[0 .. peak - 1], scratch[0..sizes.scratch], region.base(), input, .{}, read));
+        // `decode` into one arena: the sum of the two regions is enough.
+        const total = comptime wire.maxArenaSize(Format, CheckedRows, .{}, read);
+        try std.testing.expectEqual(sizes.output + sizes.scratch, total);
+        var arena = std.heap.FixedBufferAllocator.init(output[0..total]);
+        _ = try wire.decode(Format, CheckedRows, &arena, region.base(), input, .{}, read);
+        // A check that fails is refused.
+        const rejecting = checkedRows(63);
+        out.clearRetainingCapacity();
+        try zerde.serializeWith(Format, &out.writer, CheckedRows{ .rows = &rejecting }, .{}, if (Format == zerde.cbor) .{ .deterministic = true } else .{});
+        const bad_input = region.bytes[0..out.written().len];
+        const bad_output = region.bytes[std.mem.alignForward(usize, bad_input.len, 16)..];
+        @memcpy(bad_input, out.written());
+        try std.testing.expectError(error.EmptyRow, wire.decodeInto(Format, CheckedRows, bad_output[0..sizes.output], scratch[0..sizes.scratch], region.base(), bad_input, .{}, read));
+    }
+}
+
+test "the resumable regions hold the rebuild a check needs, at every cut of the input" {
+    const rows = checkedRows(64);
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    const sizes = comptime wire.resumableRegionSizes(CheckedRows, .{}, read);
+    const input = try deterministicBytes(CheckedRows, .{}, .{ .rows = &rows });
+    defer allocator.free(input);
+    var region: Region = .{};
+    var peak: usize = 0;
+    for (0..input.len + 1) |cut| {
+        var decoder: wire.Resumable(CheckedRows, .{}, read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        _ = try decoder.feed(input[0..cut]);
+        _ = try decoder.feed(input[cut..]);
+        const decoded = try decoder.finish();
+        peak = checkPeak(decoded.used, 64);
+        try std.testing.expect(peak <= sizes.output);
+    }
+    try std.testing.expect(sizes.output < peak + 256 + 12 * 64);
+    // In a region of the peak the decode succeeds, and one byte less is refused, at any cut.
+    var decoder: wire.Resumable(CheckedRows, .{}, read) = undefined;
+    decoder.init(region.bytes[0..peak], region.base());
+    _ = try decoder.feed(input);
+    _ = try decoder.finish();
+    decoder.init(region.bytes[0 .. peak - 1], region.base());
+    try std.testing.expectError(error.OutOfMemory, decoder.feed(input));
+    // And the stream form, where the strings stay in the stream: its struct holds text, so it has no check here, but the sizes of a
+    // type without one are the lists, as before.
+    const bare = comptime wire.streamRegionSizes(struct {
+        rows: []const u32,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 64 } } };
+    }, .{}, read);
+    try std.testing.expect(bare.output < 64 * 4 + 3 + 256 + 1);
+}
+
+const CheckedRaw = struct {
+    raw: zerde.cbor.Raw,
+    labels: zerde.SortedMap(u8),
+    count: u32,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 16 }, .labels = .{ .max_len = 4 } } };
+    pub fn check(self: CheckedRaw) !void {
+        // The item's own bytes, and the keys, which are copied into the output.
+        if (!std.mem.eql(u8, self.raw.bytes, &.{ 0x82, 0x01, 0x02 })) return error.RawNotSeen;
+        if (self.labels.entries.len != 2) return error.KeysNotSeen;
+        if (!std.mem.eql(u8, self.labels.entries[0].key, "a") or !std.mem.eql(u8, self.labels.entries[1].key, "bb")) return error.KeysNotSeen;
+    }
+};
+
+test "a check that reads only a Raw and a sorted map's keys works where the strings stay in the stream" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 50, .max_input_bytes = 200 };
+    const entries = [_]zerde.SortedMap(u8).Entry{ .{ .key = "a", .value = 1 }, .{ .key = "bb", .value = 2 } };
+    const input = try deterministicBytes(CheckedRaw, .{}, .{ .raw = .{ .bytes = &.{ 0x82, 0x01, 0x02 } }, .labels = .{ .entries = &entries }, .count = 3 });
+    defer allocator.free(input);
+    const sizes = comptime wire.streamRegionSizes(CheckedRaw, .{}, read);
+    var region: Region = .{};
+    for (0..input.len + 1) |cut| {
+        var decoder: wire.StreamResumable(CheckedRaw, .{}, read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        _ = try decoder.feed(input[0..cut]);
+        _ = try decoder.feed(input[cut..]);
+        const decoded = try decoder.finish();
+        try std.testing.expectEqual(@as(u32, 3), decoded.value.count);
+    }
+    // The same bytes with a key the check does not expect: the check does see them.
+    var wrong = try allocator.dupe(u8, input);
+    defer allocator.free(wrong);
+    const at = std.mem.indexOf(u8, wrong, "bb").?;
+    wrong[at + 1] = 'c';
+    var decoder: wire.StreamResumable(CheckedRaw, .{}, read) = undefined;
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    try std.testing.expectError(error.KeysNotSeen, decoder.feed(wrong));
+}
+
+const CheckedPlain = struct {
+    rows: []const CheckedLine,
+    pub const serde = CheckedRows.serde;
+};
+
+/// `C` in each place a struct can be below the root of a type: a field, a list element, an optional, an array element, a union
+/// payload and a sorted map's value.
+fn CheckedBelow(comptime C: type) [6]type {
+    const base = .{ .deny_unknown_fields = true };
+    const Choice = union(enum) { a: C, b: u8 };
+    return .{
+        struct {
+            held: C,
+            pub const serde = base;
+        },
+        struct {
+            held: []const C,
+            pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .held = .{ .max_len = 2 } } };
+        },
+        struct {
+            held: ?C,
+            pub const serde = base;
+        },
+        struct {
+            held: [2]C,
+            pub const serde = base;
+        },
+        struct {
+            held: Choice,
+            pub const serde = base;
+        },
+        struct {
+            held: zerde.SortedMap(C),
+            pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .held = .{ .max_len = 2 } } };
+        },
+    };
+}
+
+test "the rebuild of a check is counted wherever the struct that declares it is" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    // 64 typed rows of 24 bytes, in an allocation that may need up to 7 bytes of padding.
+    const rebuild = 64 * @sizeOf(CheckedLine) + @alignOf(CheckedLine) - 1;
+    const checked = comptime CheckedBelow(CheckedRows);
+    const plain = comptime CheckedBelow(CheckedPlain);
+    inline for (checked, plain) |With, Without| {
+        const with = comptime wire.regionSizes(zerde.cbor, With, .{}, read);
+        const without = comptime wire.regionSizes(zerde.cbor, Without, .{}, read);
+        try std.testing.expectEqual(without.output + rebuild, with.output);
+        try std.testing.expectEqual(without.scratch, with.scratch);
+        const resumable_with = comptime wire.resumableRegionSizes(With, .{}, read);
+        const resumable_without = comptime wire.resumableRegionSizes(Without, .{}, read);
+        try std.testing.expectEqual(resumable_without.output + rebuild, resumable_with.output);
+    }
+    // The largest rebuild bounds them all: two checks in one type cost the larger, not the sum.
+    const Two = struct {
+        first: CheckedRows,
+        second: CheckedRows,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const TwoPlain = struct {
+        first: CheckedPlain,
+        second: CheckedPlain,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    try std.testing.expectEqual(
+        comptime wire.regionSizes(zerde.cbor, TwoPlain, .{}, read).output + rebuild,
+        comptime wire.regionSizes(zerde.cbor, Two, .{}, read).output,
+    );
+}
+
+const RebuildTags = struct {
+    tags: []const []const u8,
+    nums: []const u32,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .tags = .{ .max_len = 3, .elem = .{ .max_len = 8 } }, .nums = .{ .max_len = 4 } } };
+};
+
+const rebuild_serde = .{ .deny_unknown_fields = true, .fields = .{ .groups = .{ .max_len = 4 }, .labels = .{ .max_len = 2 } } };
+const RebuildChoice = union(enum) { a: RebuildTags, b: RebuildTags, c: u8 };
+
+const RebuildChecked = struct {
+    groups: []const RebuildTags,
+    opt: ?RebuildTags,
+    pair: [2]RebuildTags,
+    choice: RebuildChoice,
+    labels: zerde.SortedMap(RebuildTags),
+    pub const serde = rebuild_serde;
+    pub fn check(self: RebuildChecked) !void {
+        _ = self;
+    }
+};
+
+const RebuildPlain = struct {
+    groups: []const RebuildTags,
+    opt: ?RebuildTags,
+    pair: [2]RebuildTags,
+    choice: RebuildChoice,
+    labels: zerde.SortedMap(RebuildTags),
+    pub const serde = rebuild_serde;
+};
+
+test "the rebuild of a check follows the typed layout of everything below the struct: lists in lists, arrays, optionals, unions and maps" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    const with = comptime wire.regionSizes(zerde.cbor, RebuildChecked, .{}, read);
+    const without = comptime wire.regionSizes(zerde.cbor, RebuildPlain, .{}, read);
+    // A list of text is a list of 16-byte slices that is rebuilt (3 of them); a list of u32 is not (it aliases).
+    const tags = 3 * @sizeOf([]const u8) + @alignOf([]const u8) - 1;
+    const groups = 4 * @sizeOf(RebuildTags) + @alignOf(RebuildTags) - 1 + 4 * tags;
+    const entry = 2 * @sizeOf(zerde.SortedMap(RebuildTags).Entry) + @alignOf(zerde.SortedMap(RebuildTags).Entry) - 1 + 2 * tags;
+    // The groups, the optional, the two array elements, the union's payload (the most of its variants) and the map.
+    try std.testing.expectEqual(groups + tags + 2 * tags + tags + entry, with.output - without.output);
+    // A list that draws on the shared budget: each item takes its element and its padding.
+    const Unbounded = struct {
+        rows: []const CheckedLine,
+        pub const serde = .{ .deny_unknown_fields = true };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const UnboundedPlain = struct {
+        rows: []const CheckedLine,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const small = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 10 };
+    try std.testing.expectEqual(
+        10 * (@sizeOf(CheckedLine) + @alignOf(CheckedLine)),
+        comptime wire.regionSizes(zerde.cbor, Unbounded, .{}, small).output - wire.regionSizes(zerde.cbor, UnboundedPlain, .{}, small).output,
+    );
+    // A type that recurses through a list is charged down to `max_depth`, a list at depth 1, 3 and 5 here: the innermost is 2 rows
+    // of 16 bytes, and each list above holds two of the rows below it.
+    const Tree = struct {
+        kids: []const @This(),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .kids = .{ .max_len = 2 } } };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const TreePlain = struct {
+        kids: []const @This(),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .kids = .{ .max_len = 2 } } };
+    };
+    const shallow = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 100, .max_depth = 5 };
+    const level = 2 * @sizeOf(Tree) + @alignOf(Tree) - 1;
+    try std.testing.expectEqual(
+        level + 2 * (level + 2 * level),
+        comptime wire.regionSizes(zerde.cbor, Tree, .{}, shallow).output - wire.regionSizes(zerde.cbor, TreePlain, .{}, shallow).output,
+    );
+}

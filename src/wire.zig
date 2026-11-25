@@ -818,7 +818,9 @@ fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const
 /// An upper bound, in bytes, of what the arena of `decode(Format, T, ...)` allocates, computed from
 /// the bounds of `T` (`max_len` and `.elem` of each field) and from `format_cfg`: `max_items` (the
 /// items of the whole input, which bounds every list that has no `max_len`, and all lists together),
-/// `max_string_len`, `max_depth`, and `max_input_bytes`, which `decode` enforces.
+/// `max_string_len`, `max_depth`, and `max_input_bytes`, which `decode` enforces. A struct with a `check` is checked on a typed
+/// copy of itself, rebuilt in the arena from the wire layout (`WireSink.check`) once the read has filled the arena for it, so the
+/// bound adds the largest such rebuild.
 ///
 /// A string that is borrowed from the input (a definite CBOR string, a JSON string without an escape)
 /// and a `Raw` item cost nothing: their span points into the input. Only what is rewritten costs.
@@ -842,7 +844,8 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 }
 
 /// The two regions of `decodeInto`, in bytes: `output` holds the arrays and rewritten strings the wire value
-/// points at, `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
+/// points at, and the rebuild of a struct's `check` (the typed form of the struct's lists, made from the wire layout for the
+/// call and given back; the largest rebuild over every struct with a `check`), `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
 /// a lenient CBOR `Raw` and the recorded names of a JSON `Raw` (`json.RecordedKey`) otherwise), and
 /// together they are `maxArenaSize`. Each is an upper bound under the same rules, so a region of exactly its
 /// size is enough for any input the config allows.
@@ -855,7 +858,8 @@ pub fn regionSizes(comptime Format: type, comptime T: type, comptime serde_cfg: 
 /// `regionSizes` for a resumable decode (`Resumable`) of strict CBOR: every string, byte string and `Raw` is copied into `output`
 /// as it arrives, each in an allocation of exactly its length (a `Raw`'s grows in place to at most its bound and is cut to its
 /// length), so they are charged where a whole-input strict read charges nothing; the arrays are charged as it charges them, and
-/// `scratch` is empty, since the reader's state is in the `Resumable`. Every string must have a bound (`max_len`, or
+/// `scratch` is empty, since the reader's state is in the `Resumable`, and `output` includes the rebuild of a `check` as `regionSizes` does.
+/// Every string must have a bound (`max_len`, or
 /// `max_string_len`), a `Raw` as well, and a `SortedMap`'s keys the config's `max_string_len`. `cbor_cfg` must say `mode = .strict`.
 pub fn resumableRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
     return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true, false);
@@ -869,7 +873,9 @@ pub fn maxResumableArenaSize(comptime T: type, comptime serde_cfg: anytype, comp
 
 /// `resumableRegionSizes` for `StreamResumable`: a text and a byte string are left in the stream, so they cost nothing; the arrays, the
 /// `Raw` items and a sorted map's keys are charged as `resumableRegionSizes` charges them. A type with none of the latter is bounded
-/// by its arrays alone, however long its strings are.
+/// by its arrays alone, however long its strings are. A struct with a `check` must hold no text or byte string, since the check
+/// rebuilds the struct from the output and could not see one that is still in the stream (a compile error); a `Raw` and a sorted map's keys
+/// are in the output, and a check reads them.
 pub fn streamRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
     return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true, true);
 }
@@ -944,11 +950,7 @@ fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: any
     const items = limits.max_items;
 
     // Arrays of lists: from the fields, and, where the items are bounded, from the budget alone.
-    var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", items, "the items of the input"));
-    if (items) |budget| if (cost.list_size != 0) {
-        const per_item = listPerItem(budget, cost.list_size, cost.list_align, limits.strict);
-        lists = @min(lists, per_item * budget);
-    };
+    const lists = listsOf(cost, limits, limits.strict);
 
     // Text that is rewritten: from the fields, and, where the input and the items are bounded, from the input.
     var text = if (cost.text.pool == 0) cost.text.fixed else cost.text.total(bound("max_items", items, "the items of the input"));
@@ -957,9 +959,128 @@ fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: any
         // input for one, chunks only add heads, and base64 decodes to three quarters.
         text = @min(text, input);
     }
-    const output = lists + text + slack;
+
+    // A `check` rebuilds the struct it checks from the wire layout, after the read has filled the output for that subtree.
+    const check = comptime checkBytes(T, serde_cfg, limits, 0);
+    const output = lists + text + check + slack;
     if (output + cost.scratch > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
     return .{ .output = @intCast(output), .scratch = @intCast(cost.scratch) };
+}
+
+/// The bytes the lists of `cost` take: from the fields, and, where the items are bounded, from the budget alone. `strict` says that
+/// each list is allocated once, at its exact size.
+fn listsOf(comptime cost: Cost, comptime limits: Limits, comptime strict: bool) u64 {
+    var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", limits.max_items, "the items of the input"));
+    if (limits.max_items) |budget| if (cost.list_size != 0) {
+        const per_item = listPerItem(budget, cost.list_size, cost.list_align, strict);
+        lists = @min(lists, per_item * budget);
+    };
+    return lists;
+}
+
+/// What `fromWire` allocates to rebuild one value of `T` from its wire layout (`WireSink.check` does it for a struct with a
+/// `check`): `typedOwned`'s list algebra over the typed element sizes. A list of non-scalar elements is allocated once, at the exact
+/// size of its elements as the typed layer holds them, which can be twice their wire size; text, bytes, `Raw` and a scalar list
+/// alias the memory the spans name and cost nothing. A list of packed structs is not a scalar list, so it costs its elements.
+fn rebuildOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) Cost {
+    if (depth > limits.max_depth) return .{};
+    return switch (comptime reflect.kindOf(T)) {
+        .bool, .int, .float, .byte_array, .@"enum", .@"packed", .text, .byte_string, .raw, .hook, .none => .{},
+        .list => blk: {
+            const Elem = @typeInfo(T).pointer.child;
+            if (comptime isScalarList(Elem)) break :blk .{};
+            const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
+            const element = rebuildOwned(Elem, elem_bounds, cfg, limits, depth + 1);
+            var own: Cost = .{ .list_size = @sizeOf(Elem), .list_align = @alignOf(Elem) };
+            if (ownBound(bounds)) |n| {
+                own.lists.fixed = listBytes(n, @sizeOf(Elem), @alignOf(Elem), true);
+                break :blk own.plus(element.times(n));
+            }
+            const items = bound("max_items", limits.max_items, "the items of the input");
+            own.lists.pool = listPerItem(items, @sizeOf(Elem), @alignOf(Elem), true) + element.lists.fixed;
+            break :blk own.plus(.{ .lists = .{ .pool = element.lists.pool } });
+        },
+        .array => rebuildOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),
+        .optional => rebuildOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
+        .pointer => @compileError("a pointer has no wire layout: " ++ @typeName(T)),
+        .@"struct" => blk: {
+            if (comptime typed.isSortedMap(T)) break :blk rebuildOwned([]const T.Entry, bounds, cfg, limits, depth);
+            var total: Cost = .{};
+            for (reflect.fields(T, cfg)) |field| {
+                if (field.extras) continue;
+                total = total.plus(rebuildOwned(field.type, field.bounds, cfg, limits, depth + 1));
+            }
+            break :blk total;
+        },
+        .@"union" => blk: {
+            var most: Cost = .{};
+            for (reflect.variants(T, cfg)) |variant| {
+                if (variant.type != void) most = most.most(rebuildOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
+            }
+            break :blk most;
+        },
+    };
+}
+
+/// The most `fromWire` allocates for the `check` of any struct that `T` reaches and that declares one (0 for none, and for a packed
+/// struct, which holds no list). The rebuild runs after the read has filled the output for its subtree and is given back at once, so
+/// the largest one is what a region must hold beyond the read's own bytes. The checked struct's own bounds and the limits that reach it
+/// apply, and nothing above it does: what it costs is the same wherever it is.
+fn checkBytes(comptime T: type, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) u64 {
+    if (depth > limits.max_depth) return 0;
+    return switch (comptime reflect.kindOf(T)) {
+        .list => checkBytes(@typeInfo(T).pointer.child, cfg, limits, depth + 1),
+        .array => checkBytes(@typeInfo(T).array.child, cfg, limits, depth + 1),
+        .optional => checkBytes(@typeInfo(T).optional.child, cfg, limits, depth),
+        .@"struct" => blk: {
+            var most: u64 = 0;
+            if (comptime @hasDecl(T, "check")) {
+                if (limits.in_stream and holdsStreamText(T, cfg, limits, depth)) {
+                    @compileError("a check cannot read text or bytes that stay in the stream (`StreamResumable`), and this one's struct holds some: " ++ @typeName(T));
+                }
+                most = listsOf(rebuildOwned(T, .{}, cfg, limits, depth), limits, true);
+            }
+            for (reflect.fields(T, cfg)) |field| {
+                if (!field.extras) most = @max(most, checkBytes(field.type, cfg, limits, depth + 1));
+            }
+            break :blk most;
+        },
+        .@"union" => blk: {
+            var most: u64 = 0;
+            for (reflect.variants(T, cfg)) |variant| {
+                if (variant.type != void) most = @max(most, checkBytes(variant.type, cfg, limits, depth + 1));
+            }
+            break :blk most;
+        },
+        else => 0,
+    };
+}
+
+/// Whether the value of `T` holds a text or a byte string that `StreamResumable` leaves in the stream: any but a sorted map's key,
+/// which is copied into the output to be compared with the next. A `Raw` is copied too.
+fn holdsStreamText(comptime T: type, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) bool {
+    if (depth > limits.max_depth) return false;
+    return switch (comptime reflect.kindOf(T)) {
+        .text, .byte_string => true,
+        .list => holdsStreamText(@typeInfo(T).pointer.child, cfg, limits, depth + 1),
+        .array => holdsStreamText(@typeInfo(T).array.child, cfg, limits, depth + 1),
+        .optional => holdsStreamText(@typeInfo(T).optional.child, cfg, limits, depth),
+        .@"struct" => blk: {
+            for (reflect.fields(T, cfg)) |field| {
+                if (field.extras) continue;
+                if (@hasDecl(T, "zerde_sorted_entry") and std.mem.eql(u8, field.name, "key")) continue;
+                if (holdsStreamText(field.type, cfg, limits, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .@"union" => blk: {
+            for (reflect.variants(T, cfg)) |variant| {
+                if (variant.type != void and holdsStreamText(variant.type, cfg, limits, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 /// The list bound of a field, if it has one of its own: a field's `max_len` is a number of items the
