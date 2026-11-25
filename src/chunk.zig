@@ -140,6 +140,11 @@ pub fn Reader(comptime Config: type) type {
             return true;
         }
 
+        /// The read accepts only the deterministic encoding: one value, one encoding.
+        pub fn isStrict(_: *const Self) bool {
+            return true;
+        }
+
         /// Gives the reader its next chunk, which it must be done with (every call before it said `NeedMore`, or the
         /// item is complete). A stream longer than `max_input_bytes` is `error.InputTooLarge`.
         pub fn feed(self: *Self, chunk: []const u8) !void {

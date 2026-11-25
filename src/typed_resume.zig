@@ -224,6 +224,8 @@ pub fn enumValue(comptime T: type, deserializer: anytype, comptime cfg: anytype,
             // An enum written as its number reads only a number.
             .string => if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) return error.UnexpectedType,
             .number => {
+                // A strict read takes only the form the writer uses: the name, for an enum written as its name.
+                if (comptime meta.effectiveEnumRepr(T, cfg) == .name) if (typed.readsStrict(deserializer)) return error.NonDeterministicEncoding;
                 const raw_tag = switch (try deserializer.readNumber()) {
                     .integer => |n| n,
                     .float => return error.UnexpectedType,

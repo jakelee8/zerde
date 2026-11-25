@@ -692,6 +692,8 @@ MUTANTS = [
     ("cbor.zig", "try writePreferredFloat(&fixed, self.float(header));\n                    image.head_len = fixed.end;", "try writePreferredFloat(&fixed, floatValue(header));\n                    image.head_len = fixed.end;"),
     ("cbor.zig", "    if (refuse_zero and isNegativeZero(header)) return error.NegativeZero;\n    switch (header.major) {", "    switch (header.major) {"),
     ("cbor.zig", "    return if (value == 0) 0 else value;", "    return value;"),
+    ("typed.zig", "if (readsStrict(deserializer)) return error.NonDeterministicEncoding;", "if (readsStrict(deserializer) and false) return error.NonDeterministicEncoding;"),
+    ("typed_resume.zig", "if (typed.readsStrict(deserializer)) return error.NonDeterministicEncoding;", "if (typed.readsStrict(deserializer) and false) return error.NonDeterministicEncoding;"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,

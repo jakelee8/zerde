@@ -1243,6 +1243,12 @@ pub fn narrowFloat(comptime T: type, wide: f64) Error!T {
     return narrowed;
 }
 
+/// Whether `deserializer` reads only the deterministic encoding (`isStrict`); a format without the capability is never strict.
+pub fn readsStrict(deserializer: anytype) bool {
+    if (comptime !@hasDecl(@TypeOf(deserializer.*), "isStrict")) return false;
+    return deserializer.isStrict();
+}
+
 fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype, comptime cfg: anytype, rc: anytype) anyerror!T {
     const DeserializerType = @TypeOf(deserializer.*);
     if (@hasDecl(DeserializerType, "readEnumTag")) {
@@ -1267,6 +1273,8 @@ fn decodeEnumValue(comptime T: type, allocator: Allocator, deserializer: anytype
             break :blk std.meta.stringToEnum(T, token.bytes) orelse error.InvalidEnumTag;
         },
         .number => blk: {
+            // A strict read takes only the form the writer uses: the name, for an enum written as its name.
+            if (comptime meta.effectiveEnumRepr(T, cfg) == .name) if (readsStrict(deserializer)) return error.NonDeterministicEncoding;
             const raw_tag = switch (try deserializer.readNumber()) {
                 .integer => |n| n,
                 .float => return error.UnexpectedType,

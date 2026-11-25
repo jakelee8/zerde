@@ -768,6 +768,37 @@ test "an integral float is not accepted as an enum tag either" {
     try std.testing.expectEqual(Role.doctor, role);
 }
 
+test "a strict read takes an enum only in the form its writer writes" {
+    const Kind = enum { alpha, beta };
+    const S = struct {
+        kind: Kind,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const number = [_]u8{ 0xa1, 0x64, 'k', 'i', 'n', 'd', 0x01 };
+    const name = [_]u8{ 0xa1, 0x64, 'k', 'i', 'n', 'd', 0x64, 'b', 'e', 't', 'a' };
+    // The writer writes the name, so the number is not the deterministic encoding.
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.cbor.parseSliceWith(S, allocator, &number, .{}, strict));
+    try std.testing.expectEqual(Kind.beta, (try zerde.cbor.parseSlice(S, allocator, &number)).kind);
+    try std.testing.expectEqual(Kind.beta, (try zerde.cbor.parseSliceWith(S, allocator, &name, .{}, strict)).kind);
+
+    // The resumable read refuses it too, however the input is cut.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    for (0..number.len + 1) |cut| {
+        _ = arena_state.reset(.retain_capacity);
+        try std.testing.expectError(error.NonDeterministicEncoding, readInChunks(S, .{}, chunk_read, arena_state.allocator(), &number, &.{cut}));
+    }
+
+    // An enum written as its number reads its number under strict.
+    const Holder = struct {
+        level: Level,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const high = [_]u8{ 0xa1, 0x65, 'l', 'e', 'v', 'e', 'l', 0x09 };
+    try std.testing.expectEqual(Level.high, (try zerde.cbor.parseSliceWith(Holder, allocator, &high, .{}, strict)).level);
+    try std.testing.expectEqual(Level.high, (try readInChunks(Holder, .{}, chunk_read, arena_state.allocator(), &high, &.{})).level);
+}
+
 test "MessagePack and BSON refuse text for a byte field" {
     const TextTag = struct { tag: []const u8 };
     const FixedTag = struct { tag: [2]u8 };
@@ -7402,7 +7433,7 @@ test "a resumable read of unions reads each form, and refuses the others as the 
     }
 }
 
-test "a resumable read of enums takes a name or a number, and an enum written as its number only the number" {
+test "a resumable read of enums takes the name of an enum written as its name, and the number of one written as its number" {
     const ByNumber = struct {
         l: ChunkLevel,
         pub const serde = .{ .deny_unknown_fields = true };
@@ -7415,7 +7446,7 @@ test "a resumable read of enums takes a name or a number, and an enum written as
     try expectValueInChunks(ByNumber, integers, chunk_read, .{ .l = .low }, &[_]u8{ 0xa1, 0x61, 'l', 0x01 });
     try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .beta }, &[_]u8{ 0xa1, 0x61, 'k', 0x64, 'b', 'e', 't', 'a' });
     try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .gamma_long_name }, &[_]u8{ 0xa1, 0x61, 'k', 0x6f, 'g', 'a', 'm', 'm', 'a', '_', 'l', 'o', 'n', 'g', '_', 'n', 'a', 'm', 'e' });
-    try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .beta }, &[_]u8{ 0xa1, 0x61, 'k', 0x01 });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.NonDeterministicEncoding, &[_]u8{ 0xa1, 0x61, 'k', 0x01 });
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'l', 0x63, 'l', 'o', 'w' });
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'l', 0x05 });
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'l', 0x19, 0x01, 0x2c });
@@ -7423,7 +7454,7 @@ test "a resumable read of enums takes a name or a number, and an enum written as
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'l', 0xf5 });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x64, 'z', 'e', 't', 'a' });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x78, 0x1e, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'a', 'b', 'c', 'd' });
-    try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x09 });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.NonDeterministicEncoding, &[_]u8{ 0xa1, 0x61, 'k', 0x09 });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'k', 0x41, 0x00 });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidUtf8, &[_]u8{ 0xa1, 0x61, 'k', 0x62, 0xc3, 0x28 });
 }
