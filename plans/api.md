@@ -158,10 +158,11 @@ and `bench-json`, three alternating runs, with every refusal the branch added st
 
 On `bench-cbor` (the `e07eb8c` section of `bench/CBOR.md`) every zerde row is at or below the base but two pairs: one
 small parse run (1.15, after a load-9 base run) and one large roundtrip run (1.02). On `bench-json` small parse is 0.95
-to 1.00, medium 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 1.08; pinned to one core the medium
-parse is at the base and the large 1.04 to 1.05. JSON write is 0.72 to 0.87 of the base. The rest of the large JSON
-parse is not attributed; what the cheaper check did not recover is accepted and recorded here. Every
-refusal stays: the mutants of each guard on the changed path are killed.
+to 1.00, medium 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 1.08; pinned to one core, with a
+retained arena, medium and large parse are both about 1.02 (the 1.04 to 1.05 first recorded here came from a probe that
+timed two parses per fresh arena, and its ratio is not reproduced; `plans/json-scan.md`, F1). JSON write is 0.72 to
+0.87 of the base. Narrowing the first steps of the 64-byte string scan removes that remainder on a Zen 5 native build
+(`plans/json-scan.md`; the two-stage scan chosen there). What the cheaper check did not recover is accepted and recorded here. Every refusal stays: the mutants of each guard on the changed path are killed.
 
 ## (j) BSON element types a typed read does not know
 

@@ -71,6 +71,7 @@ Notes:
 
 - Small parse is at the base (0.95 to 1.00); medium parse 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 1.08 on the same pairs. Write is 0.72 to 0.87 and roundtrip 0.76 to 1.02.
 - Pinned to one core (`taskset -c 3`), best of 15 repetitions: small parse 3,820 to 3,866 ns against 3,823 to 3,880; medium 1,186,000 to 1,194,000 against 1,188,000 to 1,190,000; large 161.7 to 163.3 ms against 154.5 to 155.8 ms (1.04 to 1.05). What is left on the large parse is not attributed; gating the `max_items` count at compile time, as the CBOR reader now does, moved nothing on medium (1,175,000 to 1,188,000 ns).
+- Corrected later the same day: that probe built a fresh arena for each repetition and timed two parses in it. Best of 12 (large) or 400 (medium) parses in one process with a retained arena, pinned the same way, gives large 116.4 to 117.6 ms against 113.7 to 115.1 ms and medium 1,114,000 to 1,124,000 ns against 1,091,000 to 1,106,000 ns, both about 1.02. Why the first probe's ratio differs is not known (`plans/json-scan.md`, F1); its source was not kept.
 
 ## 2026-11-25 - 52757c8
 
