@@ -59,10 +59,13 @@ consulted at run time: the width is fixed when the code is compiled, from the ta
 
 - The compiled scan is the same instruction sequence at 32 and 64 bytes with wider registers (`tmp/simd/dis.zig`,
   objdump). Code size per inlined call site and instruction encoding length were not compared. Whole-run instruction
-  counts: 34.98 G (64) against 34.88 G (16-byte cap); cycles about 10% higher at 64.
+  counts: 34.98 G (64) against 34.88 G (16-byte cap), 0.3% apart; cycles 1.944 against 1.774 s, about 10% apart.
 - In the hottest parse function (`typed.deserializeStruct`) the vector and mask instructions take 0.20 s of cycles at 64
-  against 0.09 s at 16; other functions are unchanged, so it is not a core-wide slowdown such as the Zen 5 AVX-512 IPC
-  throttling Chips and Cheese measured on this CPU model (link below).
+  against 0.09 s at 16, about 0.11 s of the 0.17 s gap; the rest is not attributed. Other functions moved in both
+  directions between the two builds (`readBool` 0.057 s at 64 against 0.082 s at 16; `startObjectKey` 0.057 against
+  0.088 s) because the builds inline differently, so per-function figures do not compare across them. A core-wide
+  slowdown, such as the Zen 5 AVX-512 IPC throttling Chips and Cheese measured on this CPU model (link below), is not
+  ruled out.
 - Payload strings: 7.57 million keys and values per large parse (F9's census, which skips escaped quotes), all but one
   under 16 bytes. `tmp/simd/real.zig` took its scan starts from every second quote character, 7.66 million starts.
 - Scanning from those starts as independent calls: 0.78 to 0.79 ns per start at 16 and 32, 0.83 at 64 (about 6%). In a
@@ -189,7 +192,9 @@ against 1.12 to 1.14 ms). Not investigated further.
   long-text speed predicted near 64 by the microbenchmark but not measured in this form; adds a second code path and
   needs the endian branch in the first stage.
 - **A5. Keep 64 and avoid the cache-line split.** Load the aligned 64-byte block that holds `from` and shift the bits
-  before `from` off the mask, as aligned-block scanners do. Tests F4's split-load part directly; not measured.
+  before `from` off the mask, as aligned-block scanners do. Tests F4's split-load part directly; not measured. The
+  aligned block can start before the input slice and end after it (the input is the caller's, at any alignment), so the
+  first and last blocks need a clamped or byte-wise path, or a documented padding requirement like simdjson's.
 - **A6. A build option for the width,** so a build chooses 16, 32 or 64 instead of the comptime default.
 - **A7. Runtime dispatch by CPU.** Compile the scan per CPU level or model and choose at startup (F7, F8). A binary
   built for a CPU level runs on Intel and AMD alike and has one width today (F3: 16 for baseline, 32 for `x86_64_v3`
