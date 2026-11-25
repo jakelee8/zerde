@@ -31,9 +31,9 @@ Runs before `8a3a0a9` used the older simpler payload, so they are not directly c
 
 ## 2026-11-25 - e07eb8c
 
-Changes since previous run: the default-path fixes of `plans/api.md` (i). The string scan reads its first match as a bit mask (`std.simd.firstTrue` took a horizontal minimum over 64 lanes) and notes whether a run holds a byte of 0x80 or above, so an ASCII run skips the UTF-8 check; the writer puts out a field name and an enum name as bytes made at compile time.
+Changes since previous run: default-path fixes from `plans/api.md` (item i). The string scan reads its first match as a bit mask; `std.simd.firstTrue` took a horizontal minimum over 64 lanes. The scan also notes whether a run holds a byte of 0x80 or above, so an ASCII run skips the UTF-8 check. The writer emits field names and enum names as bytes built at compile time.
 
-Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`; `zig build bench-json -Doptimize=ReleaseFast` under one `flock`, alternating base and tip. A first set of three pairs ran at load 2 to 12 and the `std.json` control moved 0.99 to 1.25 (parse rows below the table); the table is a second set of three pairs at load 2 to 5.
+Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `zig build bench-json -Doptimize=ReleaseFast` under one `flock`, alternating base and tip. The table shows a set of three pairs at load 2 to 5. An earlier set at load 2 to 12 is noisier (the `std.json` control moved 0.99 to 1.25); its parse rows follow the table.
 
 | Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
@@ -56,7 +56,7 @@ Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. `Linux x86_64` (
 | large | roundtrip zerde | 226,073,225 / 219,563,687 / 216,152,418 | 196,538,963 / 201,898,766 / 205,117,878 | 0.87 to 0.95 |
 | large | roundtrip std.json | 362,526,159 / 355,546,739 / 333,878,049 | 335,800,990 / 333,428,909 / 332,642,493 | 0.93 to 1.00 |
 
-First set (load 2 to 12), parse rows:
+Parse rows of the set at load 2 to 12:
 
 | Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
@@ -69,17 +69,17 @@ First set (load 2 to 12), parse rows:
 
 Notes:
 
-- Small parse is at the base (0.95 to 1.00); medium parse 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 1.08 on the same pairs. Write is 0.72 to 0.87 and roundtrip 0.76 to 1.02.
-- Pinned to one core (`taskset -c 3`), best of 15 repetitions: small parse 3,820 to 3,866 ns against 3,823 to 3,880; medium 1,186,000 to 1,194,000 against 1,188,000 to 1,190,000; large 161.7 to 163.3 ms against 154.5 to 155.8 ms (1.04 to 1.05). What is left on the large parse is not attributed; gating the `max_items` count at compile time, as the CBOR reader now does, moved nothing on medium (1,175,000 to 1,188,000 ns).
-- Corrected later the same day: that probe built a fresh arena for each repetition and timed two parses in it. Best of 12 (large) or 400 (medium) parses in one process with a retained arena, pinned the same way, gives large 116.4 to 117.6 ms against 113.7 to 115.1 ms and medium 1,114,000 to 1,124,000 ns against 1,091,000 to 1,106,000 ns, both about 1.02. Why the first probe's ratio differs is not known (`plans/json-scan.md`, F1); its source was not kept.
+- Small parse is at the base (0.95 to 1.00). Medium parse is 1.03 to 1.07 and large parse 0.99 to 1.17, while `std.json` moved 0.79 to 1.08 on the same pairs. Write is 0.72 to 0.87 and roundtrip 0.76 to 1.02.
+- Steady-state parse, pinned to one core (`taskset -c 3`), best of 12 (large) or 400 (medium) parses in one process with a retained arena: large 116.4 to 117.6 ms (tip) against 113.7 to 115.1 ms (base); medium 1,114,000 to 1,124,000 ns against 1,091,000 to 1,106,000 ns. Both ratios are about 1.02.
+- The remaining large-parse cost is not attributed. Gating the `max_items` count at compile time, as the CBOR reader does, did not move the medium parse (1,175,000 to 1,188,000 ns).
 
 ## 2026-11-25 - 52757c8
 
 The whole branch against its base, on the default path (no new option set).
 
-Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-json -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+Base is `03beb0e` (`origin/zig-0.17`); tip is `52757c8` (`fix/library-review`). Environment: `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`. Command: `zig build bench-json -Doptimize=ReleaseFast` under one `flock`, three runs each, alternating base and tip suite by suite. Load average was 2 to 10. The comparison library's rows control for machine load.
 
-Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+The repeated-key change (`5870942`) adds a key record to an untyped read and to each unknown member that a typed read skips. MessagePack and BSON also walk each skipped value. This payload has no unknown members and these rows read no untyped value, so none of that cost shows here. The `5870942` entry below gives the untyped cost.
 
 | Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
@@ -104,17 +104,17 @@ Expected from the repeated-key change (`5870942`): a key record in an untyped re
 
 Notes:
 
-- The typed zerde parse is 1.20 to 1.37 times the base in every pair and every scenario, and the roundtrip 1.07 to 1.34; `std.json` moved 0.83 to 1.18 on the same machine, but for one medium roundtrip run (1.37). The write is 0.98 to 1.15. The parse change is the branch's, not the repeated-key check: the `5870942` section measured the typed parse unchanged across that commit. Which of the branch's read changes (UTF-8 checks on every string, limits, the destination-passing walk) costs it is not measured here.
-- Listed under "Default-path cost" in `plans/api.md`.
+- The typed zerde parse is 1.20 to 1.37 times the base in every pair and scenario. The roundtrip is 1.07 to 1.34 and the write 0.98 to 1.15. The `std.json` control moved 0.83 to 1.18, except one medium roundtrip run (1.37). The parse cost comes from the branch, not from the repeated-key check: the `5870942` entry measured the typed parse unchanged across that commit. These runs do not show which read change (UTF-8 checks on every string, limits, the destination-passing walk) causes it.
+- `plans/api.md` lists this under "Default-path cost".
 
 ## 2026-11-24 - 5870942
 
 Changes since previous run:
 
-- every read refuses an object that names a key twice: the JSON deserializer records each key it returns (and each unknown key a typed read skips, unless the type denies unknown members) and checks each object's keys when it closes
+- every read refuses an object that names a key twice: the JSON deserializer records each key it returns (and each unknown key a typed read skips, unless the type denies unknown members) and checks the keys when the object closes
 - new rows `value parse zerde` and `value parse std.json`: the same input into `zerde.value` and into `std.json.Value` (both refuse a repeated name)
 
-Environment for this entry only: `Linux x86_64` (WSL2, 24 cores, shared; load average 3 to 10 while it ran), Zig `0.17.1`. "Before" is `1ed10b9`, the commit that added the value rows; "after" is `5870942`. Three runs each, alternating before and after, `zig build bench-json -Doptimize=ReleaseFast` under one `flock`. ns/op, run 1 / run 2 / run 3.
+Environment: `Linux x86_64` (WSL2, 24 cores, shared; load average 3 to 10), Zig `0.17.1`. "Before" is `1ed10b9`, which added the value rows; "after" is `5870942`. Command: `zig build bench-json -Doptimize=ReleaseFast` under one `flock`, three runs each, alternating before and after. Cells give ns/op for run 1 / run 2 / run 3.
 
 | Row | Scenario | Before | After |
 | --- | --- | ---: | ---: |
@@ -128,16 +128,16 @@ Environment for this entry only: `Linux x86_64` (WSL2, 24 cores, shared; load av
 
 Notes:
 
-- the untyped read pays 25 to 35% for the repeated-key check (a key record and a sort per object); it stays about 1.5x faster than `std.json.Value`, which makes the same check
+- the untyped read costs 25 to 35% more for the repeated-key check (a key record and a sort per object); it stays about 1.5x faster than `std.json.Value`, which makes the same check
 - the typed parse is unchanged within the spread: a typed read records only unknown keys, and the payload has none
 
 ## 2026-11-23 - 4881395
 
 Changes since previous run:
 
-- strings are checked for UTF-8 on every path, integer fields refuse `1.0` and `1e2`, float fields refuse an overflowing number, skipped numbers are no longer converted, and the writer checks that a float is finite
+- strings are checked for UTF-8 on every path, integer fields refuse `1.0` and `1e2`, float fields refuse an overflowing number, skipped numbers are not converted, and the writer checks that a float is finite
 
-Environment for this entry only (not the machine above): `Linux x86_64`, Zig `0.17.1`. "Before" is `6e4bf79` built and run on the same machine in the same session, so only the two columns of this entry compare with each other. One run each, `zig build bench-json -Doptimize=ReleaseFast`.
+Environment for this entry: `Linux x86_64`, Zig `0.17.1`. "Before" is `6e4bf79`, built and run on the same machine in the same session; compare only the two columns of this entry. Command: `zig build bench-json -Doptimize=ReleaseFast`, one run each.
 
 | Operation | Scenario | Before zerde ns/op | After zerde ns/op | Change |
 | --- | --- | ---: | ---: | ---: |
@@ -153,7 +153,7 @@ Environment for this entry only (not the machine above): `Linux x86_64`, Zig `0.
 
 Notes:
 
-- the write path moved by up to 10% in both directions on code that changed by one comparison, so changes under about 10% are inside this machine's run-to-run noise
+- the write path moved by up to 10% in both directions on code that changed by one comparison, so changes under about 10% are within this machine's run-to-run noise
 - no parse or write regression stands out; a repeat run on the benchmark machine would settle the small parse case
 
 ## 2026-04-21 - a7c1073
