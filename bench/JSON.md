@@ -29,6 +29,30 @@ The current large case produces a JSON document of about `107.58 MiB`.
 
 Runs before `8a3a0a9` used the older simpler payload, so they are not directly comparable to the newer mixed-payload runs.
 
+## 2026-11-24 - 5870942
+
+Changes since previous run:
+
+- every read refuses an object that names a key twice: the JSON deserializer records each key it returns (and each unknown key a typed read skips, unless the type denies unknown members) and checks each object's keys when it closes
+- new rows `value parse zerde` and `value parse std.json`: the same input into `zerde.value` and into `std.json.Value` (both refuse a repeated name)
+
+Environment for this entry only: `Linux x86_64` (WSL2, 24 cores, shared; load average 3 to 10 while it ran), Zig `0.17.1`. "Before" is `1ed10b9`, the commit that added the value rows; "after" is `5870942`. Three runs each, alternating before and after, `zig build bench-json -Doptimize=ReleaseFast` under one `flock`. ns/op, run 1 / run 2 / run 3.
+
+| Row | Scenario | Before | After |
+| --- | --- | ---: | ---: |
+| value parse zerde | small | 7939 / 8265 / 7913 | 10334 / 10056 / 10221 |
+| value parse zerde | medium | 2411320 / 2408970 / 2441306 | 3295482 / 3075614 / 3475500 |
+| value parse zerde | large | 252130956 / 249342836 / 255650040 | 330518157 / 319929492 / 334972429 |
+| value parse std.json | small | 15644 / 15513 / 15336 | 16260 / 15013 / 15626 |
+| value parse std.json | large | 528656169 / 479105537 / 485833036 | 518953828 / 479640622 / 483995081 |
+| parse zerde (typed) | small | 5513 / 5485 / 6456 | 5776 / 5418 / 5748 |
+| parse zerde (typed) | large | 165406066 / 163523097 / 165058272 | 169912025 / 166403705 / 168057518 |
+
+Notes:
+
+- the untyped read pays 25 to 35% for the repeated-key check (a key record and a sort per object); it stays about 1.5x faster than `std.json.Value`, which makes the same check
+- the typed parse is unchanged within the spread: a typed read records only unknown keys, and the payload has none
+
 ## 2026-11-23 - 4881395
 
 Changes since previous run:
