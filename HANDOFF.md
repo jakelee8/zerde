@@ -2,14 +2,22 @@
 
 ## State
 
-`feat/deterministic-cbor` is at `88d8825`.
-
-- The two-stage string scan is merged (`4542079`). On targets with 64-byte vectors (AMD Zen 4 and Zen 5 builds), the scan takes two 32-byte steps before it moves to 64-byte steps. Large JSON parse is 0.89 to 0.97 of the previous tip in `bench-json`. Long-text scans are equal or faster in `bench-bulk`. See `plans/json-scan.md` and the `2026-11-25 - 4542079` entries of `bench/JSON.md` and `bench/BULK.md`.
-- `README.md`, `CHANGELOG.md` (Unreleased), `CONTRIBUTING.md`, `bench/*.md` and `plans/*.md` are rewritten in Standard Technical English. Lines by the original author are unchanged.
-- Checks on `e2c69b0` (the merged tree): `zig build test`, `tests/mutants.py --check` (705 mutants, 0 stale) and `bench-build` pass. On `8ab97e4` (same source), examples, transcode, and the native and wasm32 `build-lib` also pass. `zig build test` passes on `88d8825`.
+- `feat/deterministic-cbor` is at `d3b15b8`.
+  - `88d8825` merges the two-stage string scan (`4542079`), its benchmark entries and the documentation rewrite.
+  - `9170ead` and `d3b15b8` add the `code 1` out-of-line result from `bench/BULK.md` (`2026-11-25 - 4542079`) to `plans/json-scan.md` F4. Whether to keep them is open.
+- Checks:
+  - On `e2c69b0`: `zig build test`, `tests/mutants.py --check` (705 mutants, 0 stale) and `bench-build` pass.
+  - On `8ab97e4` (same source): examples, transcode, and the native and wasm32 `build-lib` also pass.
+  - `zig build test` passes on `88d8825`.
+- `plan/wire-fixes` is at `64b8ff4`. It holds `plans/wire.md`, a design that is not built yet.
 
 ## Open
 
-1. `plans/wire.md` on branch `plan/wire-fixes` (`64b8ff4`) is a design for four wire fixes: packed structs as integers, the `check` term in `regionSizes`, an arena bound for `wire.encode`, and memory for `Raw` validators. It is not built. Its open questions are listed in the file.
-2. The big-endian branch of the string scan compiles for `s390x-linux-gnu` but has not run on a big-endian host.
-3. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change.
+1. The wire plan: build it or not, and settle its three open questions. The design is `plans/wire.md` on `plan/wire-fixes`. Its four items, each one commit, are: (a) a packed struct as its backing integer, (b) the `check` rebuild term in `regionSizes`, (c) an arena bound for `wire.encode` that takes the read limits, (d) `validate_bytes` for `Raw` validators.
+   - A streaming read of a type whose `check` reads text: compile error (proposed), or copy the text into the output.
+   - `wire.encode`: take the read limits as a new parameter (proposed), or write straight from the wire layout.
+   - Validators that allocate: allowed in wire reads with a declared byte bound (proposed), or forbidden.
+   - `plan/wire-fixes` predates the documentation rewrite and the scan change, so `feat/deterministic-cbor` must be merged into it first.
+2. Keep or revert `9170ead` and `d3b15b8` (the F4 addition to `plans/json-scan.md`).
+3. The big-endian branch of `vectorStep` in `src/bulk.zig` compiles for `s390x-linux-gnu` but has not run.
+4. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change.
