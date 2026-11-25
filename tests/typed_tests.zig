@@ -4723,11 +4723,11 @@ test "the pieces stop at the edge of a window exactly: a closing quote, a base64
     var tiny: [3]u8 = undefined;
     var wt = std.Io.Writer.fixed(&tiny);
     var bstate: zerde.typed.TextState = .{};
-    try std.testing.expectError(error.WindowFull, zerde.json.writeBytesPart(&wt, .base64, "a", &bstate));
+    try std.testing.expectError(error.WindowFull, zerde.json.writeBytesPart(&wt, .base64, "a", &bstate, false));
     try std.testing.expectEqualStrings("\"", wt.buffered());
     var rest: [8]u8 = undefined;
     var wr = std.Io.Writer.fixed(&rest);
-    try zerde.json.writeBytesPart(&wr, .base64, "a", &bstate);
+    try zerde.json.writeBytesPart(&wr, .base64, "a", &bstate, false);
     try std.testing.expectEqualStrings("YQ==\"", wr.buffered());
     // A CBOR head of three bytes with two left writes nothing.
     var two: [2]u8 = undefined;

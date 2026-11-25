@@ -238,7 +238,7 @@ pub fn JsonSerializer(comptime Config: type) type {
 
         /// `emitBytes` in pieces.
         pub fn emitBytesPart(self: *Self, value: []const u8, state: *typed.TextState) !void {
-            try writeBytesPart(self.writer, bytesEncoding(Config, self.cfg), value, state);
+            try writeBytesPart(self.writer, bytesEncoding(Config, self.cfg), value, state, false);
         }
 
         /// `emitRaw` in pieces: the text is checked once, before the first byte.
@@ -1693,9 +1693,7 @@ pub fn writeEscapedPart(w: *std.Io.Writer, value: []const u8, state: *typed.Text
             state.at = special;
             continue;
         }
-        var escape: [6]u8 = undefined;
-        const length = bulk.escapeInto(&escape, value[state.at]);
-        @memcpy(w.buffer[w.end..][0..length], escape[0..length]);
+        const length = bulk.escapeInto(w.buffer[w.end..][0..6], value[state.at]);
         w.end += length;
         state.at += 1;
     }
@@ -1704,10 +1702,11 @@ pub fn writeEscapedPart(w: *std.Io.Writer, value: []const u8, state: *typed.Text
     w.end += 1;
 }
 
-/// Bytes as a JSON string in `encoding`, in pieces; see `writeEscapedPart`. Base64 goes in groups of three bytes.
-pub fn writeBytesPart(w: *std.Io.Writer, encoding: BytesEncoding, value: []const u8, state: *typed.TextState) !void {
+/// Bytes as a JSON string in `encoding`, in pieces; see `writeEscapedPart`. Base64 goes in groups of three bytes. With
+/// `trusted`, bytes written as a string are not checked as UTF-8.
+pub fn writeBytesPart(w: *std.Io.Writer, encoding: BytesEncoding, value: []const u8, state: *typed.TextState, trusted: bool) !void {
     const encoder = switch (encoding) {
-        .string => return writeEscapedPart(w, value, state, false),
+        .string => return writeEscapedPart(w, value, state, trusted),
         .base64 => std.base64.standard.Encoder,
         .base64url => std.base64.url_safe_no_pad.Encoder,
     };

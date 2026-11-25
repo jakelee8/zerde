@@ -375,8 +375,10 @@ pub fn Render(comptime json_cfg: anytype) type {
                 if (self.text.kind != .none) {
                     const bytes = stored[self.text.start..][0..self.text.len];
                     switch (self.text.kind) {
-                        .key, .text => try serializer.emitStringPart(bytes, &self.leaf),
-                        .bytes => try serializer.emitBytesPart(bytes, &self.leaf),
+                        // The first window checked every text and byte string (`verifyStrict`, `checkRenderable`), so no
+                        // piece checks it again.
+                        .key, .text => try json.writeEscapedPart(w, bytes, &self.leaf, true),
+                        .bytes => try json.writeBytesPart(w, json.bytesEncoding(@TypeOf(json_cfg), json_cfg), bytes, &self.leaf, true),
                         .none => unreachable,
                     }
                     self.leaf = .{};
