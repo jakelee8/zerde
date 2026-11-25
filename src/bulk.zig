@@ -7,6 +7,7 @@
 //! tests, which it must match on every input.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const ones: u64 = 0x0101010101010101;
 const highs: u64 = 0x8080808080808080;
@@ -25,35 +26,57 @@ fn hasBelow(word: u64, comptime limit: u8) bool {
 /// is: `"`, `\` or a control character below 0x20. `bytes.len` when there is none. It looks at a
 /// vector of bytes at a time where the target has vectors, and a word at a time elsewhere.
 pub fn findStringSpecial(bytes: []const u8, from: usize) usize {
-    if (comptime std.simd.suggestVectorLength(u8)) |width| return findStringSpecialVector(width, bytes, from);
-    return findStringSpecialWords(bytes, from);
+    var unused = false;
+    return findSpecial(false, bytes, from, &unused);
 }
 
-/// `findStringSpecial` with vectors of `width` bytes.
-pub fn findStringSpecialVector(comptime width: usize, bytes: []const u8, from: usize) usize {
+/// `findStringSpecial` that also sets `high` when a byte from `from` to the one it returns is 0x80 or above: a run
+/// with none is ASCII, which needs no UTF-8 check. It may set `high` for a byte a little past the one it returns,
+/// which costs a check that was not needed and never skips one that was.
+pub fn findStringSpecialNotingHigh(bytes: []const u8, from: usize, high: *bool) usize {
+    return findSpecial(true, bytes, from, high);
+}
+
+fn findSpecial(comptime note_high: bool, bytes: []const u8, from: usize, high: *bool) usize {
+    if (comptime std.simd.suggestVectorLength(u8)) |width| return findStringSpecialVector(width, note_high, bytes, from, high);
+    return findStringSpecialWords(note_high, bytes, from, high);
+}
+
+/// `findStringSpecial` with vectors of `width` bytes; with `note_high`, `findStringSpecialNotingHigh`.
+pub fn findStringSpecialVector(comptime width: usize, comptime note_high: bool, bytes: []const u8, from: usize, high: *bool) usize {
     const Vector = @Vector(width, u8);
     var i = from;
     while (i + width <= bytes.len) : (i += width) {
         const chunk: Vector = bytes[i..][0..width].*;
+        if (note_high and @reduce(.Or, chunk >= @as(Vector, @splat(0x80)))) high.* = true;
         const special = (chunk == @as(Vector, @splat('"'))) | (chunk == @as(Vector, @splat('\\'))) | (chunk < @as(Vector, @splat(0x20)));
-        if (std.simd.firstTrue(special)) |offset| return i + offset;
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            // The lanes as the bits of one integer, the first lane lowest: `std.simd.firstTrue` takes a horizontal
+            // minimum instead, which at 64 lanes (AVX-512) costs more than the scan.
+            const mask: @Int(.unsigned, width) = @bitCast(special);
+            if (mask != 0) return i + @ctz(mask);
+        } else if (std.simd.firstTrue(special)) |offset| return i + offset;
     }
-    while (i < bytes.len) : (i += 1) {
-        const c = bytes[i];
-        if (c == '"' or c == '\\' or c < 0x20) return i;
-    }
-    return bytes.len;
+    return findSpecialBytes(note_high, bytes, i, high);
 }
 
-/// `findStringSpecial` a word at a time, for a target without vectors.
-pub fn findStringSpecialWords(bytes: []const u8, from: usize) usize {
+/// `findStringSpecial` a word at a time, for a target without vectors; with `note_high`, `findStringSpecialNotingHigh`.
+pub fn findStringSpecialWords(comptime note_high: bool, bytes: []const u8, from: usize, high: *bool) usize {
     var i = from;
     while (i + 8 <= bytes.len) : (i += 8) {
         const word = std.mem.readInt(u64, bytes[i..][0..8], .little);
         if (hasZero(word ^ (ones * '"')) or hasZero(word ^ (ones * '\\')) or hasBelow(word, 0x20)) break;
+        if (note_high and word & highs != 0) high.* = true;
     }
+    return findSpecialBytes(note_high, bytes, i, high);
+}
+
+/// The scan a byte at a time, for what is left after the wide steps.
+fn findSpecialBytes(comptime note_high: bool, bytes: []const u8, from: usize, high: *bool) usize {
+    var i = from;
     while (i < bytes.len) : (i += 1) {
         const c = bytes[i];
+        if (note_high and c >= 0x80) high.* = true;
         if (c == '"' or c == '\\' or c < 0x20) return i;
     }
     return bytes.len;
@@ -184,7 +207,20 @@ fn referenceSpecial(bytes: []const u8, from: usize) usize {
     return bytes.len;
 }
 
-fn expectFinder(comptime find: anytype) !void {
+/// Checks one scan: it finds what the byte-wise reference finds, and with `notes_high` it notes every byte of 0x80 or
+/// above before that one and notes nothing in text that has none.
+fn expectFind(comptime find: anytype, comptime notes_high: bool, bytes: []const u8, from: usize) !void {
+    var high = false;
+    const at = find(bytes, from, &high);
+    try std.testing.expectEqual(referenceSpecial(bytes, from), at);
+    if (!notes_high) return;
+    for (bytes[from..at]) |c| if (c >= 0x80) try std.testing.expect(high);
+    for (bytes[from..]) |c| {
+        if (c >= 0x80) break;
+    } else try std.testing.expect(!high);
+}
+
+fn expectFinder(comptime find: anytype, comptime notes_high: bool) !void {
     // Every special byte at every offset of a buffer long enough for several words and vectors, with
     // plain bytes (ASCII and not) around it.
     var buffer: [71]u8 = undefined;
@@ -193,40 +229,57 @@ fn expectFinder(comptime find: anytype) !void {
         for (0..buffer.len) |position| {
             for ([_]u8{ '"', '\\', 0x00, 0x1f, 0x0a }) |special| {
                 buffer[position] = special;
-                for (0..buffer.len + 1) |from| {
-                    try std.testing.expectEqual(referenceSpecial(&buffer, from), find(&buffer, from));
-                }
+                for (0..buffer.len + 1) |from| try expectFind(find, notes_high, &buffer, from);
                 buffer[position] = filler;
             }
         }
-        for (0..buffer.len + 1) |from| try std.testing.expectEqual(buffer.len, find(&buffer, from));
+        for (0..buffer.len + 1) |from| try expectFind(find, notes_high, &buffer, from);
+    }
+    // One high byte in ASCII, before a special and after it, at every offset.
+    @memset(&buffer, 'a');
+    buffer[40] = '"';
+    for (0..buffer.len) |position| {
+        if (position == 40) continue;
+        buffer[position] = 0xc3;
+        for (0..buffer.len + 1) |from| try expectFind(find, notes_high, &buffer, from);
+        buffer[position] = 'a';
     }
     // Bytes next to the special ones are not mistaken for them: `#` is `"` plus one, `]` is `\` plus one.
     const near = "!#$[]^ ~\x7f\x80\xa2\xdc\xdd\xde";
-    try std.testing.expectEqual((near ++ near ++ near).len, find(near ++ near ++ near, 0));
+    try expectFind(find, notes_high, near ++ near ++ near, 0);
     var many: [64]u8 = undefined;
     for (&many, 0..) |*c, i| c.* = near[i % near.len];
-    try std.testing.expectEqual(many.len, find(&many, 0));
+    try expectFind(find, notes_high, &many, 0);
 }
 
-fn vector8(bytes: []const u8, from: usize) usize {
-    return findStringSpecialVector(8, bytes, from);
+/// One way of scanning, as a function of the bytes, the start and the note.
+fn Scan(comptime width: ?usize, comptime note_high: bool) type {
+    return struct {
+        fn find(bytes: []const u8, from: usize, high: *bool) usize {
+            if (width) |w| return findStringSpecialVector(w, note_high, bytes, from, high);
+            return findStringSpecialWords(note_high, bytes, from, high);
+        }
+    };
 }
 
-fn vector16(bytes: []const u8, from: usize) usize {
-    return findStringSpecialVector(16, bytes, from);
-}
-
-fn vector32(bytes: []const u8, from: usize) usize {
-    return findStringSpecialVector(32, bytes, from);
+fn plainFind(bytes: []const u8, from: usize, high: *bool) usize {
+    _ = high;
+    return findStringSpecial(bytes, from);
 }
 
 test "findStringSpecial matches the byte-wise scan at every position and length, whichever way it scans" {
-    try expectFinder(findStringSpecial);
-    try expectFinder(findStringSpecialWords);
-    try expectFinder(vector8);
-    try expectFinder(vector16);
-    try expectFinder(vector32);
+    try expectFinder(plainFind, false);
+    try expectFinder(Scan(null, false).find, false);
+    try expectFinder(Scan(8, false).find, false);
+    try expectFinder(Scan(16, false).find, false);
+    try expectFinder(Scan(32, false).find, false);
+}
+
+test "findStringSpecialNotingHigh notes each byte of 0x80 or above before the one it finds, whichever way it scans" {
+    try expectFinder(findStringSpecialNotingHigh, true);
+    try expectFinder(Scan(null, true).find, true);
+    try expectFinder(Scan(16, true).find, true);
+    try expectFinder(Scan(64, true).find, true);
 }
 
 test "validUtf8 and validUtf8Words agree with the standard library on valid and invalid input" {

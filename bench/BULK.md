@@ -17,6 +17,28 @@ and a byte-wise loop.
 61 bytes) and `multibyte` (the euro sign repeated). Three operations: UTF-8 validation, escaping as the
 characters of a JSON string, and finding the next byte a JSON string cannot hold as it is.
 
+## 2026-11-25 - e07eb8c
+
+Changes since previous run: the vector scan for a string's end reads its first match as a bit mask on a little-endian target; `std.simd.firstTrue` took a horizontal minimum, which on this machine (64-lane vectors, AVX-512) cost more than the scan. The scan can also note a byte of 0x80 or above, which the JSON reader uses and these rows do not.
+
+"Before" is `025086f`, "after" `e07eb8c`; `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`; three runs each, alternating, `zig build bench-bulk -Doptimize=ReleaseFast` under one `flock`. The "bulk" column, µs per operation. "code 2" is `src/cbor.zig`, which this change edits, so it is left out.
+
+| Row | Before µs (3 runs) | After µs (3 runs) | After / before |
+| --- | ---: | ---: | ---: |
+| ascii, escape | 5.0 / 5.3 / 5.1 | 4.6 / 4.7 / 4.6 | 0.88 to 0.91 |
+| ascii, find special | 3.6 / 3.1 / 3.1 | 2.5 / 2.6 / 2.6 | 0.71 to 0.82 |
+| escapes, escape | 55.0 / 58.5 / 54.3 | 22.1 / 22.2 / 21.9 | 0.38 to 0.40 |
+| escapes, find special | 52.6 / 56.3 / 52.6 | 20.0 / 19.9 / 20.1 | 0.35 to 0.38 |
+| multibyte, escape | 5.1 / 5.2 / 5.3 | 4.7 / 4.7 / 4.6 | 0.88 to 0.91 |
+| multibyte, find special | 3.1 / 3.1 / 3.1 | 2.5 / 2.7 / 2.6 | 0.81 to 0.85 |
+| code 1, find special | 183.6 / 184.5 / 183.0 | 69.2 / 70.0 / 69.2 | 0.38 to 0.38 |
+| code 1, escape | 200.4 / 201.8 / 199.3 | 90.8 / 93.2 / 90.5 | 0.45 to 0.46 |
+| prose, find special | 9.0 / 9.0 / 8.9 | 3.5 / 3.4 / 3.5 | 0.38 to 0.39 |
+| prose, escape | 9.9 / 9.8 / 9.8 | 4.5 / 4.7 / 4.5 | 0.45 to 0.48 |
+| ascii, cbor to json render (trusted) | 12.3 / 13.3 / 12.3 | 11.5 / 12.4 / 11.6 | 0.93 to 0.94 |
+| escapes6, escape, 64 KiB windows | 573.0 / 587.7 / 573.4 | 233.6 / 236.4 / 229.4 | 0.40 to 0.41 |
+| escapes6, render, 64 KiB windows | 577.1 / 577.7 / 577.7 | 232.0 / 235.1 / 234.5 | 0.40 to 0.41 |
+
 ## 2026-11-24 - 52757c8
 
 Changes since previous run: the windowed JSON escape (`json.writeEscapedPart`) writes an escape straight into the window

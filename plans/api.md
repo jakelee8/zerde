@@ -144,6 +144,25 @@ make (UTF-8 is one: it is the reason text is refused on read and write).
 **Acceptance.** The typed CBOR write within 1.10× of the base and the CBOR and JSON parse within 1.05× on `bench-cbor`
 and `bench-json`, three alternating runs, with every refusal the branch added still in place.
 
+**Outcome (`e07eb8c`).** Profiled with `gprofng` and a per-commit bisection; four causes, each fixed:
+
+1. `357dd04`: the CBOR writer, and the JSON writer too, checked every field name and enum name as UTF-8 on each write.
+   They are known at compile time; they are now checked and encoded then.
+2. `3461d9c`: the vector string scan found its first match with `std.simd.firstTrue`, a horizontal minimum that at 64
+   lanes (AVX-512) cost more than the scan. It reads a bit mask now.
+3. `21c5f15`: the CBOR reader checked strict mode and counted `max_items` on every head at run time, which kept the head
+   read out of line; inlining it exposed a store-forwarding stall copying `Header`'s byte fields. Both checks are decided
+   at compile time when the config does not name them, and `Header` is packed.
+4. `4881395`: the JSON reader's UTF-8 check of every string, a refusal the default keeps. The string scan now notes a byte
+   of 0x80 or above and an ASCII run skips the check.
+
+On `bench-cbor` (the `e07eb8c` section of `bench/CBOR.md`) every zerde row is at or below the base but two pairs: one
+small parse run (1.15, after a load-9 base run) and one large roundtrip run (1.02). On `bench-json` small parse is 0.95
+to 1.00, medium 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 1.08; pinned to one core the medium
+parse is at the base and the large 1.04 to 1.05. JSON write is 0.72 to 0.87 of the base. The rest of the large JSON
+parse is not attributed; what the cheaper check did not recover is accepted and recorded here. Every
+refusal stays: the mutants of each guard on the changed path are killed.
+
 ## (j) BSON element types a typed read does not know
 
 **Problem.** The typed BSON reader maps nine element types (`readTag`, `src/bson.zig:510-523`) and refuses any other

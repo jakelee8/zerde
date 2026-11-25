@@ -29,6 +29,49 @@ The current large case produces a JSON document of about `107.58 MiB`.
 
 Runs before `8a3a0a9` used the older simpler payload, so they are not directly comparable to the newer mixed-payload runs.
 
+## 2026-11-25 - e07eb8c
+
+Changes since previous run: the default-path fixes of `plans/api.md` (i). The string scan reads its first match as a bit mask (`std.simd.firstTrue` took a horizontal minimum over 64 lanes) and notes whether a run holds a byte of 0x80 or above, so an ASCII run skips the UTF-8 check; the writer puts out a field name and an enum name as bytes made at compile time.
+
+Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`; `zig build bench-json -Doptimize=ReleaseFast` under one `flock`, alternating base and tip. A first set of three pairs ran at load 2 to 12 and the `std.json` control moved 0.99 to 1.25 (parse rows below the table); the table is a second set of three pairs at load 2 to 5.
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 4,362 / 4,477 / 4,296 | 4,145 / 4,274 / 4,285 | 0.95 to 1.00 |
+| small | parse std.json | 7,843 / 7,936 / 7,828 | 7,814 / 8,534 / 7,754 | 0.99 to 1.08 |
+| small | write zerde | 3,405 / 3,412 / 3,447 | 2,947 / 2,928 / 2,869 | 0.83 to 0.87 |
+| small | write std.json | 3,949 / 3,909 / 3,912 | 3,843 / 3,875 / 3,817 | 0.97 to 0.99 |
+| small | roundtrip zerde | 8,426 / 8,361 / 9,653 | 7,306 / 7,467 / 7,337 | 0.76 to 0.89 |
+| small | roundtrip std.json | 13,029 / 12,738 / 13,210 | 12,666 / 14,291 / 12,462 | 0.94 to 1.12 |
+| medium | parse zerde | 1,232,638 / 1,213,688 / 1,232,783 | 1,297,257 / 1,253,299 / 1,324,229 | 1.03 to 1.07 |
+| medium | parse std.json | 2,336,482 / 2,231,743 / 2,826,390 | 2,450,578 / 2,340,124 / 2,238,098 | 0.79 to 1.05 |
+| medium | write zerde | 958,634 / 947,272 / 1,016,852 | 774,761 / 744,034 / 732,183 | 0.72 to 0.81 |
+| medium | write std.json | 1,097,580 / 1,077,382 / 1,129,367 | 1,088,111 / 1,128,965 / 1,079,413 | 0.96 to 1.05 |
+| medium | roundtrip zerde | 2,214,639 / 2,204,145 / 2,245,266 | 2,261,713 / 2,048,737 / 2,002,912 | 0.89 to 1.02 |
+| medium | roundtrip std.json | 3,535,611 / 3,408,501 / 3,483,469 | 3,406,240 / 3,444,362 / 3,364,090 | 0.96 to 1.01 |
+| large | parse zerde | 132,295,106 / 123,867,856 / 136,191,280 | 137,931,135 / 145,028,796 / 134,249,843 | 0.99 to 1.17 |
+| large | parse std.json | 227,015,694 / 223,074,371 / 224,078,599 | 226,849,074 / 240,354,209 / 224,392,942 | 1.00 to 1.08 |
+| large | write zerde | 92,967,951 / 92,653,629 / 94,181,370 | 75,230,277 / 74,491,980 / 72,207,548 | 0.77 to 0.81 |
+| large | write std.json | 106,118,215 / 105,974,634 / 106,773,277 | 105,371,084 / 106,428,196 / 106,857,267 | 0.99 to 1.00 |
+| large | roundtrip zerde | 226,073,225 / 219,563,687 / 216,152,418 | 196,538,963 / 201,898,766 / 205,117,878 | 0.87 to 0.95 |
+| large | roundtrip std.json | 362,526,159 / 355,546,739 / 333,878,049 | 335,800,990 / 333,428,909 / 332,642,493 | 0.93 to 1.00 |
+
+First set (load 2 to 12), parse rows:
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 4,200 / 4,254 / 4,344 | 4,208 / 4,668 / 4,113 | 0.95 to 1.10 |
+| small | parse std.json | 7,921 / 8,021 / 7,838 | 8,046 / 9,479 / 7,725 | 0.99 to 1.18 |
+| medium | parse zerde | 1,257,437 / 1,365,033 / 1,213,585 | 1,437,319 / 1,444,077 / 1,247,557 | 1.03 to 1.14 |
+| medium | parse std.json | 2,243,243 / 2,217,791 / 2,237,544 | 2,611,169 / 2,715,773 / 2,351,927 | 1.05 to 1.22 |
+| large | parse zerde | 127,600,087 / 139,801,705 / 121,681,496 | 150,305,731 / 150,151,805 / 140,157,420 | 1.07 to 1.18 |
+| large | parse std.json | 227,227,331 / 244,368,303 / 222,994,576 | 283,734,866 / 276,511,630 / 228,832,755 | 1.03 to 1.25 |
+
+Notes:
+
+- Small parse is at the base (0.95 to 1.00); medium parse 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 1.08 on the same pairs. Write is 0.72 to 0.87 and roundtrip 0.76 to 1.02.
+- Pinned to one core (`taskset -c 3`), best of 15 repetitions: small parse 3,820 to 3,866 ns against 3,823 to 3,880; medium 1,186,000 to 1,194,000 against 1,188,000 to 1,190,000; large 161.7 to 163.3 ms against 154.5 to 155.8 ms (1.04 to 1.05). What is left on the large parse is not attributed; gating the `max_items` count at compile time, as the CBOR reader now does, moved nothing on medium (1,175,000 to 1,188,000 ns).
+
 ## 2026-11-25 - 52757c8
 
 The whole branch against its base, on the default path (no new option set).
