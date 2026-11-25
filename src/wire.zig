@@ -376,8 +376,9 @@ pub fn Decoded(comptime T: type) type {
 /// A decode into the caller's regions, with no allocator in the API: `output` (at least
 /// `regionSizes(...).output` bytes) takes the arrays and rewritten strings the wire value points at, and
 /// stays; `scratch` (at least `regionSizes(...).scratch` bytes, a size known at compile time) takes what the
-/// reader keeps while it reads (the key records of a lenient CBOR read of a `Raw`), is free for reuse as soon
-/// as the call returns, and is empty for a strict CBOR read and for JSON. A region too small is
+/// reader keeps while it reads (the key records of a `Raw`: lenient CBOR's, and JSON's for the repeated-key
+/// check), is free for reuse as soon as the call returns, and is empty for a strict CBOR read and for a JSON
+/// read without a `Raw`. A region too small is
 /// `error.OutOfMemory`. `base` is the address spans are relative to, and the input and `output` must be
 /// memory it reaches. Everything else is `decode`.
 pub fn decodeInto(
@@ -817,7 +818,7 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 
 /// The two regions of `decodeInto`, in bytes: `output` holds the arrays and rewritten strings the wire value
 /// points at, `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
-/// a lenient CBOR `Raw` and the name spans of a JSON `Raw` otherwise), and
+/// a lenient CBOR `Raw` and the recorded names of a JSON `Raw` (`json.RecordedKey`) otherwise), and
 /// together they are `maxArenaSize`. Each is an upper bound under the same rules, so a region of exactly its
 /// size is enough for any input the config allows.
 pub const Sizes = struct { output: usize, scratch: usize };
