@@ -33,7 +33,10 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
   value `@bitCast` to the unsigned integer of the same width, masked and shifted per field, so a signed backing is
   checked the same way as an unsigned one.
 - Each walk tests `isPacked(T)` at its dispatch, before its struct arm, and continues with `T`'s backing integer type:
-  the typed write (`typed.zig:486`) and read (`typed.zig:979`), the resumable write and read (`typed_resume.zig`),
+  the typed write (`typed.zig:486`) and read (`typed.zig:979`), `freeTypedPartial` (`typed.zig:2114`, which frees
+  nothing for it), `deserializeBounded` (`typed.zig:1992-2002`: a packed field with a `min`/`max` bound gets its own
+  compile error, that bounds do not apply to a packed struct, ahead of the struct arm's), the resumable write and read
+  (`typed_resume.zig`),
   `Wire`, `toWire`, `fromWire`, `describe`, `WireSink` and `typedOwned` (`wire.zig:75-105`, `265-271`, `330-336`,
   `604-615`, `480-481`, `1008-1014`), the resumable key and frame counts (`resumable.zig:92-101`, `137`, `167-178`),
   and TOML and YAML (`toml.zig:388-391`, `yaml.zig:423`). The read calls `packedFromInt` on what the integer arm
