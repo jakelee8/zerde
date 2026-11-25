@@ -301,7 +301,8 @@ What they refuse, and why:
 - an object or map that names a key twice, in every format and every read, typed or `zerde.value`, at any depth, skipped
   values included: `error.DuplicateField`, except ZON, which reports `error.ParseZon` from the Zig parser. A JSON name is
   compared as decoded text (`a` and `\u0061` are one name). RFC 8259 §4 leaves repeated names to the reader; zerde refuses
-  them, as `std.json` does by default
+  them, as `std.json` does by default. A struct that denies unknown members without extras refuses the object at its first
+  undeclared key (`error.UnknownField`), so a repeat of that key is never reached
 - in a dynamic `Value`: a JSON integer beyond 128 bits or a float literal too large for a double
   (`error.InvalidNumber` for an integer beyond 128 bits, `error.FloatOutOfRange` for a float literal that overflows); a CBOR map key that is not text
   (`error.UnexpectedType`), a tag (`error.UnexpectedTag`), and a simple value other than false, true and

@@ -15,7 +15,7 @@
 - The JSON writer writes a float as the shortest digits that read back to the same value, laid out as ECMAScript's `Number::toString` (RFC 8785): `1e+21`, `5e-324`; values from 1e-6 up to 1e21 are written as before.
 - The JSON writer refuses NaN and infinity (`error.NonFiniteFloat`), and the JSON string and CBOR text writers, and the JSON `.string` byte encoding, refuse text that is not UTF-8 (`error.InvalidUtf8`).
 - The `sliceDeserializer` and `readerDeserializer` of CBOR, JSON, MessagePack and BSON allocate while reading (key records, extras), so a caller that uses one directly must call `deinit` on it, also for borrowed input; `parseSlice*`, `deserialize*` and `value.parse*` already do.
-- `cbor.CborSerializer` takes the write mode as comptime parameters after `Config`; `cbor.serializer` builds it.
+- `cbor.CborSerializer` takes a second comptime parameter after `Config`, `deterministic`; `cbor.serializer` builds it from the write config.
 - A field `rename` that is not valid UTF-8 is a compile error.
 
 ### Added
