@@ -180,7 +180,8 @@ against 1.12 to 1.14 ms). Not investigated further.
 
 ### A. Scan width on 64-byte targets (Zen 4/5 builds only)
 
-- **A1. Keep 64.** Long text keeps its speed (F5); large and medium parse stay about 1.02 of the base (F1).
+- **A1. Keep 64.** Long ASCII, multibyte and code text keep their speed, and the escape-dense 64 KiB windows row stays
+  the slowest of the three widths (F5); large and medium parse stay about 1.02 of the base (F1).
 - **A2. Cap at 32 in `bulk.findSpecial`.** Parse 108 to 110 ms (F2); long text slower on some bulk rows (F5); every x86
   target then scans at most 32 (F3).
 - **A3. Cap at 16.** Parse 107 to 108 ms (F2); long text slower than at 32 on the same rows (F5).
