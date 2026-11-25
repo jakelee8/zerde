@@ -156,11 +156,12 @@ and `bench-json`, three alternating runs, with every refusal the branch added st
 4. `4881395`: the JSON reader's UTF-8 check of every string, a refusal the default keeps. The string scan now notes a byte
    of 0x80 or above and an ASCII run skips the check.
 
-On `bench-cbor` (the `e07eb8c` section of `bench/CBOR.md`) every zerde row is at or below the base but one small parse
-run (1.15, after a load-9 base run). On `bench-json` small parse is 0.95 to 1.00, medium 1.03 to 1.07 and large 0.99 to
-1.17, with `std.json` at 0.79 to 1.08; pinned to one core the medium parse is at the base and the large 1.04 to 1.05.
-JSON write is 0.72 to 0.87 of the base. The rest of the large JSON parse is not attributed; what the cheaper check did not recover is accepted and recorded here. Every refusal stays: the mutants of each guard on the
-changed path are killed.
+On `bench-cbor` (the `e07eb8c` section of `bench/CBOR.md`) every zerde row is at or below the base but two pairs: one
+small parse run (1.15, after a load-9 base run) and one large roundtrip run (1.02). On `bench-json` small parse is 0.95
+to 1.00, medium 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 1.08; pinned to one core the medium
+parse is at the base and the large 1.04 to 1.05. JSON write is 0.72 to 0.87 of the base. The rest of the large JSON
+parse is not attributed; what the cheaper check did not recover is accepted and recorded here. Every
+refusal stays: the mutants of each guard on the changed path are killed.
 
 ## (j) BSON element types a typed read does not know
 
