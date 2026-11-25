@@ -29,7 +29,9 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
   bits name no tag, and the same for each field of a nested packed struct, field by field over `field_names` at compile
   time. The refusal is `error.InvalidValue` (or the existing error the implementer finds closest to the enum's refusal
   of an unknown number; one error, documented). A field of any other type (integer, bool, non-exhaustive enum) defines
-  every pattern. So `@fromBackingInt` never sees a value it would trap on.
+  every pattern. So `@fromBackingInt` never sees a value it would trap on. The checks work on the bits: the backing
+  value `@bitCast` to the unsigned integer of the same width, masked and shifted per field, so a signed backing is
+  checked the same way as an unsigned one.
 - Each walk tests `isPacked(T)` at its dispatch, before its struct arm, and continues with `T`'s backing integer type:
   the typed write (`typed.zig:486`) and read (`typed.zig:979`), the resumable write and read (`typed_resume.zig`),
   `Wire`, `toWire`, `fromWire`, `describe`, `WireSink` and `typedOwned` (`wire.zig:75-105`, `265-271`, `330-336`,
