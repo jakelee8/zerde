@@ -92,7 +92,9 @@ consulted at run time: the width is fixed when the code is compiled, from the ta
 | prose, find special | 3,455 to 3,683 | 3,342 to 3,586 | 3,816 to 4,456 |
 | escapes6, escape, 64 KiB windows | 242,082 to 244,896 | 217,704 to 226,969 | 203,712 to 223,223 |
 
-Ranges overlap between widths on the escapes and prose rows; on the ascii, multibyte and code rows they do not.
+Ranges overlap between widths on the "escapes, find special" and prose rows. On the ascii, multibyte and code rows the
+wider scan is faster with no overlap; on the escape-dense 64 KiB windows row the 64-byte scan is the slowest, with no
+overlap against 32.
 
 ### F6. Two-stage scans
 
