@@ -38,26 +38,55 @@ pub fn findStringSpecialNotingHigh(bytes: []const u8, from: usize, high: *bool) 
 }
 
 fn findSpecial(comptime note_high: bool, bytes: []const u8, from: usize, high: *bool) usize {
-    if (comptime std.simd.suggestVectorLength(u8)) |width| return findStringSpecialVector(width, note_high, bytes, from, high);
+    if (comptime std.simd.suggestVectorLength(u8)) |width| {
+        if (width > short_width) return findStringSpecialTwoStage(width, note_high, bytes, from, high);
+        return findStringSpecialVector(width, note_high, bytes, from, high);
+    }
     return findStringSpecialWords(note_high, bytes, from, high);
+}
+
+/// The width of the first steps of `findStringSpecialTwoStage`.
+const short_width = 32;
+
+/// `findStringSpecialVector` for a target whose vectors are wider than `short_width` (AVX-512 on AMD Zen 4 and Zen 5):
+/// two steps of `short_width` bytes, then `width` bytes at a time. Most strings a parser scans end within those first
+/// steps, and the reader waits on where each one ends; there a 64-byte step costs more than a 32-byte one (a large JSON
+/// parse measured 116.4 to 117.6 ms with 64-byte steps against 109.7 to 112.6 ms like this; `plans/json-scan.md`). The
+/// wide loop is called, not inlined, so the code inlined into each caller stays the size of the short steps; inlining
+/// it made the same parse 124 ms.
+fn findStringSpecialTwoStage(comptime width: usize, comptime note_high: bool, bytes: []const u8, from: usize, high: *bool) usize {
+    var i = from;
+    inline for (0..2) |_| {
+        if (i + short_width > bytes.len) return findSpecialBytes(note_high, bytes, i, high);
+        if (vectorStep(short_width, note_high, bytes, i, high)) |at| return at;
+        i += short_width;
+    }
+    return @call(.never_inline, findStringSpecialVector, .{ width, note_high, bytes, i, high });
 }
 
 /// `findStringSpecial` with vectors of `width` bytes; with `note_high`, `findStringSpecialNotingHigh`.
 pub fn findStringSpecialVector(comptime width: usize, comptime note_high: bool, bytes: []const u8, from: usize, high: *bool) usize {
-    const Vector = @Vector(width, u8);
     var i = from;
     while (i + width <= bytes.len) : (i += width) {
-        const chunk: Vector = bytes[i..][0..width].*;
-        if (note_high and @reduce(.Or, chunk >= @as(Vector, @splat(0x80)))) high.* = true;
-        const special = (chunk == @as(Vector, @splat('"'))) | (chunk == @as(Vector, @splat('\\'))) | (chunk < @as(Vector, @splat(0x20)));
-        if (comptime builtin.cpu.arch.endian() == .little) {
-            // The lanes as the bits of one integer, the first lane lowest: `std.simd.firstTrue` takes a horizontal
-            // minimum instead, which at 64 lanes (AVX-512) costs more than the scan.
-            const mask: @Int(.unsigned, width) = @bitCast(special);
-            if (mask != 0) return i + @ctz(mask);
-        } else if (std.simd.firstTrue(special)) |offset| return i + offset;
+        if (vectorStep(width, note_high, bytes, i, high)) |at| return at;
     }
     return findSpecialBytes(note_high, bytes, i, high);
+}
+
+/// The index of the first special byte in the `width` bytes at `i`, if there is one; with `note_high`, sets `high` when
+/// one of them is 0x80 or above.
+inline fn vectorStep(comptime width: usize, comptime note_high: bool, bytes: []const u8, i: usize, high: *bool) ?usize {
+    const Vector = @Vector(width, u8);
+    const chunk: Vector = bytes[i..][0..width].*;
+    if (note_high and @reduce(.Or, chunk >= @as(Vector, @splat(0x80)))) high.* = true;
+    const special = (chunk == @as(Vector, @splat('"'))) | (chunk == @as(Vector, @splat('\\'))) | (chunk < @as(Vector, @splat(0x20)));
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        // The lanes as the bits of one integer, the first lane lowest: `std.simd.firstTrue` takes a horizontal
+        // minimum instead, which at 64 lanes (AVX-512) costs more than the scan.
+        const mask: @Int(.unsigned, width) = @bitCast(special);
+        if (mask != 0) return i + @ctz(mask);
+    } else if (std.simd.firstTrue(special)) |offset| return i + offset;
+    return null;
 }
 
 /// `findStringSpecial` a word at a time, for a target without vectors; with `note_high`, `findStringSpecialNotingHigh`.
@@ -220,10 +249,10 @@ fn expectFind(comptime find: anytype, comptime notes_high: bool, bytes: []const 
     } else try std.testing.expect(!high);
 }
 
-fn expectFinder(comptime find: anytype, comptime notes_high: bool) !void {
+fn expectFinder(comptime find: anytype, comptime notes_high: bool, comptime len: usize) !void {
     // Every special byte at every offset of a buffer long enough for several words and vectors, with
     // plain bytes (ASCII and not) around it.
-    var buffer: [71]u8 = undefined;
+    var buffer: [len]u8 = undefined;
     for ([_]u8{ 'a', 0x7f, 0x80, 0xff, 0x20 }) |filler| {
         @memset(&buffer, filler);
         for (0..buffer.len) |position| {
@@ -262,24 +291,38 @@ fn Scan(comptime width: ?usize, comptime note_high: bool) type {
     };
 }
 
+/// The two-stage scan with a wide step of `width` bytes, which any target can run, whatever its own vectors are.
+fn TwoStage(comptime width: usize, comptime note_high: bool) type {
+    return struct {
+        fn find(bytes: []const u8, from: usize, high: *bool) usize {
+            return findStringSpecialTwoStage(width, note_high, bytes, from, high);
+        }
+    };
+}
+
 fn plainFind(bytes: []const u8, from: usize, high: *bool) usize {
     _ = high;
     return findStringSpecial(bytes, from);
 }
 
+/// Long enough to reach the two-stage scan's wide loop after its two short steps, and the bytes after that loop.
+const two_stage_len = 2 * short_width + 64 + 22;
+
 test "findStringSpecial matches the byte-wise scan at every position and length, whichever way it scans" {
-    try expectFinder(plainFind, false);
-    try expectFinder(Scan(null, false).find, false);
-    try expectFinder(Scan(8, false).find, false);
-    try expectFinder(Scan(16, false).find, false);
-    try expectFinder(Scan(32, false).find, false);
+    try expectFinder(plainFind, false, 71);
+    try expectFinder(Scan(null, false).find, false, 71);
+    try expectFinder(Scan(8, false).find, false, 71);
+    try expectFinder(Scan(16, false).find, false, 71);
+    try expectFinder(Scan(32, false).find, false, 71);
+    try expectFinder(TwoStage(64, false).find, false, two_stage_len);
 }
 
 test "findStringSpecialNotingHigh notes each byte of 0x80 or above before the one it finds, whichever way it scans" {
-    try expectFinder(findStringSpecialNotingHigh, true);
-    try expectFinder(Scan(null, true).find, true);
-    try expectFinder(Scan(16, true).find, true);
-    try expectFinder(Scan(64, true).find, true);
+    try expectFinder(findStringSpecialNotingHigh, true, 71);
+    try expectFinder(Scan(null, true).find, true, 71);
+    try expectFinder(Scan(16, true).find, true, 71);
+    try expectFinder(Scan(64, true).find, true, 71);
+    try expectFinder(TwoStage(64, true).find, true, two_stage_len);
 }
 
 test "validUtf8 and validUtf8Words agree with the standard library on valid and invalid input" {
