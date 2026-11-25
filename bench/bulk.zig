@@ -69,6 +69,19 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
     defer writer.deinit();
     try writer.writeText(ascii);
     try report(out, "ascii", "cbor to json render, trusted vs checked", try time(io, renderTrusted, cbor_text.written(), &sink.writer), try time(io, renderChecked, cbor_text.written(), &sink.writer), ascii.len);
+
+    // Every sixth byte a quote: the windowed escape and render, where "bulk" is the windowed path and "std" the whole-buffer one.
+    const escapes6 = try allocator.dupe(u8, ascii);
+    defer allocator.free(escapes6);
+    at = 5;
+    while (at < size) : (at += 6) escapes6[at] = '"';
+    try report(out, "escapes6", "escape, 64 KiB windows", try time(io, escapeWindowed, escapes6, &sink.writer), try time(io, escapeBulk, escapes6, &sink.writer), escapes6.len);
+    var cbor_escapes: std.Io.Writer.Allocating = .init(allocator);
+    defer cbor_escapes.deinit();
+    var escapes_writer = zerde.cbor.valueWriter(allocator, &cbor_escapes.writer, .{ .deterministic = true });
+    defer escapes_writer.deinit();
+    try escapes_writer.writeText(escapes6);
+    try report(out, "escapes6", "render, 64 KiB windows", try time(io, renderWindowed, cbor_escapes.written(), &sink.writer), try time(io, renderChecked, cbor_escapes.written(), &sink.writer), escapes6.len);
     try out.flush();
 }
 
@@ -87,6 +100,37 @@ fn renderTrusted(bytes: []const u8, sink: *std.Io.Writer) anyerror!usize {
 
 fn renderChecked(bytes: []const u8, sink: *std.Io.Writer) anyerror!usize {
     return render(bytes, sink, false);
+}
+
+/// The JSON string of `bytes`, written through a 64 KiB window that is emptied each time it fills.
+fn escapeWindowed(bytes: []const u8, _: *std.Io.Writer) anyerror!usize {
+    var window: [64 * 1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&window);
+    var state: zerde.typed.TextState = .{};
+    var total: usize = 0;
+    while (true) {
+        zerde.json.writeEscapedPart(&w, bytes, &state, true) catch |err| switch (err) {
+            error.WindowFull => {
+                total += w.end;
+                w.end = 0;
+                continue;
+            },
+            else => return err,
+        };
+        return total + w.end;
+    }
+}
+
+/// Stored strict CBOR rendered as JSON through a 64 KiB window.
+fn renderWindowed(bytes: []const u8, _: *std.Io.Writer) anyerror!usize {
+    var window: [64 * 1024]u8 = undefined;
+    var render_state = zerde.resumable.Render(.{}).init();
+    var total: usize = 0;
+    while (true) {
+        const filled = try render_state.fill(bytes, &window);
+        total += filled.len;
+        if (filled.done) return total;
+    }
 }
 
 fn report(out: *std.Io.Writer, input: []const u8, what: []const u8, bulk_ns: u64, std_ns: u64, bytes: usize) !void {
