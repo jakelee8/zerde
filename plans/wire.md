@@ -15,9 +15,8 @@ The fixes are:
 
 Line numbers are those of `aaaf864`.
 
-Each item states the problem with evidence, the design, open questions, and acceptance criteria. Each item is one branch
-with one commit, in the order below. Items (b) and (c) both edit `computeSizes`, so (c) starts from the reviewed tip of
-(b).
+Each item states the problem with evidence, the design, open questions, and acceptance criteria. The items land on one
+branch, one commit each, in the order below. Items (b) and (c) both edit `computeSizes`, so (c) builds on (b).
 
 ## (a) A packed struct is one integer
 
