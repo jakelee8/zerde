@@ -29,6 +29,38 @@ The current large case produces a JSON document of about `107.58 MiB`.
 
 Runs before `8a3a0a9` used the older simpler payload, so they are not directly comparable to the newer mixed-payload runs.
 
+## 2026-11-25 - 4542079
+
+Changes since previous run: on targets with 64-byte vectors, the string scan takes two 32-byte steps before it switches to 64-byte steps. Most strings in this payload end within the first step.
+
+Base is `aaaf864`; tip is `4542079`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `taskset -c 3 zig build bench-json -Doptimize=ReleaseFast`, alternating base and tip, load 2 to 5.
+
+| Scenario | Row | Base ns/op (3 runs) | Two-stage ns/op (3 runs) | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 4,131 / 4,857 / 4,397 | 4,298 / 4,086 / 4,072 | 0.84 to 1.04 |
+| small | parse std.json | 7,714 / 7,711 / 9,602 | 10,208 / 8,510 / 7,878 | 0.82 to 1.32 |
+| small | write zerde | 2,827 / 2,937 / 4,429 | 3,564 / 2,762 / 2,799 | 0.63 to 1.26 |
+| small | write std.json | 3,869 / 3,878 / 4,588 | 4,132 / 3,994 / 3,929 | 0.86 to 1.07 |
+| small | roundtrip zerde | 7,197 / 7,296 / 7,949 | 7,072 / 7,149 / 7,464 | 0.94 to 0.98 |
+| small | roundtrip std.json | 12,433 / 12,505 / 13,788 | 12,770 / 12,873 / 14,716 | 1.03 to 1.07 |
+| medium | parse zerde | 1,226,882 / 1,240,699 / 1,267,633 | 1,176,803 / 1,182,125 / 1,751,011 | 0.95 to 1.38 |
+| medium | parse std.json | 2,205,693 / 2,256,375 / 2,362,933 | 2,318,201 / 2,307,406 / 2,749,254 | 1.02 to 1.16 |
+| medium | write zerde | 739,702 / 793,026 / 795,686 | 712,162 / 808,319 / 724,662 | 0.91 to 1.02 |
+| medium | write std.json | 1,096,687 / 1,403,234 / 1,133,654 | 1,128,081 / 1,113,103 / 1,105,461 | 0.79 to 1.03 |
+| medium | roundtrip zerde | 2,022,916 / 2,575,626 / 2,091,921 | 2,070,370 / 1,956,187 / 1,973,189 | 0.76 to 1.02 |
+| medium | roundtrip std.json | 3,657,485 / 3,950,751 / 3,647,162 | 3,485,281 / 3,469,004 / 3,526,386 | 0.88 to 0.97 |
+| large | parse zerde | 134,093,493 / 127,182,466 / 137,054,864 | 123,936,279 / 123,010,142 / 122,430,552 | 0.89 to 0.97 |
+| large | parse std.json | 222,832,909 / 237,277,741 / 239,334,106 | 226,967,278 / 261,666,914 / 228,895,564 | 0.96 to 1.10 |
+| large | write zerde | 70,303,620 / 74,456,509 / 71,182,942 | 70,582,820 / 71,673,240 / 70,233,840 | 0.96 to 1.00 |
+| large | write std.json | 106,510,566 / 109,547,712 / 108,013,273 | 106,194,679 / 115,934,174 / 106,628,144 | 0.99 to 1.06 |
+| large | roundtrip zerde | 194,737,773 / 202,670,674 / 196,544,571 | 193,291,318 / 192,502,212 / 190,915,915 | 0.95 to 0.99 |
+| large | roundtrip std.json | 334,810,639 / 354,953,780 / 345,852,628 | 347,181,204 / 344,326,398 / 333,558,383 | 0.96 to 1.04 |
+
+Notes:
+
+- Large parse is 0.89 to 0.97 of the base. The third medium tip run is slow for `std.json` too (2,749,254 ns), so that run was disturbed; the other two medium tip runs are 0.95 of the base.
+- A standalone probe pinned to one core took the best of 12 large or 400 medium parses with a retained arena. Large parse: 108.6 to 110.4 ms in five of six rounds (one round 116.8 ms), against 116.1 to 119.0 ms at `aaaf864` and 114.1 to 115.0 ms at `03beb0e`. Medium parse: 1,039,610 to 1,057,201 ns, against 1,113,962 to 1,119,153 ns and 1,093,722 to 1,107,831 ns.
+
 ## 2026-11-25 - e07eb8c
 
 Changes since previous run: default-path fixes from `plans/api.md` (item i). The string scan reads its first match as a bit mask; `std.simd.firstTrue` took a horizontal minimum over 64 lanes. The scan also notes whether a run holds a byte of 0x80 or above, so an ASCII run skips the UTF-8 check. The writer emits field names and enum names as bytes built at compile time.

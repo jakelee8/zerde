@@ -16,6 +16,28 @@ This file logs the word-at-a-time string scans in `zerde.bulk` against the stand
 61 bytes) and `multibyte` (the euro sign repeated). Three operations: UTF-8 validation, escaping as the
 characters of a JSON string, and finding the next byte that a JSON string cannot hold as is.
 
+## 2026-11-25 - 4542079
+
+Changes since previous run: on targets with 64-byte vectors, the string scan takes two 32-byte steps before it switches to 64-byte steps.
+
+"Before" is `aaaf864`, "after" is `4542079`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `taskset -c 3 zig build bench-bulk -Doptimize=ReleaseFast`, three runs each, alternating. The "bulk" column gives µs per operation.
+
+| Row | Base µs (3 runs) | Two-stage µs (3 runs) | Ratio |
+| --- | ---: | ---: | ---: |
+| ascii find special | 2.5 / 2.6 / 2.6 | 2.6 / 2.5 / 2.5 | 0.94 to 1.01 |
+| ascii escape | 4.9 / 4.6 / 4.7 | 4.5 / 4.3 / 4.4 | 0.91 to 0.95 |
+| escapes find special | 19.9 / 20.9 / 19.8 | 18.4 / 18.3 / 18.2 | 0.88 to 0.92 |
+| multibyte find special | 2.5 / 4.7 / 2.5 | 2.7 / 2.5 / 2.6 | 0.54 to 1.08 |
+| code 1 find special | 69.4 / 69.7 / 69.9 | 63.7 / 63.4 / 62.8 | 0.90 to 0.92 |
+| code 1 escape | 91.0 / 92.3 / 90.9 | 85.9 / 85.1 / 86.1 | 0.92 to 0.95 |
+| prose find special | 3.4 / 3.5 / 3.5 | 3.3 / 3.3 / 3.3 | 0.95 to 0.97 |
+| prose escape | 4.5 / 4.5 / 4.5 | 4.4 / 4.4 / 4.4 | 0.97 to 0.98 |
+| cbor to json render | 12.7 / 15.7 / 12.6 | 12.0 / 11.7 / 11.7 | 0.74 to 0.94 |
+| escape, 64 KiB | 231.8 / 231.1 / 234.5 | 188.9 / 193.3 / 189.8 | 0.81 to 0.84 |
+| render, 64 KiB | 230.5 / 230.6 / 230.5 | 194.2 / 191.5 / 191.3 | 0.83 to 0.84 |
+
+Every row is at or below the base within run-to-run spread: the largest ratios are 1.01 (ascii, find special) and 1.08 (multibyte, against a base whose other two runs are 2.5 µs and one is 4.7 µs). The escape-dense 64 KiB rows are 0.81 to 0.84.
+
 ## 2026-11-25 - e07eb8c
 
 Changes since previous run: the vector scan for a string's end reads its first match as a bit mask on a little-endian target. `std.simd.firstTrue` took a horizontal minimum, which costs more than the scan on this machine (64-lane vectors, AVX-512). The scan can also note a byte of 0x80 or above; the JSON reader uses this and these rows do not.
