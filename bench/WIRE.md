@@ -28,23 +28,6 @@ whole decode moved between 38 and 64 µs across three runs).
 - The destination-passing typed read (every format) measured the same as before within the spread: bench-cbor, bench-json and bench-wire
   decode rows, base against this tree, alternating; bench-memory output identical.
 
-## 2026-11-23 - 4e60dfc
-
-`wire.decode` reads straight into `Wire(T)`, with no typed value and no typed array first. Before is `879332e`, after `4e60dfc`.
-
-| Read | Input / effects | Arena used (before, after) | Bound (before, after) | Time (before, after) |
-| --- | --- | --- | --- | --- |
-| strict CBOR | 723,857 B, 349 effects / 727,234 B, 353 effects | 29,323 B, 9,886 B | 344,343 B, 114,947 B | 91,024 and 105,824 ns, 86,536 and 87,328 ns |
-| JSON | 858,873 B, 349 effects / 862,968 B, 353 effects | 780,995 B, 748,240 B | 18,338,751 B, 17,799,272 B | 846,156 and 911,056 ns, 849,690 and 919,839 ns |
-
-- Memory: the arena of a strict CBOR decode falls to a third (29.3 KB to 9.9 KB: 84 to 28 bytes an effect; the typed
-  array of unions and the typed puts are gone). In JSON the arena is dominated by the base64 payloads and escaped text
-  that are rewritten (the `2026-11-23 - e343755` section), so the saving is the typed array only: 4%.
-- Time: strict CBOR is 5 to 18% faster (it no longer walks its list twice); JSON is unchanged within the run-to-run
-  spread (0.97 to 1.01 times). The sink adds no cost measured.
-- The corpus grew by four effects between the two rows because the repository's files did; per effect the figures
-  above hold.
-
 ## 2026-11-23 - e343755
 
 A rewritten string (a JSON string with an escape, a chunked CBOR string, base64 bytes) is measured first and
@@ -67,5 +50,22 @@ same JSON with every `/` written as `\/`, as some producers do. Input 301,382 B 
 - Time: JSON costs 13 to 15% more (plain) and 17 to 28% more (escaped), the second scan the item names (the measure
   pass, which also UTF-8 checks, and the write pass, which does not). Compute against memory: on this corpus the
   memory saved is the bound and the transient growth, which a fixed arena of exactly the bound cares about, and the
-  time paid is the second scan of each base64 or escaped string. Strict CBOR is unchanged. Whoever decides for the kernel
-  frames (strict CBOR, no rewrite) pays nothing.
+  time paid is the second scan of each base64 or escaped string. Strict CBOR is unchanged: a read of strict CBOR, which
+  rewrites nothing, pays nothing.
+
+## 2026-11-23 - 4e60dfc
+
+`wire.decode` reads straight into `Wire(T)`, with no typed value and no typed array first. Before is `879332e`, after `4e60dfc`.
+
+| Read | Input / effects | Arena used (before, after) | Bound (before, after) | Time (before, after) |
+| --- | --- | --- | --- | --- |
+| strict CBOR | 723,857 B, 349 effects / 727,234 B, 353 effects | 29,323 B, 9,886 B | 344,343 B, 114,947 B | 91,024 and 105,824 ns, 86,536 and 87,328 ns |
+| JSON | 858,873 B, 349 effects / 862,968 B, 353 effects | 780,995 B, 748,240 B | 18,338,751 B, 17,799,272 B | 846,156 and 911,056 ns, 849,690 and 919,839 ns |
+
+- Memory: the arena of a strict CBOR decode falls to a third (29.3 KB to 9.9 KB: 84 to 28 bytes an effect; the typed
+  array of unions and the typed puts are gone). In JSON the arena is dominated by the base64 payloads and escaped text
+  that are rewritten (the `2026-11-23 - e343755` section), so the saving is the typed array only: 4%.
+- Time: strict CBOR is 5 to 18% faster (it no longer walks its list twice); JSON is unchanged within the run-to-run
+  spread (0.97 to 1.01 times). The sink adds no cost measured.
+- The corpus grew by four effects between the two rows because the repository's files did; per effect the figures
+  above hold.
