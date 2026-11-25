@@ -302,11 +302,70 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
     };
 }
 
+/// The limits a rebuild holds to for `encode`: the ones a read of the same type under `read_cfg` applies to what it builds, so the arena
+/// has a bound (`encodeArenaSize`) whatever the wire value is. It refuses a list longer than the `max_len` of its field or element
+/// (`error.LengthOutOfBounds`), more than `max_items` rebuilt elements in all (`error.TooManyItems`, which bounds spans that alias),
+/// and containers nested deeper than `max_depth` (the format's own error, `error.CborNestingTooDeep` or `error.JsonNestingTooDeep`, which
+/// bounds the recursion of a span that names its own container). It does not apply `min_len`, `min`, `max`, a struct's `check` or a
+/// `Raw` validator, so the output is not made readable under `read_cfg`.
+pub fn Limited(comptime Format: type, comptime serde_cfg: anytype, comptime read_cfg: anytype) type {
+    return struct {
+        pub const format = Format;
+        pub const serde = serde_cfg;
+        pub const limits = limitsOf(Format, read_cfg);
+    };
+}
+
+/// What a rebuild has counted so far, for `Limited`.
+const Counts = struct { depth: u64 = 0, items: u64 = 0 };
+
+/// Whether `T` is the entry of a sorted map, which is not a container of its own: the map is one.
+fn isSortedEntry(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "zerde_sorted_entry");
+}
+
+/// Opens a container of the wire form: one level more than the limit is refused.
+fn enter(comptime limited: ?type, counts: *Counts) !void {
+    const L = limited orelse return;
+    counts.depth += 1;
+    if (counts.depth > L.limits.max_depth) return if (comptime L.format == cbor) error.CborNestingTooDeep else error.JsonNestingTooDeep;
+}
+
+fn leave(comptime limited: ?type, counts: *Counts) void {
+    if (limited != null) counts.depth -= 1;
+}
+
 /// The typed value of a wire value, the inverse of `toWire`. Arrays are allocated in `allocator`;
 /// text, byte strings, raw items and the elements of a scalar list point at the memory the spans
 /// name. Every span is checked against `memory` (`error.OffsetOutOfRange`), and an enum value, a
-/// union tag or a presence byte that means nothing is `error.InvalidTag`.
-pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error)!T {
+/// union tag or a presence byte that means nothing is `error.InvalidTag`. `limited` is null, or
+/// `Limited(Format, serde_cfg, read_cfg)` to hold the rebuild to a read's limits, as `encode` does.
+pub fn fromWire(comptime T: type, comptime limited: ?type, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error || LimitError)!T {
+    var counts: Counts = .{};
+    return rebuild(T, limited, .{}, &counts, allocator, memory, wire);
+}
+
+/// The errors of a rebuild that holds to limits.
+pub const LimitError = error{ LengthOutOfBounds, TooManyItems, CborNestingTooDeep, JsonNestingTooDeep };
+
+/// The list of `Elem` that `wire` names, rebuilt in `allocator` unless it is scalar; `bounds` and `counts` are `fromWire`'s.
+fn rebuildList(comptime Elem: type, comptime limited: ?type, comptime bounds: meta.Bounds, counts: *Counts, allocator: Allocator, memory: Memory, wire: Span) (Allocator.Error || Error || LimitError)![]const Elem {
+    const source = try memory.listOf(Wire(Elem), wire);
+    if (limited) |L| {
+        if (source.len > bounds.max_len) return error.LengthOutOfBounds;
+        if (comptime !isScalarList(Elem)) {
+            counts.items += source.len;
+            if (L.limits.max_items) |budget| if (counts.items > budget) return error.TooManyItems;
+        }
+    }
+    if (comptime isScalarList(Elem)) return source;
+    const items = try allocator.alloc(Elem, source.len);
+    const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
+    for (source, items) |item, *slot| slot.* = try rebuild(Elem, limited, elem_bounds, counts, allocator, memory, item);
+    return items;
+}
+
+fn rebuild(comptime T: type, comptime limited: ?type, comptime bounds: meta.Bounds, counts: *Counts, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error || LimitError)!T {
     @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
         .bool => switch (wire) {
@@ -319,23 +378,22 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
         .byte_string => .{ .bytes = try memory.bytesOf(wire) },
         .raw => .{ .bytes = try memory.bytesOf(wire) },
         .list => blk: {
-            const Elem = @typeInfo(T).pointer.child;
-            const source = try memory.listOf(Wire(Elem), wire);
-            if (comptime isScalarList(Elem)) break :blk source;
-            const items = try allocator.alloc(Elem, source.len);
-            for (source, items) |item, *slot| slot.* = try fromWire(Elem, allocator, memory, item);
-            break :blk items;
+            try enter(limited, counts);
+            defer leave(limited, counts);
+            break :blk try rebuildList(@typeInfo(T).pointer.child, limited, bounds, counts, allocator, memory, wire);
         },
         .array => blk: {
+            try enter(limited, counts);
+            defer leave(limited, counts);
             var out: T = undefined;
-            for (wire, &out) |item, *slot| slot.* = try fromWire(@typeInfo(T).array.child, allocator, memory, item);
+            for (wire, &out) |item, *slot| slot.* = try rebuild(@typeInfo(T).array.child, limited, .{}, counts, allocator, memory, item);
             break :blk out;
         },
         .optional => blk: {
             const Child = @typeInfo(T).optional.child;
             break :blk switch (wire.present) {
                 0 => null,
-                1 => try fromWire(Child, allocator, memory, wire.value),
+                1 => try rebuild(Child, limited, bounds, counts, allocator, memory, wire.value),
                 else => error.InvalidTag,
             };
         },
@@ -349,9 +407,22 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
             break :blk try meta.packedFromInt(T, bits);
         },
         .@"struct" => blk: {
+            // A sorted map is one container, and its entries are not containers of their own.
+            if (comptime typed.isSortedMap(T)) {
+                try enter(limited, counts);
+                defer leave(limited, counts);
+                break :blk .{ .entries = try rebuildList(T.Entry, limited, bounds, counts, allocator, memory, wire.entries) };
+            }
+            const counted = comptime !isSortedEntry(T);
+            if (counted) try enter(limited, counts);
+            defer if (counted) leave(limited, counts);
             var out: T = undefined;
             inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FieldType| {
-                @field(out, name) = try fromWire(FieldType, allocator, memory, @field(wire, name));
+                // The bounds of a sorted map's elements are those of the field that holds the map: they reach the value.
+                const field_bounds: meta.Bounds = comptime if (isSortedEntry(T))
+                    (if (std.mem.eql(u8, name, "value")) bounds else .{})
+                else if (limited) |L| meta.effectiveBounds(T, name, L.serde) else .{};
+                @field(out, name) = try rebuild(FieldType, limited, field_bounds, counts, allocator, memory, @field(wire, name));
             }
             break :blk out;
         },
@@ -359,7 +430,10 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
             inline for (@typeInfo(T).@"union".field_names, @typeInfo(T).@"union".field_types, 0..) |name, PayloadType, index| {
                 if (wire.tag == index) {
                     if (PayloadType == void) break :blk @unionInit(T, name, {});
-                    break :blk @unionInit(T, name, try fromWire(PayloadType, allocator, memory, @field(wire.payload, name)));
+                    try enter(limited, counts);
+                    defer leave(limited, counts);
+                    const payload_bounds: meta.Bounds = comptime if (limited) |L| meta.effectiveBounds(T, name, L.serde) else .{};
+                    break :blk @unionInit(T, name, try rebuild(PayloadType, limited, payload_bounds, counts, allocator, memory, @field(wire.payload, name)));
                 }
             }
             break :blk error.InvalidTag;
@@ -531,7 +605,7 @@ pub const WireSink = struct {
         if (comptime !@hasDecl(T, "check")) return;
         const mark = self.arena.end_index;
         defer self.arena.end_index = mark;
-        const view = try fromWire(T, allocator, self.memory, result.*);
+        const view = try fromWire(T, null, allocator, self.memory, result.*);
         try view.check();
     }
 
@@ -544,6 +618,13 @@ pub const WireSink = struct {
 /// first (the arrays of structs, unions, optionals, enums and arrays; text and scalar lists point at
 /// the memory the spans name), because the writers stream and keep no memory of their own. Every
 /// span is checked against `memory`; `arena` is put back as it was when the write is done.
+///
+/// A wire value that the caller built is bound by no limit, so the rebuild holds to the limits of `read_cfg`, the read config that a
+/// decode of the same type uses (`Limited`): a list longer than its `max_len`, more than `max_items` rebuilt elements (spans may
+/// alias, so one array can be rebuilt many times) and nesting past `max_depth` (a span may name its own container) are refused.
+/// `encodeArenaSize` is then the size of `arena` that is enough for any wire value `encode` accepts, and every list must have a bound
+/// for it (a compile error where one has none). These limits bound the arena; they do not make the output readable under `read_cfg`:
+/// `min_len`, `min`, `max`, a struct's `check` and a `Raw` validator are not applied, and `format_cfg` may differ from what a read expects.
 pub fn encode(
     comptime Format: type,
     comptime T: type,
@@ -553,11 +634,24 @@ pub fn encode(
     writer: *std.Io.Writer,
     comptime serde_cfg: anytype,
     comptime format_cfg: anytype,
+    comptime read_cfg: anytype,
 ) !void {
+    _ = comptime encodeArenaSize(Format, T, serde_cfg, read_cfg);
     const mark = arena.end_index;
     defer arena.end_index = mark;
-    const value = try fromWire(T, arena.allocator(), memory, wire);
+    const value = try fromWire(T, Limited(Format, serde_cfg, read_cfg), arena.allocator(), memory, wire);
     try root.serializeWith(Format, writer, value, serde_cfg, format_cfg);
+}
+
+/// The bytes of the arena that `encode(Format, T, ...)` needs for any wire value it accepts: the rebuild of the whole of `T`
+/// (`rebuildOwned`, with `max_len` and `.elem` of each field and `max_items` and `max_depth` of `read_cfg`). A list without a `max_len`
+/// draws on `max_items`, and with neither it is a compile error.
+pub fn encodeArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype) usize {
+    @setEvalBranchQuota(1_000_000);
+    const limits = comptime limitsOf(Format, read_cfg);
+    const size = comptime listsOf(rebuildOwned(T, .{}, serde_cfg, limits, 0), limits, true);
+    if (size > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
+    return @intCast(size);
 }
 
 /// A wire value as a typed-layer field: reads a `T` through the decode hook, so a message that holds
@@ -1004,11 +1098,14 @@ fn rebuildOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: an
         .optional => rebuildOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
         .pointer => @compileError("a pointer has no wire layout: " ++ @typeName(T)),
         .@"struct" => blk: {
-            if (comptime typed.isSortedMap(T)) break :blk rebuildOwned([]const T.Entry, bounds, cfg, limits, depth);
+            // A sorted map is one container, and the value of an entry is in it, not in an entry: one level below the map.
+            if (comptime typed.isSortedMap(T)) break :blk rebuildOwned([]const T.Entry, bounds, cfg, limits, depth -| 1);
             var total: Cost = .{};
             for (reflect.fields(T, cfg)) |field| {
                 if (field.extras) continue;
-                total = total.plus(rebuildOwned(field.type, field.bounds, cfg, limits, depth + 1));
+                // The `elem` bounds of the field that holds a sorted map reach the value of each entry, as they do in a read.
+                const field_bounds = if (comptime isSortedEntry(T) and std.mem.eql(u8, field.name, "value")) bounds else field.bounds;
+                total = total.plus(rebuildOwned(field.type, field_bounds, cfg, limits, depth + 1));
             }
             break :blk total;
         },
@@ -1033,6 +1130,7 @@ fn checkBytes(comptime T: type, comptime cfg: anytype, comptime limits: Limits, 
         .array => checkBytes(@typeInfo(T).array.child, cfg, limits, depth + 1),
         .optional => checkBytes(@typeInfo(T).optional.child, cfg, limits, depth),
         .@"struct" => blk: {
+            if (comptime typed.isSortedMap(T)) break :blk checkBytes([]const T.Entry, cfg, limits, depth -| 1);
             var most: u64 = 0;
             if (comptime @hasDecl(T, "check")) {
                 if (limits.in_stream and holdsStreamText(T, cfg, limits, depth)) {
@@ -1066,6 +1164,7 @@ fn holdsStreamText(comptime T: type, comptime cfg: anytype, comptime limits: Lim
         .array => holdsStreamText(@typeInfo(T).array.child, cfg, limits, depth + 1),
         .optional => holdsStreamText(@typeInfo(T).optional.child, cfg, limits, depth),
         .@"struct" => blk: {
+            if (comptime typed.isSortedMap(T)) break :blk holdsStreamText([]const T.Entry, cfg, limits, depth -| 1);
             for (reflect.fields(T, cfg)) |field| {
                 if (field.extras) continue;
                 if (@hasDecl(T, "zerde_sorted_entry") and std.mem.eql(u8, field.name, "key")) continue;

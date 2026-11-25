@@ -400,6 +400,10 @@ pub fn build(b: *std.Build) void {
         .{ "tests/compile_fail/stream_check_array.zig", "and this one's struct holds some: stream_check_array.Checked" },
         .{ "tests/compile_fail/stream_check_union.zig", "and this one's struct holds some: stream_check_union.Checked" },
         .{ "tests/compile_fail/stream_check_map.zig", "and this one's struct holds some: stream_check_map.Checked" },
+        .{ "tests/compile_fail/stream_check_depth.zig", "and this one's struct holds some: stream_check_depth.Inner" },
+        .{ "tests/compile_fail/stream_check_depth_in.zig", "and this one's struct holds some: stream_check_depth_in.Checked" },
+        .{ "tests/compile_fail/encode_unbounded.zig", "has no bound a decode can rely on: max_items" },
+        .{ "tests/compile_fail/encode_arena_size_unbounded.zig", "has no bound a decode can rely on: max_items" },
     }) |case| {
         const compile_fail = b.addTest(.{
             .root_module = b.createModule(.{
