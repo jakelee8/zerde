@@ -198,7 +198,9 @@ const KeyOrder = struct {
     zeros: u2 = 0,
 };
 
-pub const Header = struct {
+/// Packed, so a head is copied as whole words: copying its byte fields one by one into a caller that then reads
+/// them as a word stalls the read on every head.
+pub const Header = packed struct {
     major: u8,
     ai: u8,
     value: u64,
@@ -413,8 +415,12 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
             try typed.copyPart(self.writer, value, &state.at);
         }
 
-        pub fn emitEnum(self: *Self, comptime _: type, value: anytype) !void {
-            try writeTextString(self.writer, @tagName(value));
+        pub fn emitEnum(self: *Self, comptime E: type, value: E) !void {
+            if (comptime @typeInfo(E).@"enum".mode == .nonexhaustive) {
+                try encodeText(self.writer, @tagName(value), false);
+            } else switch (value) {
+                inline else => |tag| try writeName(self.writer, @tagName(tag)),
+            }
         }
 
         /// A deterministic map states its length; any other map is indefinite, which keeps the
@@ -443,7 +449,7 @@ pub fn CborSerializer(comptime Config: type, comptime deterministic: bool) type 
         pub fn beginStructField(self: *Self, comptime Parent: type, comptime name: []const u8, comptime FieldType: type) !bool {
             _ = Parent;
             _ = FieldType;
-            try writeTextString(self.writer, name);
+            try writeName(self.writer, name);
             return true;
         }
 
@@ -544,14 +550,24 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// The encoded form of a key, which a type that declares its fields in order is checked against (`typed.assertDeclaredOrder`).
         pub const keyEncoder = encodeKey;
 
+        /// A read whose configuration does not name `mode` is lenient, and one that does not name `max_items` counts no
+        /// items: both are decided when it is compiled, so the default read carries no check for either on each head.
+        const may_be_strict = meta.hasField(Config, "mode");
+        const counts_items = meta.hasField(Config, "max_items");
+
         /// Whether the keys of a map are guaranteed to ascend, so each repeats or follows the one before (a strict read).
         pub fn keysAscend(self: *Self) bool {
-            return self.strict;
+            return self.isStrict();
         }
 
         /// The read accepts only the deterministic encoding (`Mode.strict`): one value, one encoding.
         pub fn isStrict(self: *const Self) bool {
-            return self.strict;
+            return may_be_strict and self.strict;
+        }
+
+        /// Takes back the count of a head that is about to be read again.
+        fn uncountItem(self: *Self) void {
+            if (counts_items) self.items -= 1;
         }
 
         fn initBorrowed(allocator: Allocator, input: []const u8, cfg: Config) Self {
@@ -911,12 +927,12 @@ pub fn CborDeserializer(comptime Config: type) type {
                     const value: i128 = if (header.major == 0) header.value else -@as(i128, header.value) - 1;
                     if (typed.matchStructFieldIndexInteger(T, cfg, value)) |index| return .{ .field_index = index };
                     if (refused) return .unknown;
-                    if (!self.strict) try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
+                    if (!self.isStrict()) try self.keys.append(self.allocator, .{ .kind = if (header.major == 0) .uint else .nint, .a = header.value });
                     return .unknown;
                 },
                 else => {
                     self.index = start;
-                    self.items -= 1;
+                    self.uncountItem();
                     try self.recordKeyItem(self.stack_len);
                     return .unknown;
                 },
@@ -1015,9 +1031,11 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// deterministic encoding does not allow.
         fn nextHead(self: *Self) !Header {
             const header = try parseHeader(self.input, &self.index);
-            self.items += 1;
-            if (self.items > self.max_items) return error.TooManyItems;
-            if (self.strict) {
+            if (counts_items) {
+                self.items += 1;
+                if (self.items > self.max_items) return error.TooManyItems;
+            }
+            if (self.isStrict()) {
                 if (header.major == 6) return error.UnexpectedTag;
                 if (header.indefinite or !isShortestHead(header)) return error.NonDeterministicEncoding;
                 if (header.major == 7 and !isPreferredFloat(header)) return error.NonDeterministicEncoding;
@@ -1178,7 +1196,7 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// encoding. `order` is the last key and what the map has of the zeros 0.0 and -0.0, which are
         /// the same key (RFC 8949 section 5.6.1) though they are written differently and need not be neighbours.
         fn checkKeyOrder(self: *Self, order: *KeyOrder, start: usize) !void {
-            if (!self.strict) return;
+            if (!self.isStrict()) return;
             const key = self.input[start..self.index];
             if (order.end != 0) {
                 const before = self.input[order.start..order.end];
@@ -1210,7 +1228,7 @@ pub fn CborDeserializer(comptime Config: type) type {
             const start = self.index;
             const header = try self.nextHead();
             try self.checkFloat(header);
-            if (self.strict) {
+            if (self.isStrict()) {
                 // A deterministic encoding has one form for each key, so equal keys are neighbours (`checkKeyOrder`)
                 // and nothing is recorded. The one equal pair of different forms is 0.0 and -0.0 (RFC 8949 section
                 // 5.6.1): a float key is checked for it there, and a key that holds one inside is refused here.
@@ -1219,7 +1237,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                     2, 3 => try self.skipString(header),
                     else => {
                         self.index = start;
-                        self.items -= 1;
+                        self.uncountItem();
                         const outer = self.zero_float;
                         self.zero_float = false;
                         try self.skipItem(depth);
@@ -1244,7 +1262,7 @@ pub fn CborDeserializer(comptime Config: type) type {
                 else => blk: {
                     // skipItem reads the head again and counts it again.
                     self.index = start;
-                    self.items -= 1;
+                    self.uncountItem();
                     try self.skipItem(depth);
                     const end = self.index;
                     self.index = start;
@@ -1359,7 +1377,7 @@ pub fn CborDeserializer(comptime Config: type) type {
 
         fn recordString(self: *Self, kind: KeyKind, token: StringToken) !void {
             // A strict read compares neighbours and keeps no record.
-            if (self.strict) return;
+            if (self.isStrict()) return;
             if (!token.allocated) {
                 const offset = @intFromPtr(token.bytes.ptr) - @intFromPtr(self.input.ptr);
                 try self.keys.append(self.allocator, .{ .kind = kind, .a = offset, .b = token.bytes.len });
@@ -2221,7 +2239,7 @@ pub fn PullReader(comptime Config: type) type {
             const end = d.index;
             // Read it again as an event; the first read counted it already.
             d.index = start;
-            d.items -= 1;
+            d.uncountItem();
             const event = try self.scalarEvent(kind);
             std.debug.assert(d.index == end);
             try d.orderFrameKey(start);
@@ -2882,8 +2900,11 @@ fn encodeText(writer: *std.Io.Writer, value: []const u8, trusted: bool) !void {
     try writer.writeAll(value);
 }
 
-fn writeTextString(writer: *std.Io.Writer, value: []const u8) !void {
-    try encodeText(writer, value, false);
+/// A text string known when the code is compiled, a field name or an enum name: checked as UTF-8 then, and written
+/// head and text at once.
+fn writeName(writer: *std.Io.Writer, comptime name: []const u8) !void {
+    if (comptime !std.unicode.utf8ValidateSlice(name)) @compileError("the name `" ++ name ++ "` is not valid UTF-8");
+    try writer.writeAll(comptime encodeKey(.{ .text = name }));
 }
 
 fn writeMajorValue(writer: *std.Io.Writer, major: u8, value: anytype) !void {

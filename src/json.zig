@@ -157,6 +157,14 @@ pub fn JsonSerializer(comptime Config: type) type {
             try writeStringText(self.writer, value, readLimitFlag(self.cfg, "trusted_text", false));
         }
 
+        pub fn emitEnum(self: *Self, comptime E: type, value: E) !void {
+            if (comptime @typeInfo(E).@"enum".mode == .nonexhaustive) {
+                try writeEscapedString(self.writer, @tagName(value));
+            } else switch (value) {
+                inline else => |tag| try self.writer.writeAll(comptime quotedName(@tagName(tag))),
+            }
+        }
+
         /// Where the writer is in an extras object (see `beginExtras`).
         pub const ExtrasCursor = struct {
             bytes: []const u8,
@@ -278,8 +286,7 @@ pub fn JsonSerializer(comptime Config: type) type {
             } else {
                 container.first = false;
             }
-            try writeEscapedString(self.writer, name);
-            try self.writer.writeByte(':');
+            try self.writer.writeAll(comptime quotedName(name) ++ ":");
             return true;
         }
 
@@ -1774,6 +1781,31 @@ fn writeQuoted(writer: *std.Io.Writer, bytes: []const u8) !void {
     try writer.writeByte('"');
 }
 
+/// The string literal of a name known when the code is compiled, a field name or an enum name: checked as UTF-8 and
+/// escaped then, so writing it is one copy.
+fn quotedName(comptime name: []const u8) []const u8 {
+    if (!std.unicode.utf8ValidateSlice(name)) @compileError("the name `" ++ name ++ "` is not valid UTF-8");
+    const literal = comptime blk: {
+        var buffer: [2 + 6 * name.len]u8 = undefined;
+        buffer[0] = '"';
+        var len: usize = 1;
+        for (name) |c| {
+            if (c == '"' or c == '\\' or c < 0x20) {
+                len += bulk.escapeInto(buffer[len..][0..6], c);
+            } else {
+                buffer[len] = c;
+                len += 1;
+            }
+        }
+        buffer[len] = '"';
+        len += 1;
+        var exact: [len]u8 = undefined;
+        @memcpy(&exact, buffer[0..len]);
+        break :blk exact;
+    };
+    return &literal;
+}
+
 fn effectiveMaxInputBytes(comptime cfg: anytype) usize {
     if (comptime meta.hasField(@TypeOf(cfg), "max_input_bytes")) return @field(cfg, "max_input_bytes");
     return 16 * 1024 * 1024;
@@ -1986,10 +2018,16 @@ const Parser = struct {
     }
 
     /// A string's raw bytes between escapes must be UTF-8. Each run is checked alone, which is
-    /// enough: an escape is ASCII, so no code point spans two runs.
-    fn validUtf8(self: *const Parser, bytes: []const u8) Error![]const u8 {
-        if (!self.trusted_text and !bulk.validUtf8(bytes)) return error.InvalidUtf8;
+    /// enough: an escape is ASCII, so no code point spans two runs. A run the scan saw no byte of
+    /// 0x80 or above in (`high`, from `scanString`) is ASCII and needs no check.
+    fn validUtf8(self: *const Parser, bytes: []const u8, high: bool) Error![]const u8 {
+        if (high and !self.trusted_text and !bulk.validUtf8(bytes)) return error.InvalidUtf8;
         return bytes;
+    }
+
+    /// Moves to the next byte a string cannot hold as it is, setting `high` if a byte on the way is 0x80 or above.
+    fn scanString(self: *Parser, high: *bool) void {
+        self.index = bulk.findStringSpecialNotingHigh(self.input, self.index, high);
     }
 
     // Plain strings borrow from the input; an escaped string is measured first and written once into an
@@ -2007,11 +2045,12 @@ const Parser = struct {
     /// quote): the input's own bytes if it has no escape, else null with `self.index` where the string began.
     fn plainString(self: *Parser) Error!?[]const u8 {
         const start = self.index;
+        var high = false;
         while (true) {
-            self.index = bulk.findStringSpecial(self.input, self.index);
+            self.scanString(&high);
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
-                '"' => return try self.validUtf8(self.input[start .. self.index - 1]),
+                '"' => return try self.validUtf8(self.input[start .. self.index - 1], high),
                 '\\' => {
                     self.index = start;
                     return null;
@@ -2075,18 +2114,20 @@ const Parser = struct {
     fn walkString(self: *Parser, out: anytype) !void {
         const Out = @typeInfo(@TypeOf(out)).pointer.child;
         var run_start = self.index;
+        var high = false;
         while (true) {
-            self.index = bulk.findStringSpecial(self.input, self.index);
+            self.scanString(&high);
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
                 '"', '\\' => {
                     const run = self.input[run_start .. self.index - 1];
-                    try out.put(if (Out.checks) try self.validUtf8(run) else run);
+                    try out.put(if (Out.checks) try self.validUtf8(run, high) else run);
                     if (c == '"') return;
                     var bytes: [4]u8 = undefined;
                     const length = try self.escapeBytes(&bytes);
                     try out.put(bytes[0..length]);
                     run_start = self.index;
+                    high = false;
                 },
                 0...31 => return error.InvalidStringCharacter,
                 else => {},
@@ -2201,16 +2242,17 @@ const Parser = struct {
     fn parseStringShort(self: *Parser, comptime cap: usize, buffer: *[cap]u8) Error!typed.ShortText {
         if (self.consume() != '"') return error.UnexpectedToken;
         var run_start = self.index;
+        var high = false;
         var length: usize = 0;
         var total: usize = 0;
         var long = false;
         var escaped = false;
         while (true) {
-            self.index = bulk.findStringSpecial(self.input, self.index);
+            self.scanString(&high);
             const c = self.consume() orelse return error.UnexpectedEndOfInput;
             switch (c) {
                 '"', '\\' => {
-                    const run = try self.validUtf8(self.input[run_start .. self.index - 1]);
+                    const run = try self.validUtf8(self.input[run_start .. self.index - 1], high);
                     total += run.len;
                     if (c == '"' and !escaped) {
                         if (total > self.max_string_len) return error.StringTooLong;
@@ -2234,6 +2276,7 @@ const Parser = struct {
                         length += count;
                     } else long = true;
                     run_start = self.index;
+                    high = false;
                 },
                 0...31 => return error.InvalidStringCharacter,
                 else => {},
@@ -2273,11 +2316,12 @@ const Parser = struct {
     fn skipStringChecked(self: *Parser) Error!void {
         if (self.consume() != '"') return error.UnexpectedToken;
         const start = self.index;
+        var high = false;
         while (true) {
-            self.index = bulk.findStringSpecial(self.input, self.index);
+            self.scanString(&high);
             switch (self.consume() orelse return error.UnexpectedEndOfInput) {
                 '"' => {
-                    if (!bulk.validUtf8(self.input[start .. self.index - 1])) return error.InvalidUtf8;
+                    if (high and !bulk.validUtf8(self.input[start .. self.index - 1])) return error.InvalidUtf8;
                     return;
                 },
                 '\\' => switch (self.consume() orelse return error.UnexpectedEndOfInput) {

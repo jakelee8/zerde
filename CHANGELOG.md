@@ -65,6 +65,10 @@
 - A struct field name (JSON), a union key, a bare variant name and an enum's name are matched where they are read, in a stack buffer as long as the longest declared name, and are not allocated; ZON reads an enum name the same way.
 - A rewritten string (a JSON string with an escape, a chunked CBOR string, bytes decoded from base64) is measured first and written once into an allocation of exactly its length; a skipped chunked CBOR string is checked and not buffered.
 - CBOR: under `deny_unknown_fields` without `extras`, an undeclared struct key is refused as it is read (`error.UnknownField`), without being checked or recorded.
+- CBOR and JSON write a struct field name and an enum's name as bytes made when the code is compiled, and check them as UTF-8 then, not on every write; a name that is not UTF-8 is a compile error.
+- The JSON reader checks a run of a string as UTF-8 only when the scan for the string's end saw a byte of 0x80 or above in it, so ASCII text takes one pass, not two.
+- The CBOR reader decides strict mode and the `max_items` count when it is compiled: a read config that does not name `mode` or `max_items` carries no check for them on each head. `cbor.Header` is a `packed struct`.
+- `bulk.findStringSpecial` finds the first match in a vector as a bit mask on a little-endian target: `std.simd.firstTrue` took a horizontal minimum, which cost more than the scan at 64 lanes (AVX-512). `bulk.findStringSpecialVector` and `findStringSpecialWords` take a `note_high` parameter and a flag, for `bulk.findStringSpecialNotingHigh`.
 - JSON no longer converts a number it skips, so a number too large for any type in a skipped field is accepted.
 - Ported the library, tests, examples, transcoder CLI and benchmark harness to Zig 0.17.0; `minimum_zig_version` is `0.17.0`, and CI installs it.
 - Adapted the typed reflection layer to the 0.17 `@typeInfo` shape and the ZON backend to the 0.17 `std.zig.Ast`, `Zoir` and `std.zon.Serializer` signatures.

@@ -192,8 +192,9 @@ fn scanBulk(bytes: []const u8, _: *std.Io.Writer) anyerror!usize {
 fn scanWords(bytes: []const u8, _: *std.Io.Writer) anyerror!usize {
     var count: usize = 0;
     var at: usize = 0;
+    var unused = false;
     while (true) {
-        at = zerde.bulk.findStringSpecialWords(bytes, at);
+        at = zerde.bulk.findStringSpecialWords(false, bytes, at, &unused);
         if (at >= bytes.len) return count;
         count += 1;
         at += 1;
@@ -203,8 +204,9 @@ fn scanWords(bytes: []const u8, _: *std.Io.Writer) anyerror!usize {
 /// `writeEscaped` as it was before the direct write: the word scan and one `writeAll` per escape.
 fn escapeBefore(bytes: []const u8, sink: *std.Io.Writer) anyerror!usize {
     var start: usize = 0;
+    var unused = false;
     while (true) {
-        const at = zerde.bulk.findStringSpecialWords(bytes, start);
+        const at = zerde.bulk.findStringSpecialWords(false, bytes, start, &unused);
         if (at > start) try sink.writeAll(bytes[start..at]);
         if (at >= bytes.len) return sink.end;
         switch (bytes[at]) {
