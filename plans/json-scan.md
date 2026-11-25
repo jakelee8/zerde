@@ -76,7 +76,7 @@ vendor is not consulted: the compiler fixes the width from the target CPU.
   its throughput, sets the cost. No published Zen 5 latency figure for a split 64-byte load was found.
 - Candidate 2: code size and layout. Inlining alone moves the parse by 13% (F6: 124.2 against 109.7 ms), more than the
   whole width effect. A wider scan also inlines a larger body at each call site. The two-stage scan adds direct evidence:
-  on the 270 KiB `code 1` text it runs the same 64-byte loop after 64 bytes of 32-byte steps, but out of line, and the
+  on the `code 1` text (`tests/typed_tests.zig`, 493,090 bytes) it runs the same 64-byte loop after 64 bytes of 32-byte steps, but out of line, and the
   row is 0.90 to 0.92 of the inlined loop (`bench/BULK.md`, `2026-11-25 - 4542079`). No per-string latency is involved
   there.
 - The sizes do not match. The parse gap is about 9 ms over 7.57 million strings, about 1.2 ns per string. The
