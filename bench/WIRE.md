@@ -11,7 +11,7 @@ its own before and after, measured in the same session on the same input.
 
 ## 2026-11-24 - 3bd3e6a
 
-New rows: the decode in chunks and the render in windows, against the whole ones, on the fixed corpus of the `2026-11-23 - 41c3439` section (301,382 B of
+New rows: the decode in chunks and the render in windows, against the whole ones, on the fixed corpus of the `2026-11-23 - e343755` section (301,382 B of
 strict CBOR, 195 effects; 358,403 B of JSON). Runs under `flock`, shared machine, so ratios are read, not the absolute times (the unchanged
 whole decode moved between 38 and 64 µs across three runs).
 
@@ -28,9 +28,9 @@ whole decode moved between 38 and 64 µs across three runs).
 - The destination-passing typed read (every format) measured the same as before within the spread: bench-cbor, bench-json and bench-wire
   decode rows, base against this tree, alternating; bench-memory output identical.
 
-## 2026-11-23 - 879332e
+## 2026-11-23 - 4e60dfc
 
-`wire.decode` reads straight into `Wire(T)`, with no typed value and no typed array first.
+`wire.decode` reads straight into `Wire(T)`, with no typed value and no typed array first. Before is `879332e`, after `4e60dfc`.
 
 | Read | Input / effects | Arena used (before, after) | Bound (before, after) | Time (before, after) |
 | --- | --- | --- | --- | --- |
@@ -39,20 +39,20 @@ whole decode moved between 38 and 64 µs across three runs).
 
 - Memory: the arena of a strict CBOR decode falls to a third (29.3 KB to 9.9 KB: 84 to 28 bytes an effect; the typed
   array of unions and the typed puts are gone). In JSON the arena is dominated by the base64 payloads and escaped text
-  that are rewritten (the `2026-11-23 - 41c3439` section), so the saving is the typed array only: 4%.
+  that are rewritten (the `2026-11-23 - e343755` section), so the saving is the typed array only: 4%.
 - Time: strict CBOR is 5 to 18% faster (it no longer walks its list twice); JSON is unchanged within the run-to-run
   spread (0.97 to 1.01 times). The sink adds no cost measured.
 - The corpus grew by four effects between the two rows because the repository's files did; per effect the figures
   above hold.
 
-## 2026-11-23 - 41c3439
+## 2026-11-23 - e343755
 
 A rewritten string (a JSON string with an escape, a chunked CBOR string, base64 bytes) is measured first and
 written once, exactly sized; a base64 string with escapes is decoded from its unescaped text a chunk at a time, so
 its token is never built; a skipped chunked string is checked and not buffered. The corpus here is fixed files
 (`bench/common.zig`, `vendor/zig-bson/src/root.zig`, `bench/BIN.md`), so later rows compare; "json escaped" is the
 same JSON with every `/` written as `\/`, as some producers do. Input 301,382 B and 195 effects in CBOR, 358,403 B
-(358,651 B escaped) in JSON.
+(358,651 B escaped) in JSON. Before is `41c3439`, after `e343755`.
 
 | Read | Arena used (before, after) | Bound (before, after) | Time, two runs (before; after) |
 | --- | --- | --- | --- |
