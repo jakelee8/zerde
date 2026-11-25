@@ -765,6 +765,8 @@ const ScenarioResult = struct {
     std_write_bytes: usize,
     parse_zerde: BenchStats,
     parse_std: BenchStats,
+    value_zerde: BenchStats,
+    value_std: BenchStats,
     write_zerde: BenchStats,
     write_std: BenchStats,
     roundtrip_zerde: BenchStats,
@@ -941,6 +943,51 @@ fn runScenario(io: std.Io, allocator: Allocator, bench_case: *BenchCase) !Scenar
         }
     };
 
+    // The same input into a dynamic value: `zerde.value` against `std.json.Value`, both of which refuse a repeated name.
+    const JsonZerdeValueParse = struct {
+        input: []const u8,
+        arena: std.heap.ArenaAllocator,
+
+        fn init(input: []const u8) @This() {
+            return .{
+                .input = input,
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+
+        pub fn run(self: *@This(), _: Allocator) void {
+            _ = self.arena.reset(.retain_capacity);
+            const value = zerde.value.parseSlice(zerde.json, self.arena.allocator(), self.input) catch @panic("zerde JSON value parse failed");
+            std.mem.doNotOptimizeAway(&value);
+        }
+    };
+
+    const JsonStdValueParse = struct {
+        input: []const u8,
+        arena: std.heap.ArenaAllocator,
+
+        fn init(input: []const u8) @This() {
+            return .{
+                .input = input,
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+
+        pub fn run(self: *@This(), _: Allocator) void {
+            _ = self.arena.reset(.retain_capacity);
+            const value = std.json.parseFromSliceLeaky(std.json.Value, self.arena.allocator(), self.input, .{}) catch @panic("std.json value parse failed");
+            std.mem.doNotOptimizeAway(&value);
+        }
+    };
+
     const JsonZerdeSerialize = struct {
         value: Payload,
         out: std.Io.Writer.Allocating,
@@ -1061,6 +1108,10 @@ fn runScenario(io: std.Io, allocator: Allocator, bench_case: *BenchCase) !Scenar
     defer parse_zerde.deinit();
     var parse_std = JsonStdParse.init(bench_case.json());
     defer parse_std.deinit();
+    var value_zerde = JsonZerdeValueParse.init(bench_case.json());
+    defer value_zerde.deinit();
+    var value_std = JsonStdValueParse.init(bench_case.json());
+    defer value_std.deinit();
     var write_zerde = JsonZerdeSerialize.init(bench_case.zerde_value);
     defer write_zerde.deinit();
     var write_std = JsonStdSerialize.init(bench_case.std_value);
@@ -1076,6 +1127,8 @@ fn runScenario(io: std.Io, allocator: Allocator, bench_case: *BenchCase) !Scenar
         .std_write_bytes = bench_case.stdJson().len,
         .parse_zerde = try runZbenchParam(io, allocator, "json parse zerde", &parse_zerde, bench_case.scenario.parse_iterations),
         .parse_std = try runZbenchParam(io, allocator, "json parse std", &parse_std, bench_case.scenario.parse_iterations),
+        .value_zerde = try runZbenchParam(io, allocator, "json value parse zerde", &value_zerde, bench_case.scenario.parse_iterations),
+        .value_std = try runZbenchParam(io, allocator, "json value parse std", &value_std, bench_case.scenario.parse_iterations),
         .write_zerde = try runZbenchParam(io, allocator, "json write zerde", &write_zerde, bench_case.scenario.write_iterations),
         .write_std = try runZbenchParam(io, allocator, "json write std", &write_std, bench_case.scenario.write_iterations),
         .roundtrip_zerde = try runZbenchParam(io, allocator, "json roundtrip zerde", &roundtrip_zerde, bench_case.scenario.roundtrip_iterations),
@@ -1216,6 +1269,14 @@ fn printScenarioResult(scenario: Scenario, result: ScenarioResult) void {
     std.debug.print("  parse std.json: {d:.2} ns/op, {d:.2} MiB/s\n", .{
         result.parse_std.nsPerOp(),
         result.parse_std.mibPerSec(result.parse_bytes),
+    });
+    std.debug.print("  value parse  zerde: {d:.2} ns/op, {d:.2} MiB/s\n", .{
+        result.value_zerde.nsPerOp(),
+        result.value_zerde.mibPerSec(result.parse_bytes),
+    });
+    std.debug.print("  value parse std.json: {d:.2} ns/op, {d:.2} MiB/s\n", .{
+        result.value_std.nsPerOp(),
+        result.value_std.mibPerSec(result.parse_bytes),
     });
     std.debug.print("  write  zerde: {d:.2} ns/op, {d:.2} MiB/s\n", .{
         result.write_zerde.nsPerOp(),
