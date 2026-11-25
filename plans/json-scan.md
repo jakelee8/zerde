@@ -59,9 +59,10 @@ consulted at run time: the width is fixed when the code is compiled, from the ta
 
 - The compiled scan is the same instruction sequence at 32 and 64 bytes with wider registers (`tmp/simd/dis.zig`,
   objdump). Code size per inlined call site and instruction encoding length were not compared. Whole-run instruction
-  counts: 34.98 G (64) against 34.88 G (16-byte cap), 0.3% apart; cycles 1.944 against 1.774 s, about 10% apart.
+  counts: 34.98 G (64) against 34.88 G (16-byte cap), 0.3% apart; cycles 1.944 to 1.948 against 1.769 to 1.774 s over
+  two profiled runs each (the stored experiments `w-e07eb8c.er` and `w-expC.er` are the second), about 10% apart.
 - In the hottest parse function (`typed.deserializeStruct`) the vector and mask instructions take 0.20 s of cycles at 64
-  against 0.09 s at 16, about 0.11 s of the 0.17 s gap; the rest is not attributed. Other functions moved in both
+  against 0.09 s at 16, about 0.11 s of the 0.17 to 0.18 s gap; the rest is not attributed. Other functions moved in both
   directions between the two builds (`readBool` 0.057 s at 64 against 0.082 s at 16; `startObjectKey` 0.057 against
   0.088 s) because the builds inline differently, so per-function figures do not compare across them. A core-wide
   slowdown, such as the Zen 5 AVX-512 IPC throttling Chips and Cheese measured on this CPU model (link below), is not
