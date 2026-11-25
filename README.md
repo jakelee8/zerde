@@ -116,8 +116,10 @@ Native format examples and browser-oriented wasm examples live in [`examples/`](
 Add `zerde` as a Zig dependency:
 
 ```sh
-zig fetch --save git+https://github.com/leostera/zerde#0.1.0
+zig fetch --save git+https://github.com/jakelee8/zerde#feat/zig-package
 ```
+
+`zig fetch --save` writes the commit URL and the package hash into your `build.zig.zon`; pin the commit, not the branch name, once it is there.
 
 Then import it from your `build.zig`:
 
