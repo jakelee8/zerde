@@ -17,6 +17,26 @@ and a byte-wise loop.
 61 bytes) and `multibyte` (the euro sign repeated). Three operations: UTF-8 validation, escaping as the
 characters of a JSON string, and finding the next byte a JSON string cannot hold as it is.
 
+## 2026-11-24 - 52757c8
+
+Changes since previous run: the windowed JSON escape (`json.writeEscapedPart`) writes an escape straight into the window
+instead of through a temporary, and `resumable.Render` skips the UTF-8 check of each text it writes, which its first window
+has already made. New rows on `escapes6` (270 KiB of `a`..`z` with every sixth byte a `"`): "escape, 64 KiB windows"
+(the windowed escape, trusted, against `escapeBulk` into one buffer) and "render, 64 KiB windows" (`resumable.Render`
+against the pull reader into the JSON value writer). The "bulk" column is the windowed path, "std" the whole-buffer one.
+
+"Before" is `ea4de6f` (the rows, unchanged code), "after" `52757c8`; three runs each, alternating, under one `flock`, on a
+shared 24-core WSL2 machine. µs per operation, run 1 / run 2 / run 3.
+
+| Row | Before: windowed | Before: whole | After: windowed | After: whole |
+| --- | ---: | ---: | ---: | ---: |
+| escape, 64 KiB windows | 610 / 591 / 649 | 554 / 551 / 544 | 579 / 601 / 582 | 550 / 584 / 557 |
+| render, 64 KiB windows | 619 / 603 / 589 | 577 / 564 / 564 | 620 / 592 / 602 | 577 / 573 / 574 |
+
+The windowed escape gains a few percent (0.84 to 0.93 of the whole-buffer speed before, 0.95 to 0.97 after); the render
+moves within the run-to-run spread, so the check it no longer repeats was not a measurable part of its cost here. Both
+windowed paths are within 10% of the whole-buffer ones.
+
 ## 2026-11-24 - ad684a0
 
 Changes since previous run: the JSON value writer no longer measures a key, text or byte string (`escapedLen`, a second scan of
