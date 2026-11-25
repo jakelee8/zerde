@@ -64,8 +64,8 @@ zig build bench-wire -Doptimize=ReleaseFast
 Benchmark workflow and benchmark-log conventions live in [bench/README.md](bench/README.md).
 That file also defines benchmark fairness policy: time the full public usage path, including any mandatory intermediate-representation conversion required by a compared library.
 The timing runner itself is built on `zBench`.
-GitHub Actions mirrors this setup with `.github/workflows/ci.yml` for `zig build test`, the mutant patterns
-(`python3 tests/mutants.py --check`), native library, wasm library, transcoder, example, and benchmark-harness builds, and
+GitHub Actions mirrors this setup with `.github/workflows/ci.yml`, which runs `zig build test`, the mutant check
+(`python3 tests/mutants.py --check`) and builds of the native library, wasm library, transcoder, examples and benchmark harness, and
 `.github/workflows/bench.yml` for full per-format benchmark runs on `main` and
 manual dispatches.
 Tagged commits on `main` are published through `.github/workflows/release.yml`.
@@ -108,7 +108,7 @@ When adding invalid fixtures:
 - invalid-input tests that assert parse failure without leaks
 - typed-layer behaviour tests for the formats that carry untrusted bodies (`tests/typed_tests.zig`): byte strings, unions, optional fields, integer keys, strict and lenient input, and duplicate keys
 
-`tests/mutants.py` removes or weakens one guard at a time and checks that `zig build test` fails. Add a mutant for each new guard and run `python3 tests/mutants.py` (or `python3 tests/mutants.py 12 13` for some) before committing; do not commit while it runs, because it edits `src/`. `python3 tests/mutants.py --check` lists the patterns the source no longer contains, and CI runs it.
+`tests/mutants.py` removes or weakens one guard at a time and checks that `zig build test` fails. Add a mutant for each new guard. Run `python3 tests/mutants.py` (or `python3 tests/mutants.py 12 13` for selected mutants) before you commit. Do not commit while it runs, because it edits `src/`. `python3 tests/mutants.py --check` lists the patterns that the source no longer contains. CI runs it.
 
 When changing parser behavior or adding a new format, keep the valid corpus,
 invalid corpus, and fuzz coverage aligned.

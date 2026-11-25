@@ -32,9 +32,9 @@ This run uses the baseline library's MessagePack output as the shared parse inpu
 
 The whole branch against its base, on the default path (no new option set).
 
-Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-msgpack -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+Base is `03beb0e` (`origin/zig-0.17`); tip is `52757c8` (`fix/library-review`). Environment: `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`. Command: `zig build bench-msgpack -Doptimize=ReleaseFast` under one `flock`, three runs each, alternating base and tip suite by suite. Load average was 2 to 10. The comparison library's rows control for machine load.
 
-Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+The repeated-key change (`5870942`) adds a key record to an untyped read and to each unknown member that a typed read skips. MessagePack and BSON also walk each skipped value. This payload has no unknown members and these rows read no untyped value, so none of that cost shows here. The `5870942` entry in `bench/JSON.md` gives the untyped cost.
 
 | Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
@@ -59,7 +59,7 @@ Expected from the repeated-key change (`5870942`): a key record in an untyped re
 
 Notes:
 
-- The zerde parse is faster (0.86 to 1.01), the write unchanged (0.93 to 1.13) and the roundtrip faster (0.89 to 1.03); `msgpack.zig` moved 0.93 to 1.22. No default-path cost.
+- The zerde parse is 0.86 to 1.01 of the base, the write 0.93 to 1.13 and the roundtrip 0.89 to 1.03; `msgpack.zig` moved 0.93 to 1.22. There is no default-path cost.
 
 ## 2026-04-21 - 500513c
 
