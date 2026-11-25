@@ -41,11 +41,14 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
   struct type.
 - A field override on a packed struct field that only applies to structs (`rename_all`, `fields`) is a compile error.
   `min`/`max` bounds stay refused as for any struct (the existing compile error).
-- On the wire the backing integer is widened to the smallest of `u8`, `u16`, `u32` and `u64` that holds it, as an
-  enum's is (`EnumInt`, `wire.zig:109-124`), so `packed struct(u3)` has a wire form; a backing integer wider than 64
-  bits is a compile error naming that rule. `fromWire` narrows with `std.math.cast` to the backing type and refuses a
-  value with a bit above the backing width with the same error, before `packedFromInt`. The typed read reads the
-  backing type itself through the integer arm, which refuses a number outside that type's range with
+- On the wire the backing integer is widened, keeping its signedness, to the smallest of `u8`, `u16`, `u32` and `u64`
+  (`i8` to `i64` for a signed backing, as `std.os.linux.SCHED`, `packed struct(i32)`, has) that holds it, as an enum's
+  is (`EnumInt`, `wire.zig:109-124`), so `packed struct(u3)` has a wire form and `packed struct(i32)` keeps its negative
+  values; a backing integer wider than 64 bits is a compile error naming that rule. The widening is the integer's own
+  value (zero- or sign-extension), so the backing's bits come back unchanged. `fromWire` narrows with `std.math.cast`
+  between the two integers of the same signedness, which refuses exactly a value outside the backing's range (for
+  `u3` a set bit above bit 2; for `i3` anything outside -4..3), with the packed refusal's error, before `packedFromInt`.
+  The typed read reads the backing type itself through the integer arm, which refuses a number outside that type's range with
   `error.IntegerOverflow`, as it does for any integer field; that error stays, and the docs name both: `IntegerOverflow`
   for a number too wide, the packed refusal for a pattern the type does not define.
 
@@ -55,9 +58,10 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
 **Acceptance.** Round trips of a `packed struct(u8)` field with padding in every format; the wire form is the backing
 integer (bytes compared); refused on read and on `fromWire`: a set padding bit, an exhaustive-enum field's unnamed
 pattern (`packed struct(u8){ mode: enum(u2){ a, b, c }, _: u6 }` with mode bits 3), the same inside a nested packed
-struct, and for a `packed struct(u3)` a wire `u8` of `0x20` and a read number of 32; an object where the integer is due
-is refused; `regionSizes` of a type holding one equals that of the same type with a `u8` field; mutants for each refusal
-and for the dispatch.
+struct, and for a `packed struct(u3)` a wire `u8` of `0x20` and a read number of 32; a `packed struct(i32)` with a
+negative backing value round-trips in every format and through `toWire`/`fromWire`, and a `packed struct(i3)` refuses a
+wire `i8` of `-5`; an object where the integer is due is refused; `regionSizes` of a type holding one equals that of the
+same type with a `u8` field; mutants for each refusal and for the dispatch.
 
 ## (b) `regionSizes` does not count the rebuild a `check` needs
 
