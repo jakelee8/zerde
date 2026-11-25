@@ -40,6 +40,8 @@ pub const Kind = enum {
     @"enum",
     /// A struct; see `fields`.
     @"struct",
+    /// A `packed struct`: one integer, its backing integer (`backing`), whatever its fields are.
+    @"packed",
     /// A tagged union; see `variants`.
     @"union",
     /// A type with a `zerdeDecode` or `zerdeEncode` hook: its wire form is its own.
@@ -65,7 +67,7 @@ pub fn kindOf(comptime T: type) Kind {
             .slice => if (info.child == u8) .text else .list,
             else => .pointer,
         },
-        .@"struct" => if (T == typed.ByteString) .byte_string else if (typed.isRaw(T)) .raw else .@"struct",
+        .@"struct" => if (T == typed.ByteString) .byte_string else if (typed.isRaw(T)) .raw else if (meta.isPacked(T)) .@"packed" else .@"struct",
         else => @compileError("zerde has no wire form for " ++ @typeName(T)),
     };
 }
@@ -103,6 +105,7 @@ pub fn fields(comptime T: type, comptime cfg: anytype) []const FieldInfo {
             .@"struct" => |s| s,
             else => @compileError("fields needs a struct: " ++ @typeName(T)),
         };
+        if (meta.isPacked(T)) @compileError("a packed struct is one integer and has no members: " ++ @typeName(T));
         var out: [info.field_names.len]FieldInfo = undefined;
         for (info.field_names, info.field_types, info.field_attrs, 0..) |name, FieldType, attrs, index| {
             out[index] = .{
@@ -215,6 +218,12 @@ pub fn enumInfo(comptime T: type, comptime cfg: anytype) EnumInfo {
 /// The smallest and largest value of integer type `T`.
 pub fn intRange(comptime T: type) struct { min: i128, max: i128 } {
     return .{ .min = std.math.minInt(T), .max = std.math.maxInt(T) };
+}
+
+/// The integer a packed struct is on the wire (kind `.@"packed"`).
+pub fn backing(comptime T: type) type {
+    if (!meta.isPacked(T)) @compileError("backing needs a packed struct: " ++ @typeName(T));
+    return meta.PackedInt(T);
 }
 
 /// The type a `[N]T` or `[]const T` or `?T` or `*const T` holds.

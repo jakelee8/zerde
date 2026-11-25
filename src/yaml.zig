@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const typed = @import("typed.zig");
+const meta = @import("meta.zig");
 const read_impl = @import("yaml_read.zig");
 const root = @import("root.zig");
 const diagnostic_mod = @import("diagnostic.zig");
@@ -271,6 +272,7 @@ pub fn YamlSerializer(comptime Config: type) type {
                     }
                 },
                 .@"enum" => try self.writeScalarString(@tagName(value)),
+                .@"struct" => if (comptime meta.isPacked(T)) try self.writer.print("{}", .{meta.packedToInt(T, value)}) else return error.UnsupportedYamlInlineType,
                 .array => |info| {
                     if (info.child == u8) {
                         try self.writeScalarString(value[0..]);
@@ -420,7 +422,7 @@ fn isEmptySequence(comptime T: type, value: T) bool {
 
 fn isCompoundType(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .@"struct" => |info| !info.is_tuple,
+        .@"struct" => |info| !info.is_tuple and info.layout != .@"packed",
         .array => |info| info.child != u8 and !isInlineSequenceType(T),
         .pointer => |info| switch (info.size) {
             .one => isCompoundType(info.child),
@@ -445,6 +447,7 @@ fn isInlineSequenceType(comptime T: type) bool {
 fn isInlineSequenceElementType(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .bool, .int, .comptime_int, .float, .comptime_float, .@"enum" => true,
+        .@"struct" => meta.isPacked(T),
         .optional => |info| isInlineSequenceElementType(info.child),
         .array, .pointer => isInlineSequenceType(T),
         else => false,

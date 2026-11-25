@@ -25,6 +25,7 @@
 - `sliceDeserializer` and `readerDeserializer` of CBOR, JSON, MessagePack and BSON allocate while reading. A caller that uses one directly must call `deinit`, also for borrowed input. `parseSlice*`, `deserialize*` and `value.parse*` already do.
 - `cbor.CborSerializer` takes a second comptime parameter after `Config`: `deterministic`. `cbor.serializer` builds the type from the write config.
 - A field `rename` that is not valid UTF-8 is a compile error.
+- `reflect.Kind` has a new value, `.@"packed"`, so a `switch` over every value of it no longer compiles until it handles it.
 
 ### Added
 
@@ -73,6 +74,13 @@
 - `wire.maxArenaSize(Format, T, ...)` is a compile-time upper bound, computed in 64 bits, on what `decode` allocates. `decode` rejects text over twice `max_input_bytes` (`error.InputTooLarge`).
 - `wire.decodeInto(Format, T, output, scratch, base, input, serde_cfg, format_cfg)` decodes into caller byte regions without an allocator. `wire.regionSizes` gives their sizes at compile time.
 - `zerde.typed` is exported: the typed walk, generic over a sink. `typed.TypedSink` builds the Zig value and `wire.WireSink` builds the fixed layout.
+
+#### Packed structs
+
+- A `packed struct` is one integer, its backing integer, in every format and in `wire.Wire(T)` (widened to 8, 16, 32 or 64 bits, with its signedness). It was read as a struct of its fields, so a field of the type could not be read and `Wire(T)` did not compile for a type that held one. A read refuses a pattern the type does not define with `error.InvalidValue` (a set `_` bit, an exhaustive enum field that names no tag, the same in a nested packed struct); a number too wide for the backing integer is `error.IntegerOverflow`. `wire.fromWire` refuses with `error.InvalidValue` (`wire.Error`). The type's own `check` runs after the read. Hooks win.
+- A packed struct with a `packed union` field, or with a `usize`, `isize` or C integer field (in it or in a packed struct nested in it), is a compile error, as is a backing integer of more than 64 bits on the wire, a bound on a field that holds one, and `rename_all` or `fields` on the packed type.
+- `reflect.kindOf` gives `.@"packed"` and `reflect.backing(T)` its integer type.
+- `zig build test` compiles the sources in `tests/compile_fail` and expects each to fail with the error its table in `build.zig` names.
 
 #### Chunked and windowed I/O
 

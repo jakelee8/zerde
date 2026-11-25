@@ -8,7 +8,8 @@
 //! (`typed.deserializeInto`) with `WireSink` assembling `Wire(T)` as it reads, with no `T` between,
 //! so this module has no second set of rules.
 //!
-//!   - an integer and a float are themselves; a bool is a `u8` that must be 0 or 1; an enum is an integer;
+//!   - an integer and a float are themselves; a bool is a `u8` that must be 0 or 1; an enum is an integer; a `packed struct` is its
+//!     backing integer, widened to 8, 16, 32 or 64 bits with its signedness kept;
 //!   - text, a `ByteString`, a `Raw` and a slice are a `Span`: `extern struct { offset: u32, len: u32 }`,
 //!     pointing at the bytes (`len` counts bytes), or at the contiguous `Wire(element)` array the
 //!     decode wrote (`len` counts elements);
@@ -53,6 +54,8 @@ pub const Error = error{
     OffsetOutOfRange,
     /// A union tag or an enum value in a wire value names no variant or value.
     InvalidTag,
+    /// The integer of a packed struct in a wire value is outside its backing integer, or its bits name a value the type does not define.
+    InvalidValue,
     /// The input is longer than the config's `max_input_bytes`, which `maxArenaSize` relies on.
     InputTooLarge,
 };
@@ -80,9 +83,7 @@ pub fn Wire(comptime T: type) type {
             // A layout that is the same on every target has no usize, no C type, and no width that
             // an extern struct refuses.
             const bits = @typeInfo(T).int.bits;
-            const target_sized = T == usize or T == isize or T == c_short or T == c_ushort or T == c_int or T == c_uint or
-                T == c_long or T == c_ulong or T == c_longlong or T == c_ulonglong or T == c_char;
-            if (target_sized or (bits != 8 and bits != 16 and bits != 32 and bits != 64)) {
+            if (meta.isTargetSized(T) or (bits != 8 and bits != 16 and bits != 32 and bits != 64)) {
                 @compileError("a wire integer is u8, u16, u32, u64 or the signed kind, never usize or a C type: " ++ @typeName(T));
             }
             break :blk T;
@@ -100,6 +101,7 @@ pub fn Wire(comptime T: type) type {
         },
         .pointer => @compileError("a pointer has no wire layout (it would be by value, and a recursive type has no size): use a slice, or an optional: " ++ @typeName(T)),
         .@"enum" => EnumInt(T),
+        .@"packed" => PackedWire(T),
         .@"struct" => StructWire(T),
         .@"union" => UnionWire(T),
         .hook, .none => @compileError(@typeName(T) ++ " has no wire layout"),
@@ -122,6 +124,19 @@ fn EnumInt(comptime T: type) type {
             if (low >= std.math.minInt(Candidate) and high <= std.math.maxInt(Candidate)) return Candidate;
         }
         @compileError("an enum value does not fit 64 bits: " ++ @typeName(T));
+    }
+}
+
+/// The integer a packed struct is on the wire: its backing integer widened, keeping its signedness, to the smallest of 8, 16, 32
+/// and 64 bits that holds it (as `EnumInt` does for an enum), since an extern struct refuses `u3`.
+fn PackedWire(comptime T: type) type {
+    comptime {
+        meta.checkPacked(T);
+        const backing = @typeInfo(meta.PackedInt(T)).int;
+        for ([_]u16{ 8, 16, 32, 64 }) |bits| {
+            if (backing.bits <= bits) return @Int(backing.signedness, bits);
+        }
+        @compileError("a packed struct on the wire has a backing integer of at most 64 bits: " ++ @typeName(T));
     }
 }
 
@@ -263,6 +278,7 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
             break :blk out;
         },
         .@"enum" => @intCast(@backingInt(value)),
+        .@"packed" => @intCast(meta.packedToInt(T, value)),
         .@"struct" => blk: {
             var out: Wire(T) = undefined;
             inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FieldType| {
@@ -326,6 +342,11 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
         .@"enum" => blk: {
             const tag = std.math.cast(@typeInfo(T).@"enum".tag_type, wire) orelse break :blk error.InvalidTag;
             break :blk std.enums.fromInt(T, tag) orelse error.InvalidTag;
+        },
+        // The wire integer is the backing integer's own value, widened: a value outside its range is no bit pattern of the type.
+        .@"packed" => blk: {
+            const bits = std.math.cast(meta.PackedInt(T), wire) orelse break :blk error.InvalidValue;
+            break :blk try meta.packedFromInt(T, bits);
         },
         .@"struct" => blk: {
             var out: T = undefined;
@@ -433,7 +454,11 @@ pub const WireSink = struct {
     }
 
     pub fn scalar(_: WireSink, comptime T: type, value: T) !Wire(T) {
-        return if (comptime reflect.kindOf(T) == .bool) @intFromBool(value) else value;
+        return switch (comptime reflect.kindOf(T)) {
+            .bool => @intFromBool(value),
+            .@"packed" => @intCast(meta.packedToInt(T, value)),
+            else => value,
+        };
     }
 
     pub fn text(self: WireSink, comptime _: type, bytes: []const u8) !Span {
@@ -949,7 +974,7 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
     // charged down to it and no further.
     if (depth > limits.max_depth) return .{};
     return switch (comptime reflect.kindOf(T)) {
-        .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
+        .bool, .int, .float, .byte_array, .@"enum", .@"packed", .hook, .none => .{},
         .text => blk: {
             // A strict read has only definite strings, which it never rewrites: they are spans of the input.
             if (limits.strict and (!limits.copy or limits.in_stream)) break :blk .{};

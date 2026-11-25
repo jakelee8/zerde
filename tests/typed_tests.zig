@@ -8746,3 +8746,291 @@ test "a resumable write normalizes -0.0 and refuses a Raw that holds it, for any
     const raw_min = zerde.resumable.Writer(zerde.cbor, Boxed, .{}, cfg).min_window;
     try std.testing.expectError(error.NegativeZero, writeInWindows(zerde.cbor, Boxed, holds, .{}, cfg, raw_min + 8));
 }
+
+// ---- a packed struct is one integer ---------------------------------------------------------------------------
+
+const Access = enum(u2) { none, read, write };
+const PackedFlags = packed struct(u8) { read: bool = false, write: bool = false, level: u3 = 0, _: u3 = 0 };
+const PackedMode = packed struct(u8) { mode: Access = .none, _: u6 = 0 };
+const PackedInner = packed struct(u4) { mode: Access = .none, _: u2 = 0 };
+const PackedOuter = packed struct(u8) { inner: PackedInner = .{}, extra: u4 = 0 };
+const PackedSigned = packed struct(i32) { low: u16 = 0, high: i16 = 0 };
+const PackedSmall = packed struct(u3) { a: u1 = 0, b: u2 = 0 };
+const PackedNegative = packed struct(i3) { a: i3 = 0 };
+
+fn PackedHolder(comptime P: type) type {
+    return struct { id: u8, held: P, many: []const P };
+}
+
+/// `value` is written and read back as itself in every format, through the typed read, a list of the type included.
+fn expectPackedRoundTrips(comptime P: type, value: P, other: P) !void {
+    const H = PackedHolder(P);
+    const many = [_]P{ value, other, value };
+    const holder: H = .{ .id = 7, .held = value, .many = &many };
+    inline for (.{ zerde.bin, zerde.bson, zerde.cbor, zerde.json, zerde.msgpack, zerde.toml, zerde.yaml, zerde.zon }) |Format| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try zerde.serializeWith(Format, &out.writer, holder, .{}, .{});
+        const back = try Format.parseSlice(H, allocator, out.written());
+        defer zerde.free(allocator, back);
+        try std.testing.expectEqual(holder.id, back.id);
+        try std.testing.expectEqual(value, back.held);
+        try std.testing.expectEqualSlices(P, holder.many, back.many);
+    }
+}
+
+test "a packed struct field round trips in every format, as its backing integer" {
+    try expectPackedRoundTrips(PackedFlags, .{ .read = true, .level = 5 }, .{ .write = true, .level = 7 });
+    try expectPackedRoundTrips(PackedMode, .{ .mode = .write }, .{});
+    try expectPackedRoundTrips(PackedOuter, .{ .inner = .{ .mode = .read }, .extra = 9 }, .{ .extra = 15 });
+    try expectPackedRoundTrips(PackedSmall, .{ .a = 1, .b = 3 }, .{});
+    // A negative backing value keeps its sign.
+    try expectPackedRoundTrips(PackedSigned, .{ .low = 0xffff, .high = -3 }, .{ .high = -32768 });
+    try expectPackedRoundTrips(PackedNegative, .{ .a = -4 }, .{ .a = 3 });
+}
+
+test "a packed struct is written as the integer it holds, and nothing else" {
+    const Packed = struct { flags: PackedFlags, signed: PackedSigned, many: []const PackedSigned, maybe: ?PackedFlags };
+    const Plain = struct { flags: u8, signed: i32, many: []const i32, maybe: ?u8 };
+    const value: PackedFlags = .{ .read = true, .write = true, .level = 5 };
+    const bits: u8 = @backingInt(value);
+    try std.testing.expectEqual(@as(u8, 0b10111), bits);
+    const signed: PackedSigned = .{ .low = 4, .high = -1 };
+    const list = [_]PackedSigned{ signed, .{}, .{ .low = 9 } };
+    const ints = [_]i32{ @backingInt(list[0]), 0, 9 };
+    try std.testing.expect(ints[0] < 0);
+    inline for (.{ zerde.bin, zerde.bson, zerde.cbor, zerde.json, zerde.msgpack, zerde.toml, zerde.yaml, zerde.zon }) |Format| {
+        var packed_out: std.Io.Writer.Allocating = .init(allocator);
+        defer packed_out.deinit();
+        var plain_out: std.Io.Writer.Allocating = .init(allocator);
+        defer plain_out.deinit();
+        // TOML has no null, so its optional is present.
+        try zerde.serializeWith(Format, &packed_out.writer, Packed{ .flags = value, .signed = signed, .many = &list, .maybe = value }, .{}, .{});
+        try zerde.serializeWith(Format, &plain_out.writer, Plain{ .flags = bits, .signed = ints[0], .many = &ints, .maybe = bits }, .{}, .{});
+        try std.testing.expectEqualSlices(u8, plain_out.written(), packed_out.written());
+    }
+    // rename_all renames the field that holds it, and there is no `_` member left to rename.
+    try expectJsonText("{\"Flags\":23}", struct { flags: PackedFlags }{ .flags = value }, .{ .rename_all = .PascalCase }, .{});
+}
+
+test "a packed struct that names a pattern the type does not define is refused, in each place it is read" {
+    const Flag = struct { flags: PackedFlags };
+    const Moded = struct { m: PackedMode };
+    const Outer = struct { o: PackedOuter };
+    const Small = struct { s: PackedSmall };
+    // A set padding bit; a number too wide for the backing integer is an overflow, not an undefined pattern.
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Flag, allocator, "{\"flags\":32}"));
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Flag, allocator, "{\"flags\":128}"));
+    try std.testing.expectError(error.IntegerOverflow, zerde.json.parseSlice(Flag, allocator, "{\"flags\":256}"));
+    try std.testing.expectError(error.IntegerOverflow, zerde.json.parseSlice(Small, allocator, "{\"s\":32}"));
+    try std.testing.expectEqual(@as(u8, 3), (try zerde.json.parseSlice(Flag, allocator, "{\"flags\":13}")).flags.level);
+    // An exhaustive enum field whose bits name no tag, alone and inside a nested packed struct (field by field).
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Moded, allocator, "{\"m\":3}"));
+    try std.testing.expectEqual(Access.write, (try zerde.json.parseSlice(Moded, allocator, "{\"m\":2}")).m.mode);
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Outer, allocator, "{\"o\":3}"));
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Outer, allocator, "{\"o\":4}"));
+    try std.testing.expectEqual(@as(u4, 15), (try zerde.json.parseSlice(Outer, allocator, "{\"o\":242}")).o.extra);
+    // An object where the integer is due.
+    try std.testing.expectError(error.InvalidNumber, zerde.json.parseSlice(Flag, allocator, "{\"flags\":{\"read\":true}}"));
+    try std.testing.expectError(error.InvalidNumber, zerde.json.parseSlice(struct { flags: u8 }, allocator, "{\"flags\":{\"read\":true}}"));
+    try std.testing.expectError(error.UnexpectedType, zerde.cbor.parseSlice(Flag, allocator, &.{ 0xa1, 0x65, 'f', 'l', 'a', 'g', 's', 0xa0 }));
+    // The same in CBOR, MessagePack and BSON, which read the integer by their own rules.
+    try std.testing.expectError(error.InvalidValue, zerde.cbor.parseSlice(Flag, allocator, &.{ 0xa1, 0x65, 'f', 'l', 'a', 'g', 's', 0x18, 0x20 }));
+    try std.testing.expectError(error.InvalidValue, zerde.msgpack.parseSlice(Flag, allocator, &.{ 0x81, 0xa5, 'f', 'l', 'a', 'g', 's', 0x20 }));
+}
+
+test "a packed struct is refused in a resumable read, and a resumable write is the whole write" {
+    const Flag = struct {
+        flags: PackedFlags,
+        mode: PackedMode,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict };
+    try expectChunked(Flag, .{}, strict_read, .{ .flags = .{ .write = true, .level = 6 }, .mode = .{ .mode = .read } });
+    try expectWindows(zerde.cbor, Flag, .{ .flags = .{ .write = true, .level = 6 }, .mode = .{ .mode = .read } }, .{}, .{ .deterministic = true });
+    try expectWindows(zerde.json, Flag, .{ .flags = .{ .write = true, .level = 6 }, .mode = .{ .mode = .read } }, .{}, .{});
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const bad_padding = [_]u8{ 0xa2, 0x64, 'm', 'o', 'd', 'e', 0x00, 0x65, 'f', 'l', 'a', 'g', 's', 0x18, 0x20 };
+    const bad_tag = [_]u8{ 0xa2, 0x64, 'm', 'o', 'd', 'e', 0x03, 0x65, 'f', 'l', 'a', 'g', 's', 0x00 };
+    try std.testing.expectError(error.InvalidValue, readInChunks(Flag, .{}, strict_read, arena_state.allocator(), &bad_padding, &.{ 9, 14 }));
+    try std.testing.expectError(error.InvalidValue, readInChunks(Flag, .{}, strict_read, arena_state.allocator(), &bad_tag, &.{ 3, 8 }));
+}
+
+const PackedChecked = packed struct(u8) {
+    low: u4,
+    high: u4,
+    pub fn check(self: PackedChecked) !void {
+        if (self.low > self.high) return error.LowAboveHigh;
+    }
+};
+
+const PackedHooked = packed struct(u8) {
+    value: u8,
+
+    /// Written as `[value]`, so the integer form cannot be what is on the wire.
+    pub fn zerdeEncode(self: PackedHooked, encoder: anytype) anyerror!void {
+        try encoder.beginArray(1);
+        try encoder.writeInt(self.value);
+        try encoder.endArray();
+    }
+
+    pub fn zerdeDecode(_: std.mem.Allocator, reader: anytype) anyerror!PackedHooked {
+        if (((try reader.next()) orelse return error.UnexpectedEndOfInput) != .array_begin) return error.UnexpectedType;
+        const value: u8 = switch ((try reader.next()) orelse return error.UnexpectedEndOfInput) {
+            .integer => |n| std.math.cast(u8, n) orelse return error.IntegerOverflow,
+            else => return error.UnexpectedType,
+        };
+        if (((try reader.next()) orelse return error.UnexpectedEndOfInput) != .array_end) return error.LengthMismatch;
+        return .{ .value = value };
+    }
+};
+
+test "a packed struct with a check is checked on every read, and one with hooks keeps them" {
+    const Doc = struct {
+        range: PackedChecked,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const ok = try zerde.json.parseSlice(Doc, allocator, "{\"range\":33}");
+    try std.testing.expectEqual(@as(u4, 2), ok.range.high);
+    try std.testing.expectError(error.LowAboveHigh, zerde.json.parseSlice(Doc, allocator, "{\"range\":18}"));
+    // Resumable.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict };
+    try std.testing.expectError(error.LowAboveHigh, readInChunks(Doc, .{}, strict_read, arena_state.allocator(), &.{ 0xa1, 0x65, 'r', 'a', 'n', 'g', 'e', 0x12 }, &.{}));
+    // Wire: the decode, and the check of a value that came from outside.
+    var region: Region = .{};
+    var arena = std.heap.FixedBufferAllocator.init(&region.bytes);
+    try std.testing.expectError(error.LowAboveHigh, wire.decode(zerde.json, Doc, &arena, region.base(), "{\"range\":18}", .{}, .{}));
+    const sink: wire.WireSink = .{ .base = 0, .memory = region.memory(), .arena = &arena };
+    try std.testing.expectError(error.LowAboveHigh, sink.check(PackedChecked, arena.allocator(), &@as(u8, 0x12)));
+    try sink.check(PackedChecked, arena.allocator(), &@as(u8, 0x21));
+    // A hook wins over the integer form.
+    const Hooks = struct { h: PackedHooked };
+    try expectJsonText("{\"h\":[1]}", Hooks{ .h = .{ .value = 1 } }, .{}, .{});
+    const back = try zerde.json.parseSlice(Hooks, allocator, "{\"h\":[3]}");
+    try std.testing.expectEqual(@as(u8, 3), back.h.value);
+    try std.testing.expectError(error.UnexpectedType, zerde.json.parseSlice(Hooks, allocator, "{\"h\":3}"));
+}
+
+test "a packed struct on the wire is its backing integer, widened, and fromWire refuses what the type does not define" {
+    try std.testing.expect(wire.Wire(PackedFlags) == u8);
+    try std.testing.expect(wire.Wire(PackedSmall) == u8);
+    try std.testing.expect(wire.Wire(PackedSigned) == i32);
+    try std.testing.expect(wire.Wire(PackedNegative) == i8);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var region: Region = .{};
+    const memory = region.memory();
+    const flags: PackedFlags = .{ .read = true, .level = 6 };
+    const as_wire = try wire.toWire(PackedFlags, arena_state.allocator(), region.base(), flags);
+    try std.testing.expectEqual(@as(u8, @backingInt(flags)), as_wire);
+    try std.testing.expectEqual(flags, try wire.fromWire(PackedFlags, arena_state.allocator(), memory, as_wire));
+    // A set padding bit, an exhaustive enum's unnamed pattern, the same one nested.
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedFlags, arena_state.allocator(), memory, 0x20));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedMode, arena_state.allocator(), memory, 3));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedOuter, arena_state.allocator(), memory, 3));
+    // A wire integer outside the backing integer: u3 with a bit above bit 2, and i3 with -5.
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedSmall, arena_state.allocator(), memory, 0x20));
+    try std.testing.expectEqual(PackedSmall{ .a = 1, .b = 3 }, try wire.fromWire(PackedSmall, arena_state.allocator(), memory, 7));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedNegative, arena_state.allocator(), memory, -5));
+    try std.testing.expectEqual(PackedNegative{ .a = -4 }, try wire.fromWire(PackedNegative, arena_state.allocator(), memory, -4));
+    // A negative backing value through the wire and back.
+    const negative: PackedSigned = .{ .low = 1, .high = -2 };
+    const negative_wire = try wire.toWire(PackedSigned, arena_state.allocator(), region.base(), negative);
+    try std.testing.expect(negative_wire < 0);
+    try std.testing.expectEqual(negative, try wire.fromWire(PackedSigned, arena_state.allocator(), memory, negative_wire));
+}
+
+test "a packed struct decodes into the wire layout in every wire format and in a resumable decode" {
+    const Doc = struct {
+        flags: PackedFlags,
+        signed: PackedSigned,
+        many: []const PackedFlags,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 16, .max_items = 16 };
+    const value: Doc = .{ .flags = .{ .write = true, .level = 3 }, .signed = .{ .high = -9 }, .many = &.{ .{ .read = true }, .{ .level = 7 } } };
+    _ = try expectWireChunks(Doc, .{}, read, value);
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const write_cfg = if (Format == zerde.cbor) .{ .deterministic = true } else .{};
+        try zerde.serializeWith(Format, &out.writer, value, .{}, write_cfg);
+        var region: Region = .{};
+        const len = out.written().len;
+        @memcpy(region.bytes[0..len], out.written());
+        var arena = std.heap.FixedBufferAllocator.init(region.bytes[len..]);
+        const cfg = if (Format == zerde.cbor) read else .{ .max_string_len = 16, .max_items = 16 };
+        const decoded = try wire.decode(Format, Doc, &arena, region.base(), region.bytes[0..len], .{}, cfg);
+        try std.testing.expectEqual(@as(u8, @backingInt(value.flags)), decoded.flags);
+        try std.testing.expectEqual(@as(i32, @backingInt(value.signed)), decoded.signed);
+        var back_arena = std.heap.ArenaAllocator.init(allocator);
+        defer back_arena.deinit();
+        const back = try wire.fromWire(Doc, back_arena.allocator(), region.memory(), decoded);
+        try std.testing.expectEqualDeep(value, back);
+        // And written again from the wire layout: the same bytes.
+        var again: std.Io.Writer.Allocating = .init(allocator);
+        defer again.deinit();
+        var scratch: [1024]u8 = undefined;
+        var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
+        try wire.encode(Format, Doc, &scratch_arena, region.memory(), decoded, &again.writer, .{}, write_cfg);
+        try std.testing.expectEqualSlices(u8, out.written(), again.written());
+    }
+}
+
+test "a packed struct has its own reflection kind and no members, and a region the size of the integer's" {
+    try std.testing.expectEqual(zerde.reflect.Kind.@"packed", zerde.reflect.kindOf(PackedFlags));
+    try std.testing.expect(zerde.reflect.backing(PackedFlags) == u8);
+    try std.testing.expect(zerde.reflect.backing(PackedSigned) == i32);
+    const info = comptime zerde.reflect.fields(struct { f: PackedFlags }, .{});
+    try std.testing.expectEqual(zerde.reflect.Kind.@"packed", info[0].kind);
+    const node = comptime wire.describe(struct { f: PackedFlags, g: PackedSigned }, .{});
+    try std.testing.expectEqual(zerde.reflect.Kind.@"packed", node.members[0].node.kind);
+    try std.testing.expectEqual(@as(usize, 1), node.members[0].node.size);
+    try std.testing.expectEqual(@as(usize, 4), node.members[1].node.size);
+    // A type that holds a packed struct costs what the same type with an integer costs.
+    const limits = .{ .deny_unknown_fields = true, .fields = .{ .list = .{ .max_len = 4 } } };
+    const WithPacked = struct {
+        f: PackedFlags,
+        list: []const PackedSigned,
+        pub const serde = limits;
+    };
+    const WithInt = struct {
+        f: u8,
+        list: []const i32,
+        pub const serde = limits;
+    };
+    const read = .{ .max_string_len = 8, .max_items = 32 };
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        const packed_sizes = comptime wire.regionSizes(Format, WithPacked, .{}, read);
+        const int_sizes = comptime wire.regionSizes(Format, WithInt, .{}, read);
+        try std.testing.expectEqual(int_sizes, packed_sizes);
+    }
+    try std.testing.expectEqual(@sizeOf(wire.Wire(WithInt)), @sizeOf(wire.Wire(WithPacked)));
+}
+
+test "a packed struct costs a resumable read and write what an integer costs: no frames, no key length" {
+    const Long = packed struct(u8) { a_field_with_a_rather_long_name: u4 = 0, another_long_field_name: u4 = 0 };
+    const WithPacked = struct {
+        one: Long,
+        many: []const PackedSigned,
+        maybe: ?Long = null,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const WithInt = struct {
+        one: u8,
+        many: []const i32,
+        maybe: ?u8 = null,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8 };
+    try std.testing.expectEqual(@sizeOf(zerde.resumable.Decoder(WithInt, .{}, read)), @sizeOf(zerde.resumable.Decoder(WithPacked, .{}, read)));
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        try std.testing.expectEqual(
+            zerde.resumable.Writer(Format, WithInt, .{}, .{}).min_window,
+            zerde.resumable.Writer(Format, WithPacked, .{}, .{}).min_window,
+        );
+    }
+}

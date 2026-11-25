@@ -25,6 +25,10 @@ pub const Error = Allocator.Error || error{
     IntegerOverflow,
     /// A finite input does not fit the target float type, so narrowing would give an infinity.
     FloatOutOfRange,
+    /// A packed struct's bits name a value the type does not define: a set bit of a field named `_`, or the bits of an
+    /// exhaustive-enum field that name no tag, in the struct or one nested in it (`meta.packedFromInt`). A number too wide
+    /// for the backing integer is `IntegerOverflow` instead.
+    InvalidValue,
     InvalidEnumTag,
     LengthMismatch,
     /// A field's length (`min_len`, `max_len`) is outside its bounds.
@@ -357,6 +361,12 @@ fn serializeValue(
         var encoder = serializer.encoder();
         try value.zerdeEncode(&encoder);
         try encoder.finish();
+        return;
+    }
+    // A packed struct is its backing integer, as an enum is its number under `enum_repr = .integer`.
+    if (comptime meta.isPacked(T)) {
+        try reserveRoom(rc, atomic_room);
+        try serializer.emitInteger(meta.packedToInt(T, value));
         return;
     }
     switch (@typeInfo(T)) {
@@ -958,6 +968,18 @@ pub fn deserializeValue(
             return error.HookIncomplete;
         }
         dest.* = decoded;
+        return;
+    }
+    // A packed struct is read as its backing integer (the integer arm below, with its range check), and refused where the
+    // bits name a value the type does not define; its own `check` then runs, as a struct's does.
+    if (comptime meta.isPacked(T)) {
+        const Backing = meta.PackedInt(T);
+        const bits: Backing = if (@hasDecl(DeserializerType, "readInt"))
+            try deserializer.readInt(Backing)
+        else
+            try decodeIntNumber(Backing, try deserializer.readNumber());
+        dest.* = try s.scalar(T, try meta.packedFromInt(T, bits));
+        try s.check(T, allocator, dest);
         return;
     }
     switch (@typeInfo(T)) {
@@ -1976,6 +1998,7 @@ fn deserializeBounded(
     comptime track_diagnostics: bool,
     rc: anytype,
 ) anyerror!void {
+    if (comptime meta.isPacked(T)) @compileError("bounds do not apply to a packed struct, which is one integer: " ++ @typeName(T));
     switch (@typeInfo(T)) {
         .optional => |info| try deserializeOptional(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds, rc),
         .int => {

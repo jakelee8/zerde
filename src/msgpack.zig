@@ -206,6 +206,11 @@ pub fn MsgpackSerializer(comptime Config: type) type {
                     try self.emitEnum(T, value);
                     return true;
                 },
+                .@"struct" => {
+                    if (comptime !meta.isPacked(T)) return false;
+                    try self.emitInteger(meta.packedToInt(T, value));
+                    return true;
+                },
                 .optional => {
                     if (value) |child| return try self.writeInlineValue(@TypeOf(child), child);
                     try self.emitNull();

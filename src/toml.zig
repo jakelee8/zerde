@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const typed = @import("typed.zig");
+const meta = @import("meta.zig");
 const read_impl = @import("toml_read.zig");
 
 pub const ReadConfig = read_impl.ReadConfig;
@@ -257,6 +258,7 @@ pub fn TomlSerializer(comptime Config: type) type {
                 .int, .comptime_int => try writeInteger(self.writer, value),
                 .float, .comptime_float => try writeFloat(self.writer, value),
                 .@"enum" => try writeQuotedEnumTag(self.writer, T, value),
+                .@"struct" => if (comptime meta.isPacked(T)) try writeInteger(self.writer, meta.packedToInt(T, value)) else return error.UnsupportedType,
                 .optional => {
                     if (value) |child| {
                         try self.writeInlineValue(@TypeOf(child), child);
@@ -387,7 +389,7 @@ pub fn serializeWith(
 
 fn isStructType(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .@"struct" => |info| !info.is_tuple,
+        .@"struct" => |info| !info.is_tuple and info.layout != .@"packed",
         .pointer => |info| info.size == .one and isStructType(info.child),
         .optional => |info| isStructType(info.child),
         else => false,
