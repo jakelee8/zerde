@@ -363,10 +363,13 @@ MUTANTS = [
     ("wire.zig", "        for ([_]u16{ 8, 16, 32, 64 }) |bits| {", "        for ([_]u16{ 16, 32, 64 }) |bits| {"),
     ("wire.zig", "        const signed = low < 0;", "        const signed = false;"),
     ("wire.zig", "            break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1), json_spans) };", "            _ = levels;\n            _ = json_spans;\n            break :blk .{ .scratch = growth(n / 2 + 8, 24, 8) };"),
-    ("bulk.zig", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x20)));", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk < @as(Vector, @splat(0x20)));"),
-    ("bulk.zig", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x20)));", "        const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x1f)));"),
-    ("bulk.zig", "            if (mask != 0) return i + @ctz(mask);", "            if (mask != 0) return i + @ctz(mask) + 1;"),
-    ("bulk.zig", "        if (note_high and @reduce(.Or, chunk >= @as(Vector, @splat(0x80)))) high.* = true;", "        _ = 0;"),
+    ("bulk.zig", "    const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x20)));", "    const special = (chunk == @as(Vector, @splat('\"'))) | (chunk < @as(Vector, @splat(0x20)));"),
+    ("bulk.zig", "    const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x20)));", "    const special = (chunk == @as(Vector, @splat('\"'))) | (chunk == @as(Vector, @splat('\\\\'))) | (chunk < @as(Vector, @splat(0x1f)));"),
+    ("bulk.zig", "        if (mask != 0) return i + @ctz(mask);", "        if (mask != 0) return i + @ctz(mask) + 1;"),
+    ("bulk.zig", "    if (note_high and @reduce(.Or, chunk >= @as(Vector, @splat(0x80)))) high.* = true;", "    if (note_high and @reduce(.Or, chunk >= @as(Vector, @splat(0x80))) and false) high.* = true;"),
+    ("bulk.zig", "        if (i + short_width > bytes.len) return findSpecialBytes(note_high, bytes, i, high);", "        if (false) return findSpecialBytes(note_high, bytes, i, high);"),
+    ("bulk.zig", "        if (vectorStep(short_width, note_high, bytes, i, high)) |at| return at;", "        _ = vectorStep(short_width, note_high, bytes, i, high);"),
+    ("bulk.zig", "        i += short_width;\n    }\n    return @call(", "        i += short_width + 1;\n    }\n    return @call("),
     ("bulk.zig", "        if (note_high and word & highs != 0) high.* = true;", "        _ = 0;"),
     ("bulk.zig", "        if (note_high and c >= 0x80) high.* = true;", "        if (note_high and c == 0xff) high.* = true;"),
     ("bulk.zig", "        const spare = writer.buffer.len - writer.end;\n        if (spare >= escape.len) {", "        const spare = writer.buffer.len - writer.end;\n        if (spare > 0) {"),
@@ -730,8 +733,9 @@ MUTANTS = [
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
 # the unreachable else branch of JSON parseStringToken, the compile-time UTF-8 check of a name
 # (`writeName` in cbor.zig, `quotedName` in json.zig), the reset of `high` after an escape in the
-# JSON reader (without it a run is checked that needed no check), and the big-endian branch of the
-# vector scan in bulk.zig, which a little-endian host does not compile.
+# JSON reader (without it a run is checked that needed no check), the big-endian branch of the
+# vector scan in bulk.zig, which a little-endian host does not compile, and `findSpecial`'s choice
+# of the two-stage scan, which changes only speed (the two-stage scan is tested directly).
 
 
 def run(index):

@@ -32,9 +32,9 @@ This run uses a signed-integer and string-signature payload because that is the 
 
 The whole branch against its base, on the default path (no new option set).
 
-Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-bson -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+Base is `03beb0e` (`origin/zig-0.17`); tip is `52757c8` (`fix/library-review`). Environment: `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`. Command: `zig build bench-bson -Doptimize=ReleaseFast` under one `flock`, three runs each, alternating base and tip suite by suite. Load average was 2 to 10. The comparison library's rows control for machine load.
 
-Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+The repeated-key change (`5870942`) adds a key record to an untyped read and to each unknown member that a typed read skips. MessagePack and BSON also walk each skipped value. This payload has no unknown members and these rows read no untyped value, so none of that cost shows here. The `5870942` entry in `bench/JSON.md` gives the untyped cost.
 
 | Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
@@ -59,7 +59,7 @@ Expected from the repeated-key change (`5870942`): a key record in an untyped re
 
 Notes:
 
-- The zerde parse is faster in every pair (0.77 to 0.84): a typed read matches a key to a field where it reads it (`nextObjectFieldIndex`, added with the repeated-key change). Write 0.84 to 1.03, roundtrip 0.91 to 0.97; `zig-bson` moved 0.89 to 1.05. No default-path cost.
+- The zerde parse is faster in every pair (0.77 to 0.84) because a typed read matches a key to a field where it reads it (`nextObjectFieldIndex`, added with the repeated-key change). Write is 0.84 to 1.03 and roundtrip 0.91 to 0.97; `zig-bson` moved 0.89 to 1.05. There is no default-path cost.
 
 ## 2026-04-21 - ced89d0
 

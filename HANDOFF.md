@@ -2,14 +2,22 @@
 
 ## State
 
-`feat/deterministic-cbor` holds the library review (`5032c15`) and the default-path performance fixes (`perf/default-path`, merged at `b9af132`).
-
-- The default-path cost of `plans/api.md` (i) is fixed and recorded there under "Outcome (`e07eb8c`)". Four causes: UTF-8 checks of compile-time names on write, `std.simd.firstTrue` in the 64-lane string scan, CBOR strict and `max_items` checks per head with the `Header` copy stall, and the JSON read UTF-8 check of ASCII runs. The benchmarks are the `2026-11-25 - e07eb8c` sections of `bench/CBOR.md`, `bench/JSON.md` and `bench/BULK.md`.
-- A cheaper JSON check was made. The large JSON parse stays 1.04 to 1.05 of the base when pinned to one core (0.99 to 1.17 in the suite); this is documented as accepted.
-- Checks on `cbb13fc` (same tree as the merge): `zig build test`, `tests/mutants.py --check` (702 mutants, 0 stale), examples, transcode, `bench-build`, and native and wasm32 `build-lib` pass; `zig build test` passes on `b9af132`. Every new or retargeted mutant was run and killed by a test.
+- `feat/deterministic-cbor` is at `d3b15b8`.
+  - `88d8825` merges the two-stage string scan (`4542079`), its benchmark entries and the documentation rewrite.
+  - `9170ead` and `d3b15b8` add the `code 1` out-of-line result from `bench/BULK.md` (`2026-11-25 - 4542079`) to `plans/json-scan.md` F4. Whether to keep them is open.
+- Checks:
+  - On `e2c69b0`: `zig build test`, `tests/mutants.py --check` (705 mutants, 0 stale) and `bench-build` pass.
+  - On `8ab97e4` (same source): examples, transcode, and the native and wasm32 `build-lib` also pass.
+  - `zig build test` passes on `88d8825`.
+- `plan/wire-fixes` is at `64b8ff4`. It holds `plans/wire.md`, a design that is not built yet.
 
 ## Open
 
-1. Gather as a comptime parameter (step 6 of the library review) was measured and not built: no write row moved beyond the spread.
-2. `plans/api.md` (j), BSON element types a typed read does not know, is an open design item.
-3. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change.
+1. The wire plan: build it or not, and settle its three open questions. The design is `plans/wire.md` on `plan/wire-fixes`. Its four items, each one commit, are: (a) a packed struct as its backing integer, (b) the `check` rebuild term in `regionSizes`, (c) an arena bound for `wire.encode` that takes the read limits, (d) `validate_bytes` for `Raw` validators.
+   - A streaming read of a type whose `check` reads text: compile error (proposed), or copy the text into the output.
+   - `wire.encode`: take the read limits as a new parameter (proposed), or write straight from the wire layout.
+   - Validators that allocate: allowed in wire reads with a declared byte bound (proposed), or forbidden.
+   - `plan/wire-fixes` predates the documentation rewrite and the scan change, so `feat/deterministic-cbor` must be merged into it first.
+2. Keep or revert `9170ead` and `d3b15b8` (the F4 addition to `plans/json-scan.md`).
+3. The big-endian branch of `vectorStep` in `src/bulk.zig` compiles for `s390x-linux-gnu` but has not run.
+4. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change.
