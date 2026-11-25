@@ -2,14 +2,14 @@
 
 ## State
 
-`feat/deterministic-cbor` holds the library review (`5032c15`) and the default-path performance fixes (`perf/default-path`, merged at `b9af132`).
+`feat/deterministic-cbor` is at `88d8825`.
 
-- The default-path cost of `plans/api.md` (i) is fixed and recorded there under "Outcome (`e07eb8c`)". Four causes: UTF-8 checks of compile-time names on write, `std.simd.firstTrue` in the 64-lane string scan, CBOR strict and `max_items` checks per head with the `Header` copy stall, and the JSON read UTF-8 check of ASCII runs. The benchmarks are the `2026-11-25 - e07eb8c` sections of `bench/CBOR.md`, `bench/JSON.md` and `bench/BULK.md`.
-- A cheaper JSON check was made. The large JSON parse stays 1.04 to 1.05 of the base when pinned to one core (0.99 to 1.17 in the suite); this is documented as accepted.
-- Checks on `cbb13fc` (same tree as the merge): `zig build test`, `tests/mutants.py --check` (702 mutants, 0 stale), examples, transcode, `bench-build`, and native and wasm32 `build-lib` pass; `zig build test` passes on `b9af132`. Every new or retargeted mutant was run and killed by a test.
+- The two-stage string scan is merged (`4542079`). On targets with 64-byte vectors (AMD Zen 4 and Zen 5 builds), the scan takes two 32-byte steps before it moves to 64-byte steps. Large JSON parse is 0.89 to 0.97 of the previous tip in `bench-json`. Long-text scans are equal or faster in `bench-bulk`. See `plans/json-scan.md` and the `2026-11-25 - 4542079` entries of `bench/JSON.md` and `bench/BULK.md`.
+- `README.md`, `CHANGELOG.md` (Unreleased), `CONTRIBUTING.md`, `bench/*.md` and `plans/*.md` are rewritten in Standard Technical English. Lines by the original author are unchanged.
+- Checks on `e2c69b0` (the merged tree): `zig build test`, `tests/mutants.py --check` (705 mutants, 0 stale) and `bench-build` pass. On `8ab97e4` (same source), examples, transcode, and the native and wasm32 `build-lib` also pass. `zig build test` passes on `88d8825`.
 
 ## Open
 
-1. Gather as a comptime parameter (step 6 of the library review) was measured and not built: no write row moved beyond the spread.
-2. `plans/api.md` (j), BSON element types a typed read does not know, is an open design item.
+1. `plans/wire.md` on branch `plan/wire-fixes` (`64b8ff4`) is a design for four wire fixes: packed structs as integers, the `check` term in `regionSizes`, an arena bound for `wire.encode`, and memory for `Raw` validators. It is not built. Its open questions are listed in the file.
+2. The big-endian branch of the string scan compiles for `s390x-linux-gnu` but has not run on a big-endian host.
 3. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change.
