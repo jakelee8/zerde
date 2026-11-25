@@ -41,6 +41,12 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
   `604-615`, `480-481`, `1008-1014`), the resumable key and frame counts (`resumable.zig:92-101`, `137`, `167-178`),
   and TOML and YAML (`toml.zig:388-391`, `yaml.zig:423`). The read calls `packedFromInt` on what the integer arm
   returns; `fromWire` does the same. No `.int` arm is changed, since none sees the packed type.
+- Hooks win: each walk keeps its hook test first (as `reflect.kindOf` does, `reflect.zig:54`), so a packed struct with
+  `zerdeEncode`/`zerdeDecode` keeps using them, and `isPacked` is tested after the hooks and before the struct arm.
+- A packed struct's own `check` runs after `packedFromInt` on every read path (the typed read, the resumable read and
+  `fromWire` under a wire decode), through the sink's existing `check` (`TypedSink.check`, `typed.zig:864-866`;
+  `WireSink.check`, `wire.zig:506`), so a declared rule is never skipped. Its rebuild in (b) costs 0, since a packed
+  struct holds no list.
 - `reflect` gets its own kind, `.@"packed"`, and a `backing` type for it, so a generator sees one integer of that type
   and the `.int` arms that read `@typeInfo(T).int` (`grep -n '\.int\b.*=>' src/*.zig`, 25 arms) are not reached with a
   struct type.
@@ -66,7 +72,8 @@ pattern (`packed struct(u8){ mode: enum(u2){ a, b, c }, _: u6 }` with mode bits 
 struct, and for a `packed struct(u3)` a wire `u8` of `0x20` and a read number of 32; a `packed struct(i32)` with a
 negative backing value round-trips in every format and through `toWire`/`fromWire`, and a `packed struct(i3)` refuses a
 wire `i8` of `-5`; an object where the integer is due is refused; `regionSizes` of a type holding one equals that of the
-same type with a `u8` field; mutants for each refusal and for the dispatch.
+same type with a `u8` field; a packed struct with hooks is written and read by its hooks; a packed struct whose `check`
+fails is refused on the typed, resumable and wire reads; mutants for each refusal and for the dispatch.
 
 ## (b) `regionSizes` does not count the rebuild a `check` needs
 
