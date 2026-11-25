@@ -578,9 +578,10 @@ bound holds when that limit is the smaller one. `bench-wire` measures both decod
 `zerde.SortedMap(V)` is a map whose keys are data (labels, history, limits): a slice of `Entry { key, value }` sorted by
 encoded text key (shorter first, then bytewise), found with `get`, `getPtr` and `index` by binary search, with no hash table
 and no copy of a key (an aliased read keeps the input's bytes; in a decode into `wire.Wire` it is `{ entries: Span }` over
-`{ key: Span, value: Wire(V) }`). CBOR and JSON read and write it as a map of text keys. A read refuses a key that does
-not sort after the one before it in every mode (`error.NonDeterministicEncoding`, or `error.DuplicateField` when equal),
-a write refuses entries that are not in order (the same errors), a field's `max_len` bounds the entries (checked from the map's
+`{ key: Span, value: Wire(V) }`). CBOR and JSON read and write it as a map of text keys. Every read refuses a repeated key
+(`error.DuplicateField`); a strict CBOR read also refuses a key that does not sort after the one before it
+(`error.NonDeterministicEncoding`); any other read (lenient CBOR, JSON) accepts the keys in any order and sorts the entries, so
+the value is always sorted and binary search holds. A write refuses entries out of order (the same errors), a field's `max_len` bounds the entries (checked from the map's
 head when its length is stated, and at each entry otherwise) and `.elem` bounds each value. A resumable write of one goes entry by entry
 (a key longer than the window goes through it a piece at a time, and a key follows `trusted_text` as any text does), refusing an entry out of
 order when it reaches it.

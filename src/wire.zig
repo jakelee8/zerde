@@ -439,6 +439,12 @@ pub const WireSink = struct {
         return spanOf(self.base, bytes);
     }
 
+    /// The text a `text` result names. The key of a sorted entry was just placed in a region `memory` covers (a sorted
+    /// entry's key is never left in the stream, `typedOwned`), so it resolves.
+    pub fn textOf(self: WireSink, text_value: Span) []const u8 {
+        return self.memory.bytesOf(text_value) catch unreachable;
+    }
+
     pub fn bytesOf(self: WireSink, comptime _: type, bytes: []const u8) !Span {
         return spanOf(self.base, bytes);
     }

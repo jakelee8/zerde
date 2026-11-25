@@ -568,11 +568,7 @@ pub fn sortedMap(
     while (level.index < level.count) {
         if (level.phase == 1) {
             const key = try text(3, allocator, deserializer, .{}, rc);
-            if (level.index > 0) switch (sorted.order(level.prev, key)) {
-                .lt => {},
-                .eq => return error.DuplicateField,
-                .gt => return error.NonDeterministicEncoding,
-            };
+            if (level.index > 0) try sorted.checkNext(level.prev, key);
             level.prev = key;
             entries[level.index].key = try s.text([]const u8, key);
             level.phase = 2;

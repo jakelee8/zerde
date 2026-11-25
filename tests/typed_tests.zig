@@ -5193,7 +5193,7 @@ test "a sorted map is written in key order, in both formats, and read back; what
     try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.json, &sink.writer, repeated, .{}, .{}));
 }
 
-test "a sorted map read refuses an unsorted or repeated key in every mode, and a JSON key with an escape is the key it spells" {
+test "a sorted map read refuses a repeated key in every read, and an unsorted one only when strict; any other read sorts it" {
     const E = error.NonDeterministicEncoding;
     const D = error.DuplicateField;
     // CBOR, lenient and strict: {"limits": ...} is the field, with the keys of the map in the order given.
@@ -5201,24 +5201,72 @@ test "a sorted map read refuses an unsorted or repeated key in every mode, and a
     const unsorted = prefix ++ [_]u8{ 0xa2, 0x61, 'w', 0x01, 0x61, 'r', 0x02 };
     const repeat = prefix ++ [_]u8{ 0xa2, 0x61, 'r', 0x01, 0x61, 'r', 0x02 };
     const long_first = prefix ++ [_]u8{ 0xa2, 0x62, 'a', 'a', 0x01, 0x61, 'b', 0x02 };
-    inline for (.{ false, true }) |is_strict| {
-        const read_cfg = if (is_strict) strict else .{ .mode = zerde.cbor.Mode.lenient };
-        try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &unsorted, .{}, read_cfg));
-        try std.testing.expectError(D, zerde.cbor.parseSliceWith(Maps, allocator, &repeat, .{}, read_cfg));
-        try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &long_first, .{}, read_cfg));
+    try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &unsorted, .{}, strict));
+    try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &long_first, .{}, strict));
+    inline for (.{ zerde.cbor.Mode.lenient, zerde.cbor.Mode.strict }) |mode| {
+        try std.testing.expectError(D, zerde.cbor.parseSliceWith(Maps, allocator, &repeat, .{}, .{ .mode = mode }));
     }
-    // JSON has no mode and keeps no order: a sorted map is where an order is demanded.
-    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"b\":\"x\",\"a\":\"y\"},\"limits\":{}}"));
+    const lenient = try zerde.cbor.parseSlice(Maps, allocator, &long_first);
+    defer zerde.free(allocator, lenient);
+    try std.testing.expect(lenient.limits.isSorted());
+    try std.testing.expectEqualStrings("b", lenient.limits.entries[0].key);
+    try std.testing.expectEqual(@as(?u32, 1), lenient.limits.get("aa"));
+    const swapped = try zerde.cbor.parseSlice(Maps, allocator, &unsorted);
+    defer zerde.free(allocator, swapped);
+    try std.testing.expectEqual(@as(?u32, 2), swapped.limits.get("r"));
+    try std.testing.expectEqual(@as(?u32, 1), swapped.limits.get("w"));
+
+    // JSON has no mode and keeps no order: the entries are sorted, and a repeat anywhere in the map is refused.
+    const ByKey = zerde.SortedMap(u8);
+    const by_length = try zerde.json.parseSlice(ByKey, allocator, "{\"aa\":1,\"b\":2}");
+    defer zerde.free(allocator, by_length);
+    try std.testing.expectEqualStrings("b", by_length.entries[0].key);
+    try std.testing.expectEqualStrings("aa", by_length.entries[1].key);
+    try std.testing.expectEqual(@as(?u8, 1), by_length.get("aa"));
+    try std.testing.expectError(D, zerde.json.parseSlice(ByKey, allocator, "{\"aa\":1,\"b\":2,\"aa\":3}"));
     try std.testing.expectError(D, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"a\":\"y\"},\"limits\":{}}"));
-    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"aa\":\"x\",\"b\":\"y\"},\"limits\":{}}"));
     // `\u0061` is `a`: a repeat of it, and an order that only holds for the spelling.
     try std.testing.expectError(D, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0061\":\"y\"},\"limits\":{}}"));
     const spelled = try zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"\\u0061\":\"x\",\"b\\n\":\"y\"},\"limits\":{}}");
     defer zerde.free(allocator, spelled);
     try std.testing.expectEqualStrings("y", spelled.labels.get("b\n").?);
+    const escaped = try zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0063\\u0063\":\"y\",\"\\u0062\":\"z\"},\"limits\":{}}");
+    defer zerde.free(allocator, escaped);
+    try std.testing.expect(escaped.labels.isSorted());
+    try std.testing.expectEqualStrings("y", escaped.labels.get("cc").?);
     // The same with the values failing after keys were read: nothing is left allocated (the testing allocator checks).
     try std.testing.expectError(error.ValueOutOfRange, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\"},\"limits\":{\"\\u0061\":5,\"b\":101}}"));
-    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0063\\u0063\":\"y\",\"\\u0062\":\"z\"},\"limits\":{}}"));
+
+    // A decode into the wire layout sorts the entries too, keys resolved through the memory.
+    const text = "{\"labels\":{\"cc\":\"x\",\"\\u0062\":\"y\",\"a\":\"z\"}}";
+    var region: Region = .{};
+    @memcpy(region.bytes[0..text.len], text);
+    const cfg = .{ .max_items = 64, .max_string_len = 16, .max_input_bytes = 4096 };
+    const bound = comptime wire.maxArenaSize(zerde.json, LabelsOnly, .{}, cfg);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[text.len..][0..bound]);
+    const w = try wire.decode(zerde.json, LabelsOnly, &arena, region.base(), region.bytes[0..text.len], .{}, cfg);
+    const mem = region.memory();
+    const entries = try mem.listOf(wire.Wire(Labels.Entry), w.labels.entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    for (entries, [_][]const u8{ "a", "b", "cc" }, [_][]const u8{ "z", "y", "x" }) |entry, key, value| {
+        try std.testing.expectEqualStrings(key, try mem.bytesOf(entry.key));
+        try std.testing.expectEqualStrings(value, try mem.bytesOf(entry.value));
+    }
+}
+
+/// A JSON read of an unsorted sorted map, `DuplicateField` taken as the result it should be when `repeats`.
+fn parseUnsortedLabels(failing: std.mem.Allocator, input: []const u8, repeats: bool) !void {
+    const value = zerde.json.parseSlice(LabelsOnly, failing, input) catch |err| {
+        if (repeats and err == error.DuplicateField) return;
+        return err;
+    };
+    zerde.free(failing, value);
+    if (repeats) return error.TestUnexpectedResult;
+}
+
+test "an unsorted sorted map read frees what it read, on a repeat and on every failed allocation" {
+    try std.testing.checkAllAllocationFailures(allocator, parseUnsortedLabels, .{ "{\"labels\":{\"cc\":\"x\",\"\\u0062\":\"y\",\"a\":\"z\"}}", false });
+    try std.testing.checkAllAllocationFailures(allocator, parseUnsortedLabels, .{ "{\"labels\":{\"cc\":\"x\",\"\\u0062\":\"y\",\"\\u0063c\":\"z\"}}", true });
 }
 
 test "a sorted map's bounds are checked before it is allocated, and its values have their own" {

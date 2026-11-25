@@ -513,11 +513,7 @@ fn serializeValue(
                 while (index < value.entries.len) : (index += 1) {
                     const entry = value.entries[index];
                     if (level.phase == 0) {
-                        if (index > 0) switch (sorted.order(value.entries[index - 1].key, entry.key)) {
-                            .lt => {},
-                            .eq => return error.DuplicateField,
-                            .gt => return error.NonDeterministicEncoding,
-                        };
+                        if (index > 0) try sorted.checkNext(value.entries[index - 1].key, entry.key);
                         try reserveRoom(rc, atomic_room);
                         try serializer.beginMapEntry();
                         level.phase = 1;
@@ -795,7 +791,7 @@ fn omitField(comptime T: type, comptime field_name: []const u8, comptime FieldTy
 /// The walk is destination-passing: a value is read into the `*Of(T)` the caller gives, so what a container has
 /// built so far is in the destination and not in a frame of the walk, which is what lets a resumable read
 /// (`ReadLevel`) stop in the middle of one. A sink has `Of(T)`, the type of the result for `T`, and `scalar`,
-/// `text`, `bytesOf`, `list`, `someDest`, `none`, `enumOf`, `unionDest`, `unionVoid`, `fromDefault`, `check` and
+/// `text`, `textOf`, `bytesOf`, `list`, `someDest`, `none`, `enumOf`, `unionDest`, `unionVoid`, `fromDefault`, `check` and
 /// `free`, as `TypedSink` shows.
 pub const TypedSink = struct {
     pub fn Of(comptime T: type) type {
@@ -809,6 +805,11 @@ pub const TypedSink = struct {
     /// A string field, `bytes` being the input's own bytes, the reader's rewritten ones, or a copy.
     pub fn text(_: TypedSink, comptime T: type, bytes: []const u8) !T {
         return if (@typeInfo(T).pointer.attrs.@"const") bytes else @constCast(bytes);
+    }
+
+    /// The text a `text` result holds.
+    pub fn textOf(_: TypedSink, text_value: []const u8) []const u8 {
+        return text_value;
     }
 
     /// A `ByteString` or a `Raw` that holds `bytes`.
@@ -977,6 +978,8 @@ pub fn deserializeValue(
                 try readByteString(s, T, dest, allocator, deserializer, .{}, rc);
             } else if (comptime isRaw(T)) {
                 dest.* = try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, .{}, rc));
+            } else if (comptime isSortedMap(T)) {
+                try deserializeSortedMap(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}, rc);
             } else {
                 try deserializeStruct(s, T, info, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
             }
@@ -1629,10 +1632,12 @@ fn deserializeStruct(
     try s.check(T, allocator, dest);
 }
 
-/// A `SortedMap`: the entries of a map of text keys, each key after the one before it, which is checked as it is read, so a
-/// map that is unsorted or repeats a key is refused in every mode. A key is the input's own bytes in an aliased read and a copy
-/// otherwise; the entries are one exact allocation when the format states their number. `bounds.max_len` is checked
-/// before that allocation, and at each entry when the format does not state it, and `bounds.elem` bounds each value.
+/// A `SortedMap`: the entries of a map of text keys. Every read refuses a repeated key (`error.DuplicateField`); a strict CBOR
+/// read also refuses a key that does not sort after the one before it (`error.NonDeterministicEncoding`); any other read
+/// (lenient CBOR, JSON) accepts the keys in any order and sorts the entries, so the value is always sorted and binary search
+/// holds. A key is the input's own bytes in an aliased read and a copy otherwise; the entries are one exact allocation when the
+/// format states their number. `bounds.max_len` is checked before that allocation, and at each entry when the format does not
+/// state it, and `bounds.elem` bounds each value.
 fn deserializeSortedMap(
     s: anytype,
     comptime T: type,
@@ -1663,6 +1668,7 @@ fn deserializeSortedMap(
             try items.ensureTotalCapacityPrecise(allocator, count);
         }
     }
+    var unsorted = false;
     var previous: ?[]const u8 = null;
     while (try nextSortedMapKey(deserializer, allocator)) |token| {
         errdefer token.deinit(allocator);
@@ -1674,7 +1680,9 @@ fn deserializeSortedMap(
         if (previous) |before| switch (sorted.order(before, key)) {
             .lt => {},
             .eq => return error.DuplicateField,
-            .gt => return error.NonDeterministicEncoding,
+            // A strict CBOR read refuses a key out of order as it reads it (`cbor.Mode.strict`); any other read sorts the
+            // entries when the map is done.
+            .gt => unsorted = true,
         };
         previous = key;
         var value: Out(T.Value) = undefined;
@@ -1683,8 +1691,23 @@ fn deserializeSortedMap(
         try items.append(allocator, .{ .key = try s.text([]const u8, key), .value = value });
         owned = false;
     }
+    if (unsorted) try sortEntries(s, Out(Entry), items.items);
     try checkLength(bounds, items.items.len);
     dest.* = .{ .entries = try s.list([]const Entry, try items.toOwnedSlice(allocator)) };
+}
+
+/// Sorts the entries of a `SortedMap` read out of order by their keys, which `s` resolves; two equal keys are a repeat. Nothing
+/// is freed here: on an error the caller frees every item.
+fn sortEntries(s: anytype, comptime Item: type, items: []Item) error{DuplicateField}!void {
+    const Sink = @TypeOf(s);
+    std.sort.pdq(Item, items, s, struct {
+        fn less(sink: Sink, a: Item, b: Item) bool {
+            return sorted.order(sink.textOf(a.key), sink.textOf(b.key)) == .lt;
+        }
+    }.less);
+    for (items[@min(1, items.len)..], 0..) |item, before| {
+        if (sorted.order(s.textOf(items[before].key), s.textOf(item.key)) == .eq) return error.DuplicateField;
+    }
 }
 
 /// The next key of a `SortedMap`: by a format that records keys for a repeat check (`nextSortedKey`), one that is not
