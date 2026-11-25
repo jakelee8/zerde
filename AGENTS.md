@@ -6,10 +6,10 @@ Project conventions for automated changes:
 - run `zig build test` after code changes
 - when touching benchmarked code, run the relevant `zig build bench-* -Doptimize=ReleaseFast` command
 - keep `.github/workflows/ci.yml` and `.github/workflows/bench.yml` aligned with the documented Zig version and repo workflow
-- keep `.github/workflows/ci.yml` validating native lib, wasm lib, tests, examples, the transcoder CLI, and `zig build bench-build`
+- keep `.github/workflows/ci.yml` validating native lib, wasm lib, tests, the mutant patterns (`tests/mutants.py --check`), examples, the transcoder CLI, and `zig build bench-build`
 - keep `.github/workflows/release.yml` aligned with the documented release process and tag conventions
 - benchmark workflow lives in `bench/README.md`
-- benchmark history lives in `bench/BIN.md`, `bench/BSON.md`, `bench/BULK.md`, `bench/CBOR.md`, `bench/JSON.md`, `bench/MEMORY.md`, `bench/MSGPACK.md`, `bench/TOML.md`, `bench/WASM.md`, `bench/YAML.md`, and `bench/ZON.md`
+- benchmark history lives in `bench/BIN.md`, `bench/BSON.md`, `bench/BULK.md`, `bench/CBOR.md`, `bench/JSON.md`, `bench/MEMORY.md`, `bench/MSGPACK.md`, `bench/TOML.md`, `bench/WASM.md`, `bench/WIRE.md`, `bench/YAML.md`, and `bench/ZON.md`
 - benchmark timing is implemented with `zBench`; keep the scenario workloads and fairness policy stable unless you are intentionally changing benchmark behavior
 - add benchmark log entries only for real benchmark-affecting changes, newest first, with sections named `## YYYY-MM-DD - <hash>`
 - corpus roundtrip fixtures live in `tests/corpus/<format>` and should stay in canonical output form

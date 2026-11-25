@@ -34,7 +34,7 @@ of a long ASCII text; the scans above are unchanged code. Measured on the same m
 Each is ns for one render of the 270 KiB ASCII text, from strict CBOR into the JSON value writer ("cbor to json render, trusted
 vs checked" in the output; trusted skips the UTF-8 check on the way in and out). The run-to-run spread of the unchanged code
 is large (the other rows of the same runs moved by up to 20%), so the figures show the direction, not a ratio. A render of
-unicode text, which the gateway's `bench/room-guard.mjs` measures, is not a row of this benchmark and was not measured here.
+unicode text is not a row of this benchmark and was not measured here.
 
 ## 2026-11-23 - dbbe32f
 
@@ -88,7 +88,7 @@ the rest is the scan for characters to escape and the copy, about 63 µs. So the
 dominates a long-text render; a faster scan or a copy of text known to need no escapes would be what gets near a plain `memcpy`.
 On wasm without SIMD validation costs more (see the table above), so the option is worth more there; it was not measured.
 
-## 2026-11-24 - vector scan and direct escape writes
+## 2026-11-24 - 3461d9c
 
 Changes since previous run: `findStringSpecial` scans a `@Vector` of `std.simd.suggestVectorLength(u8)` bytes where there is one (native; WebAssembly
 with `simd128`), the word version elsewhere; `writeEscaped` writes each escape into the writer's spare buffer when it has room, instead of one

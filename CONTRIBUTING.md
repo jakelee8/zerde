@@ -64,8 +64,8 @@ zig build bench-wire -Doptimize=ReleaseFast
 Benchmark workflow and benchmark-log conventions live in [bench/README.md](bench/README.md).
 That file also defines benchmark fairness policy: time the full public usage path, including any mandatory intermediate-representation conversion required by a compared library.
 The timing runner itself is built on `zBench`.
-GitHub Actions mirrors this setup with `.github/workflows/ci.yml` for `zig build test`
-plus native library, wasm library, transcoder, example, and benchmark-harness builds, and
+GitHub Actions mirrors this setup with `.github/workflows/ci.yml` for `zig build test`, the mutant patterns
+(`python3 tests/mutants.py --check`), native library, wasm library, transcoder, example, and benchmark-harness builds, and
 `.github/workflows/bench.yml` for full per-format benchmark runs on `main` and
 manual dispatches.
 Tagged commits on `main` are published through `.github/workflows/release.yml`.
