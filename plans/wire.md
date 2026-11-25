@@ -45,9 +45,9 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
   enum's is (`EnumInt`, `wire.zig:109-124`), so `packed struct(u3)` has a wire form; a backing integer wider than 64
   bits is a compile error naming that rule. `fromWire` narrows with `std.math.cast` to the backing type and refuses a
   value with a bit above the backing width with the same error, before `packedFromInt`. The typed read reads the
-  backing type itself through the integer arm, which already refuses a number outside that type's range
-  (`error.IntegerOverflow` today; the implementer maps it to the packed refusal's error only if the existing arm
-  makes that a one-line change, otherwise both errors are documented).
+  backing type itself through the integer arm, which refuses a number outside that type's range with
+  `error.IntegerOverflow`, as it does for any integer field; that error stays, and the docs name both: `IntegerOverflow`
+  for a number too wide, the packed refusal for a pattern the type does not define.
 
 **Open.** None. The bit-for-bit form is the one the type itself defines. Text output by field name
 (a `packed_repr = .fields`) is not proposed.
