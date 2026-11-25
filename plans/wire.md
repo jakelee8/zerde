@@ -86,11 +86,12 @@ never counts it, and the documented guarantee that a region of `regionSizes().ou
 (`wire.zig:822`, `README.md:643-646`) is false for a type with `check`. The resumable read calls the same check with the
 same arena (`src/typed_resume.zig:450`).
 
-**Design.** `computeSizes` gains a term `check` = the rebuild cost of the root, charged only when a type reachable from
-the root declares `check`, else 0. It is `typedOwned`'s list algebra with typed element sizes, exact allocation (no
-growth: `fromWire` allocates each list once), and text, bytes, `Raw` and scalar lists at 0. `output` becomes
-`lists + text + check + slack`, for `regionSizes`, `resumableRegionSizes` and `maxArenaSize`. A nested check's rebuild is
-no larger than the root's and each rebuild is given back before the next, so one term bounds them all.
+**Design.** `computeSizes` gains a term `check` = the largest rebuild cost among the types reachable from the root that
+declare `check` (0 when none does, and 0 for a packed struct's own check, which rebuilds nothing). A type's rebuild cost
+is `typedOwned`'s list algebra over that type with typed element sizes, exact allocation (no growth: `fromWire`
+allocates each list once), and text, bytes, `Raw` and scalar lists at 0, under the limits that reach it. `output`
+becomes `lists + text + check + slack`, for `regionSizes`, `resumableRegionSizes` and `maxArenaSize`. Each rebuild is
+given back before the next check runs, so the largest one bounds them all.
 
 **Defect found on the same path: `StreamResumable` checks the wrong bytes.** In a stream read a text or byte string
 stays in the stream and its span holds a stream offset (`WireSink.span`, `wire.zig:453-459`), but the check's rebuild
