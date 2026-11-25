@@ -60,7 +60,7 @@ Expected from the repeated-key change (`5870942`): a key record in an untyped re
 
 Notes:
 
-- The typed zerde parse is 1.20 to 1.37 times the base in every pair and every scenario, and the roundtrip 1.07 to 1.34; `std.json` moved 0.83 to 1.18 on the same machine. The write is 0.98 to 1.15. The parse change is the branch's, not the repeated-key check: the `5870942` section measured the typed parse unchanged across that commit. Which of the branch's read changes (UTF-8 checks on every string, limits, the destination-passing walk) costs it is not measured here.
+- The typed zerde parse is 1.20 to 1.37 times the base in every pair and every scenario, and the roundtrip 1.07 to 1.34; `std.json` moved 0.83 to 1.18 on the same machine, but for one medium roundtrip run (1.37). The write is 0.98 to 1.15. The parse change is the branch's, not the repeated-key check: the `5870942` section measured the typed parse unchanged across that commit. Which of the branch's read changes (UTF-8 checks on every string, limits, the destination-passing walk) costs it is not measured here.
 - Listed under "Default-path cost" in `plans/api.md`.
 
 ## 2026-11-24 - 5870942

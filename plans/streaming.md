@@ -72,7 +72,7 @@ input, which the record now borrows from.
 ## (e) Decoder state that can move between calls (open)
 
 **Problem.** The copy-mode decoder's state points into itself: `wire.ResumableIn.init` stores `&self.regions` and
-`&self.arena` (`src/wire.zig:884-889`), and the typed walk's `ReadLevel` holds pointers into the region. A host that
+`&self.arena` (`src/wire.zig:885-892`), and the typed walk's `ReadLevel` holds pointers into the region. A host that
 keeps many uploads in flight cannot copy a decoder's state out and back.
 
 **Proposed design.** Three options:

@@ -6,7 +6,7 @@ added this file.
 
 ## (a) Split `tests/typed_tests.zig`
 
-**Problem.** `tests/typed_tests.zig` is one file of about 8,700 lines and some 300 tests, in sections by feature. A change
+**Problem.** `tests/typed_tests.zig` is one file of about 8,700 lines and about 270 tests, in sections by feature. A change
 to one feature recompiles all of it, and two branches that add tests to it conflict.
 
 **Proposed design.**
@@ -74,7 +74,8 @@ its commit, or drop it for a link to `bench/`.
 
 ## (e) CI
 
-**Problem.** `.github/workflows/ci.yml` runs the tests in Debug only, does not check formatting, and runs no mutants.
+**Problem.** `.github/workflows/ci.yml` runs the tests in Debug only, does not check formatting, and runs no mutant (only
+`tests/mutants.py --check`, which checks that the patterns are still in the source).
 
 **Proposed design.**
 

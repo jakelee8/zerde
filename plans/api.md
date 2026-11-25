@@ -54,15 +54,16 @@ names only the new entry points.
 
 ## (d) `typed_resume.zig` and CBOR
 
-**Problem.** The resumable typed walk imports `cbor` directly (`src/typed_resume.zig:24`), so it is CBOR-specific in
-places although it is described as format-independent.
+**Problem.** The resumable typed walk imports `cbor` directly (`src/typed_resume.zig:24`). Its module doc says the reader
+is strict CBOR, which is true, but the import is what would stop a resumable lenient-CBOR or JSON reader from reusing the
+walk.
 
-**Proposed design.** Either move the CBOR parts behind the deserializer protocol (as `isStrict` and `keysAscend` are), or
-document `typed_resume` as the CBOR-only walk it is.
+**Proposed design.** Move the CBOR parts behind the deserializer protocol (as `isStrict` and `keysAscend` are), when a
+second resumable reader is built.
 
-**Open questions.** Depends on (d) of `plans/streaming.md`: a resumable JSON reader would need the first option.
+**Open questions.** Depends on (d) of `plans/streaming.md`: without a second resumable reader there is nothing to gain.
 
-**Acceptance.** `typed_resume.zig` no longer imports `cbor.zig`, or its module doc says it is CBOR-only.
+**Acceptance.** `typed_resume.zig` no longer imports `cbor.zig`, and the resumable read tests pass unchanged.
 
 ## (e) The size of a default JSON deserializer
 
@@ -90,7 +91,7 @@ parse keep borrowed keys.
 
 ## (g) A byte order mark
 
-**Problem.** A JSON text that starts with a byte order mark is refused (`error.UnexpectedToken`; `README.md:310`). RFC
+**Problem.** A JSON text that starts with a byte order mark is refused (`error.UnexpectedToken`; `README.md:311`). RFC
 8259 §8.1 lets a parser ignore one. YAML 1.2 requires a reader to accept one; no handling of it is in
 `src/yaml_read.zig` (no `0xEF` or `U+FEFF`).
 
@@ -115,17 +116,19 @@ parse keep borrowed keys.
 
 **Problem.** Measured against the branch's base (`03beb0e`), with no new option set, three alternating runs per suite
 (the `2026-11-25 - 52757c8` sections of `bench/JSON.md`, `bench/CBOR.md`, `bench/MSGPACK.md`, `bench/BSON.md` and
-`bench/MEMORY.md`), two formats are slower on the typed default path in every pair, beyond 10%:
+`bench/MEMORY.md`), two formats are slower on the typed default path, by more than 10% in every pair:
 
 | Format | Row | Tip / base, three pairs |
 | --- | --- | --- |
 | CBOR | write | 1.61 to 2.11 small, 1.33 to 1.54 medium, 1.45 to 1.50 large |
 | CBOR | roundtrip | 1.36 to 1.45 small, 1.31 to 1.34 medium, 1.30 to 1.32 large |
 | CBOR | parse | 1.24 to 1.29 small, 1.19 to 1.20 medium, 1.19 to 1.23 large |
-| JSON | parse | 1.20 to 1.31 small, 1.29 to 1.37 medium, 1.25 to 1.36 large |
-| JSON | roundtrip | 1.07 to 1.19 small, 1.15 to 1.25 medium, 1.22 to 1.34 large |
+| JSON | parse | 1.20 to 1.31 small, 1.28 to 1.37 medium, 1.25 to 1.36 large |
+| JSON | roundtrip (medium, large) | 1.15 to 1.25 medium, 1.22 to 1.34 large |
 
-The comparison libraries (zbor, `std.json`) moved within 0.83 to 1.18 on the same runs. MessagePack and BSON are as fast
+The JSON small roundtrip (1.07 to 1.19) has one pair under 10%, so it is context, not one of these rows. The comparison
+libraries (zbor, `std.json`) moved within 0.83 to 1.18 on the same runs, but for one `std.json` medium roundtrip run
+(1.37). MessagePack and BSON are as fast
 or faster; JSON allocates fewer bytes, every other format the same. The repeated-key check is not the cause: the typed
 JSON parse was unchanged across it (`5870942` section of `bench/JSON.md`), and the CBOR rows do not touch it. A comptime
 gather parameter for the CBOR writer was measured and moved nothing.
