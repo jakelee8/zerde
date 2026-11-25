@@ -30,9 +30,9 @@ The current large case produces a canonical CBOR document of about `76.22 MiB`, 
 
 ## 2026-11-25 - e07eb8c
 
-Changes since previous run: the default-path fixes of `plans/api.md` (i). The writer puts out a field name and an enum name as bytes made at compile time, with no UTF-8 check on each write; the reader decides strict mode and the `max_items` count at compile time when the config does not name them, and `Header` is a `packed struct`, so the head read no longer stalls on copying its byte fields.
+Changes since previous run: default-path fixes from `plans/api.md` (item i). The writer emits field names and enum names as bytes built at compile time, with no UTF-8 check on each write. The reader decides strict mode and the `max_items` count at compile time when the config does not name them. `Header` is a `packed struct`, so the head read no longer stalls on copying its byte fields.
 
-Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`; three runs each, alternating base and tip, `zig build bench-cbor -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 9; the zbor rows are the control.
+Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `zig build bench-cbor -Doptimize=ReleaseFast` under one `flock`, three runs each, alternating base and tip. Load average was 2 to 9. The zbor rows are the control.
 
 | Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
@@ -57,16 +57,16 @@ Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. `Linux x86_64` (
 
 Notes:
 
-- Every zerde row is at or below the base but for two pairs: one small parse run (1.15, its pair ran just after load 9) and one large roundtrip run (1.02). The plan's acceptance (write within 1.10, parse within 1.05) holds in every other pair. zbor moved 0.71 to 1.05 on the same runs, so the base runs were slowed too.
-- Pinned to one core (`taskset -c 3`), best of 15 repetitions of the same payload in a standalone probe: small write 970 to 977 ns against 1,001 (1,333 in the first round), parse 2,470 to 2,482 against 2,495 to 2,561; large write 41.5 against 42.5 to 42.7 ms, parse 87.6 to 89.2 against 86.4 to 87.4 ms (1.00 to 1.03 round by round).
+- Every zerde row is at or below the base except two pairs: one small parse run (1.15; its pair ran just after load 9) and one large roundtrip run (1.02). Every other pair meets the plan's acceptance limits (write within 1.10, parse within 1.05). zbor moved 0.71 to 1.05 on the same runs, so the base runs were slowed too.
+- A standalone probe pinned to one core (`taskset -c 3`) took the best of 15 repetitions of the same payload. Tip against base: small write 970 to 977 ns against 1,001 ns (1,333 ns in the first round); small parse 2,470 to 2,482 ns against 2,495 to 2,561 ns; large write 41.5 ms against 42.5 to 42.7 ms; large parse 87.6 to 89.2 ms against 86.4 to 87.4 ms (1.00 to 1.03 round by round).
 
 ## 2026-11-25 - 52757c8
 
 The whole branch against its base, on the default path (no new option set).
 
-Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-cbor -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+Base is `03beb0e` (`origin/zig-0.17`); tip is `52757c8` (`fix/library-review`). Environment: `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`. Command: `zig build bench-cbor -Doptimize=ReleaseFast` under one `flock`, three runs each, alternating base and tip suite by suite. Load average was 2 to 10. The comparison library's rows control for machine load.
 
-Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+The repeated-key change (`5870942`) adds a key record to an untyped read and to each unknown member that a typed read skips. MessagePack and BSON also walk each skipped value. This payload has no unknown members and these rows read no untyped value, so none of that cost shows here. The `5870942` entry in `bench/JSON.md` gives the untyped cost.
 
 | Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
@@ -91,8 +91,8 @@ Expected from the repeated-key change (`5870942`): a key record in an untyped re
 
 Notes:
 
-- Every zerde row is slower in every pair: parse 1.19 to 1.29, write 1.33 to 2.11, roundtrip 1.30 to 1.46; zbor stayed within 0.94 to 1.09. The write regression is the largest default-path cost of the branch. A comptime gather parameter (removing the one optional branch of `emitBytes` and `emitRaw`) was measured and did not move the write rows (1,643 to 1,675 ns against 1,686 to 1,707 ns, small), so it was not committed. Which of the branch's write changes costs it is not measured here.
-- Listed under "Default-path cost" in `plans/api.md`.
+- Every zerde row is slower in every pair: parse 1.19 to 1.29, write 1.33 to 2.11, roundtrip 1.30 to 1.46; zbor stayed within 0.94 to 1.09. The write regression is the largest default-path cost of the branch. A comptime gather parameter (which removes the one optional branch of `emitBytes` and `emitRaw`) did not move the write rows (small: 1,643 to 1,675 ns against 1,686 to 1,707 ns), so it was not committed. These runs do not show which write change causes the cost.
+- `plans/api.md` lists this under "Default-path cost".
 
 ## 2026-11-23 - 4881395
 
@@ -101,7 +101,7 @@ Changes since previous run:
 - reads validate text as UTF-8, check a length against the bytes left, record unknown map keys for a duplicate check, and match a struct key before validating it; the map is read through `nextObjectFieldIndex` with integer keys
 - an integer field refuses a float, tags other than 55799 are refused, and a skipped value is walked with a depth bound
 
-Environment for this entry only (not the machine above): `Linux x86_64`, Zig `0.17.1`. "Before" is `6e4bf79` built and run on the same machine in the same session, so only the two columns of this entry compare with each other. One run each, `zig build bench-cbor -Doptimize=ReleaseFast`.
+Environment for this entry: `Linux x86_64`, Zig `0.17.1`. "Before" is `6e4bf79`, built and run on the same machine in the same session; compare only the two columns of this entry. Command: `zig build bench-cbor -Doptimize=ReleaseFast`, one run each.
 
 | Operation | Scenario | Before zerde ns/op | After zerde ns/op | Change |
 | --- | --- | ---: | ---: | ---: |
@@ -117,8 +117,8 @@ Environment for this entry only (not the machine above): `Linux x86_64`, Zig `0.
 
 Notes:
 
-- the write path moved by up to 12% on code that did not change for this payload, so changes under about 12% are inside this machine's run-to-run noise
-- the small parse case is the one that may have slowed (+18.8%, outside that noise), and the medium and large cases do not show it; the likely cause is the per-string UTF-8 check and per-document setup, which weigh most on a small document [INFERENCE: not profiled]
+- the write path moved by up to 12% on code that did not change for this payload, so changes under about 12% are within this machine's run-to-run noise
+- the small parse case (+18.8%) is outside that noise, and the medium and large cases do not show it; the likely cause is the per-string UTF-8 check and per-document setup, which weigh most on a small document [INFERENCE: not profiled]
 - the payload has no unknown keys, so the duplicate check records nothing; a repeat run on the benchmark machine would settle the small parse case
 
 ## 2026-04-20 - 49d8ca8

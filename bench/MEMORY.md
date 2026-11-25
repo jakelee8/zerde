@@ -30,15 +30,11 @@ canonical representation.
 
 ## 2026-11-25 - 52757c8
 
-The whole branch against its base, on the default path (no new option set). Base is `03beb0e` (`origin/zig-0.17`), tip
-`52757c8`; `zig build bench-memory -Doptimize=ReleaseFast`, three runs each, alternating, `Linux x86_64` (WSL2), Zig
-`0.17.1`. The counts are the same in all three runs of a tree.
+The whole branch against its base, on the default path (no new option set). Base is `03beb0e` (`origin/zig-0.17`); tip is `52757c8`. Command: `zig build bench-memory -Doptimize=ReleaseFast`, three runs each, alternating. Environment: `Linux x86_64` (WSL2), Zig `0.17.1`. The counts are the same in all three runs of a tree.
 
-Expected from the repeated-key change (`5870942`): a key record for each unknown member a typed read skips; the payload
-has none, so the typed reads allocate what they did.
+The repeated-key change (`5870942`) adds a key record for each unknown member that a typed read skips. The payload has none, so the typed reads allocate what they did before.
 
-Every format but JSON allocates the same as the base. JSON makes the same allocation calls, with fewer remaps and fewer
-bytes (a rewritten string is measured and allocated once, at its exact length):
+Every format except JSON allocates the same as the base. JSON makes the same allocation calls with fewer remaps and fewer bytes, because a rewritten string is measured and allocated once, at its exact length:
 
 | JSON | Base: remaps, allocated, peak | Tip: remaps, allocated, peak |
 | --- | --- | --- |
