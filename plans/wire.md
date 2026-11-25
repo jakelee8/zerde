@@ -43,16 +43,21 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
   `min`/`max` bounds stay refused as for any struct (the existing compile error).
 - On the wire the backing integer is widened to the smallest of `u8`, `u16`, `u32` and `u64` that holds it, as an
   enum's is (`EnumInt`, `wire.zig:109-124`), so `packed struct(u3)` has a wire form; a backing integer wider than 64
-  bits is a compile error naming that rule.
+  bits is a compile error naming that rule. `fromWire` narrows with `std.math.cast` to the backing type and refuses a
+  value with a bit above the backing width with the same error, before `packedFromInt`. The typed read reads the
+  backing type itself through the integer arm, which already refuses a number outside that type's range
+  (`error.IntegerOverflow` today; the implementer maps it to the packed refusal's error only if the existing arm
+  makes that a one-line change, otherwise both errors are documented).
 
 **Open.** None. The bit-for-bit form is the one the type itself defines. Text output by field name
 (a `packed_repr = .fields`) is not proposed.
 
 **Acceptance.** Round trips of a `packed struct(u8)` field with padding in every format; the wire form is the backing
 integer (bytes compared); refused on read and on `fromWire`: a set padding bit, an exhaustive-enum field's unnamed
-pattern (`packed struct(u8){ mode: enum(u2){ a, b, c }, _: u6 }` with mode bits 3), and the same inside a nested
-packed struct; an object where the integer is due is refused; `regionSizes` of a type holding one equals that of the
-same type with a `u8` field; mutants for each refusal and for the dispatch.
+pattern (`packed struct(u8){ mode: enum(u2){ a, b, c }, _: u6 }` with mode bits 3), the same inside a nested packed
+struct, and for a `packed struct(u3)` a wire `u8` of `0x20` and a read number of 32; an object where the integer is due
+is refused; `regionSizes` of a type holding one equals that of the same type with a `u8` field; mutants for each refusal
+and for the dispatch.
 
 ## (b) `regionSizes` does not count the rebuild a `check` needs
 
