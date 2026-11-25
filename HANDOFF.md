@@ -2,14 +2,14 @@
 
 ## State
 
-`feat/deterministic-cbor` holds the library-review changes (19 commits of `fix/library-review`, merged at `5032c15`).
+`feat/deterministic-cbor` holds the library review (`5032c15`) and the default-path performance fixes (`perf/default-path`, merged at `b9af132`).
 
-- Checks on the merged tree: `zig build test` passes. On `c24e7c4` (same source): `tests/mutants.py --check` (696 mutants, 0 stale), native and wasm32 `build-lib`, `examples`, `transcode` and `bench-build` pass. Every new or re-targeted mutant was run and killed.
-- `plans/` holds `streaming.md`, `structure.md` and `api.md`.
+- The default-path cost of `plans/api.md` (i) is fixed and recorded there under "Outcome (`e07eb8c`)". Four causes: UTF-8 checks of compile-time names on write, `std.simd.firstTrue` in the 64-lane string scan, CBOR strict and `max_items` checks per head with the `Header` copy stall, and the JSON read UTF-8 check of ASCII runs. The benchmarks are the `2026-11-25 - e07eb8c` sections of `bench/CBOR.md`, `bench/JSON.md` and `bench/BULK.md`.
+- A cheaper JSON check was made. The large JSON parse stays 1.04 to 1.05 of the base when pinned to one core (0.99 to 1.17 in the suite); this is documented as accepted.
+- Checks on `cbb13fc` (same tree as the merge): `zig build test`, `tests/mutants.py --check` (702 mutants, 0 stale), examples, transcode, `bench-build`, and native and wasm32 `build-lib` pass; `zig build test` passes on `b9af132`. Every new or retargeted mutant was run and killed by a test.
 
 ## Open
 
-1. Default-path cost of the whole branch, measured against `03beb0e` in three alternating pairs per suite: typed CBOR write is 1.33 to 2.11 times slower, CBOR parse and roundtrip 1.19 to 1.46, JSON typed parse 1.20 to 1.37. `plans/api.md` (i) and the `2026-11-25 - 52757c8` sections of `bench/CBOR.md` and `bench/JSON.md` record it. Profiling and fixing it is the next step.
-2. Gather as a comptime parameter (step 6 of the review plan) was measured and not built: no write row moved beyond the spread (small 1,643 to 1,675 ns before, 1,686 to 1,707 ns after).
-3. `plans/api.md` (j), BSON element types a typed read does not know, is an open design item.
-4. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change.
+1. Gather as a comptime parameter (step 6 of the library review) was measured and not built: no write row moved beyond the spread.
+2. `plans/api.md` (j), BSON element types a typed read does not know, is an open design item.
+3. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change.
