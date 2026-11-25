@@ -40,8 +40,10 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
   and the `.int` arms that read `@typeInfo(T).int` (`grep -n '\.int\b.*=>' src/*.zig`, 25 arms) are not reached with a
   struct type.
 - A field override on a packed struct field that only applies to structs (`rename_all`, `fields`) is a compile error.
-  `min`/`max` bounds stay refused as for any struct (the existing compile error). A backing width `Wire` has no integer
-  for is the existing compile error.
+  `min`/`max` bounds stay refused as for any struct (the existing compile error).
+- On the wire the backing integer is widened to the smallest of `u8`, `u16`, `u32` and `u64` that holds it, as an
+  enum's is (`EnumInt`, `wire.zig:109-124`), so `packed struct(u3)` has a wire form; a backing integer wider than 64
+  bits is a compile error naming that rule.
 
 **Open.** None. The bit-for-bit form is the one the type itself defines. Text output by field name
 (a `packed_repr = .fields`) is not proposed.
@@ -131,12 +133,16 @@ size function can derive. The same arm has a smaller copy: `json.readRaw` passes
 **Design.**
 - A field option `validate_bytes: usize` states the most bytes the validator allocates for one item. Under a wire decode
   a `validate` without `validate_bytes` is a compile error; the typed (non-wire) read keeps accepting it as today.
-- Both call sites run the validator on a `FixedBufferAllocator` of `validate_bytes` for the call and give it back after,
-  so the cost does not grow with the number of items. Under `decodeInto` and `decode` it is taken from the reader's
-  scratch, and `computeSizes` adds the largest `validate_bytes` reachable from the root to `scratch`. The resumable read
-  has no scratch, so it takes it from the end of the output arena and gives it back, as the `check` rebuild does, and
-  `resumableRegionSizes` and `streamRegionSizes` add the largest `validate_bytes` to `output`. The typed read without a
-  wire region keeps passing its allocator.
+- Both call sites run the validator on a `FixedBufferAllocator` over a block of `validate_bytes` and give the block back
+  right after the call, so stranded growth inside it never outlives the call and the cost does not grow with the number
+  of items. `readRawSlice` takes the block from the reader's own allocator (the deserializer's `allocator` field, which
+  `run` builds on `work`: the scratch region under `decodeInto`, the one arena under `decode`, `wire.zig:368`, `416`),
+  allocated last and freed first, so the fixed-buffer allocator under it reclaims it; `computeSizes` adds the largest
+  `validate_bytes` reachable from the root to `scratch`, which `maxArenaSize` already adds to `decode`'s one arena. The
+  resumable read has no scratch, so it takes the block from the end of the output arena with a mark and restore of
+  `end_index`, as the `check` rebuild does, and `resumableRegionSizes` and `streamRegionSizes` add the largest
+  `validate_bytes` to `output` (their doc line that `scratch` is empty stays true). The typed read without a wire region
+  keeps passing its allocator.
 - `cbor` and `json` export the scratch their own validators need as a comptime function of a read config
   (`cbor.validateScratch(cfg)`, and the size of a pull reader for the README form), so a caller can state
   `validate_bytes` without guessing. These sizes come from the existing list-growth algebra (`growth`,
