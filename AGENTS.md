@@ -22,3 +22,4 @@ Project conventions for automated changes:
 - keep `README.md`, `bench/README.md`, and `CONTRIBUTING.md` aligned with the current workflow
 - `tests/mutants.py` lists the mutants (a removed or weakened guard) the tests must kill; add one for each new guard, and run it before committing, never while committing
 - keep this file updated when repo conventions change
+- the package is `b.addModule("zerde")` over `src/root.zig`; `build.zig` returns right after it for a consumer (`!b.isRoot()`), and `toml`, `zbor` and `zbench` stay `.lazy = true`, so a consumer fetches no third-party code; keep `src/` free of third-party imports and of paths outside `src/`, and keep `.paths` in `build.zig.zon` to what the package needs

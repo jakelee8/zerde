@@ -121,18 +121,24 @@ fn generateCorpusTests(
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const zig_toml_dep = b.dependency("toml", .{
+    // The package itself is just `src/root.zig`. It imports no third-party code,
+    // and Zig analyzes only the formats a consumer names.
+    const zerde_mod = b.addModule("zerde", .{
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const zbor_dep = b.dependency("zbor", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zbench_dep = b.dependency("zbench", .{
-        .target = target,
-        .optimize = optimize,
-    });
+
+    // Everything below is the repository's own tests, examples and benchmarks. A
+    // consumer's build stops here, so it fetches none of the lazy dependencies.
+    if (!b.isRoot()) return;
+
+    // Asking for all three before returning lets one fetch round resolve them together.
+    const zig_toml_dep = b.lazyDependency("toml", .{ .target = target, .optimize = optimize });
+    const zbor_dep = b.lazyDependency("zbor", .{ .target = target, .optimize = optimize });
+    const zbench_dep = b.lazyDependency("zbench", .{ .target = target, .optimize = optimize });
+    if (zig_toml_dep == null or zbor_dep == null or zbench_dep == null) return;
+
     const zig_bson_mod = b.createModule(.{
         .root_source_file = b.path("vendor/zig-bson/src/root.zig"),
         .target = target,
@@ -154,13 +160,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The package itself is just `src/root.zig`; tests and benchmarks import it.
-    const zerde_mod = b.addModule("zerde", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
+    // Tests and benchmarks import the package module.
     const tests_root_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -442,9 +442,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zerde", .module = zerde_mod },
                 .{ .name = "zig_bson", .module = zig_bson_mod },
                 .{ .name = "zig_msgpack", .module = zig_msgpack_mod },
-                .{ .name = "zig_toml", .module = zig_toml_dep.module("toml") },
-                .{ .name = "zbor", .module = zbor_dep.module("zbor") },
-                .{ .name = "zbench", .module = zbench_dep.module("zbench") },
+                .{ .name = "zig_toml", .module = zig_toml_dep.?.module("toml") },
+                .{ .name = "zbor", .module = zbor_dep.?.module("zbor") },
+                .{ .name = "zbench", .module = zbench_dep.?.module("zbench") },
                 .{ .name = "zig_yaml", .module = zig_yaml_mod },
                 // Real text for the string benchmarks: source with many quotes, newlines and backslashes, and prose.
                 .{ .name = "corpus_code", .module = b.createModule(.{ .root_source_file = b.path("tests/typed_tests.zig") }) },

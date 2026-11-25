@@ -136,6 +136,8 @@ And from your Zig code:
 const zerde = @import("zerde");
 ```
 
+The package is one module, `zerde`, rooted at `src/root.zig`. It imports no third-party code, and Zig analyzes only the formats you name, so a build that uses `zerde.json`, `zerde.cbor`, `zerde.typed`, `zerde.wire` or `zerde.reflect` compiles none of the others. The `toml`, `zbor` and `zbench` dependencies in `build.zig.zon` are lazy and serve only this repository's benchmarks; a consumer never fetches them. The package's `.paths` are `build.zig`, `build.zig.zon`, `LICENSE.md`, `README.md` and `src`, so `zig fetch` hashes only those; keep any file `src/` needs inside `src/`.
+
 Benchmark history and per-format runs live in [`bench/`](bench).
 
 ## CLI

@@ -5,28 +5,26 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .toml = .{
+            .lazy = true,
             .url = "git+https://github.com/sam701/zig-toml#ad204acbf239a2b819d86845f8ba650532786126",
             .hash = "toml-0.3.0-bV14BdyjAQDsja1zOCQ5Hpzjasu7EjR7fsR9YZHgtVlE",
         },
         .zbor = .{
+            .lazy = true,
             .url = "git+https://codeberg.org/r4gus/zbor#11115509222fc12852a25f945cce152aaeba8be2",
             .hash = "zbor-0.23.0-kr-CoJc2BAAiIloJs2bFGRVifqreyeAHmhNnEWtKRE97",
         },
         .zbench = .{
+            .lazy = true,
             .url = "git+https://github.com/hendriknielaender/zBench#f12a2262bcd9d300207890555c577da5e29de453",
             .hash = "zbench-0.14.1-YTdc781OAQCR6wxqkgAwm9bG4TnFGzm8c9aE-ZPiTAU1",
         },
     },
     .paths = .{
-        ".githooks",
-        "AGENTS.md",
-        "CONTRIBUTING.md",
         "build.zig",
         "build.zig.zon",
-        "bench",
+        "LICENSE.md",
         "README.md",
         "src",
-        "tests",
-        "vendor",
     },
 }
