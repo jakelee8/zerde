@@ -20,23 +20,33 @@ characters of a JSON string, and finding the next byte that a JSON string cannot
 
 Changes since previous run: on targets with 64-byte vectors, the string scan takes two 32-byte steps before it switches to 64-byte steps.
 
-"Before" is `aaaf864`, "after" is `4542079`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `taskset -c 3 zig build bench-bulk -Doptimize=ReleaseFast`, three runs each, alternating. The "bulk" column gives µs per operation.
+Base is `aaaf864`; tip is `4542079`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `taskset -c 3 zig build bench-bulk -Doptimize=ReleaseFast`, three runs each, alternating. The "bulk" column gives µs per operation; the last column is tip over base, run by run. Both sides embed `README.md` as of `aaaf864` for the prose rows.
 
-| Row | Base µs (3 runs) | Two-stage µs (3 runs) | Ratio |
+| Row | Base µs (3 runs) | Tip µs (3 runs) | Tip / base |
 | --- | ---: | ---: | ---: |
-| ascii find special | 2.5 / 2.6 / 2.6 | 2.6 / 2.5 / 2.5 | 0.94 to 1.01 |
+| ascii validate utf-8 | 1.4 / 1.4 / 1.2 | 1.3 / 1.3 / 1.4 | 0.94 to 1.11 |
+| ascii validate words | 6.3 / 6.3 / 6.4 | 6.8 / 6.6 / 6.6 | 1.04 to 1.07 |
 | ascii escape | 4.9 / 4.6 / 4.7 | 4.5 / 4.3 / 4.4 | 0.91 to 0.95 |
+| ascii find special | 2.5 / 2.6 / 2.6 | 2.6 / 2.5 / 2.5 | 0.94 to 1.01 |
+| escapes validate utf-8 | 1.3 / 1.3 / 1.3 | 1.3 / 1.3 / 1.3 | 0.99 to 1.04 |
+| escapes validate words | 6.3 / 6.3 / 6.3 | 6.4 / 6.5 / 6.8 | 1.02 to 1.09 |
+| escapes escape | 22.2 / 22.5 / 22.2 | 22.5 / 22.3 / 22.6 | 0.99 to 1.02 |
 | escapes find special | 19.9 / 20.9 / 19.8 | 18.4 / 18.3 / 18.2 | 0.88 to 0.92 |
+| multibyte validate utf-8 | 83.4 / 82.1 / 82.1 | 82.6 / 82.7 / 82.0 | 0.99 to 1.01 |
+| multibyte validate words | 92.2 / 92.0 / 94.7 | 100.1 / 100.1 / 99.8 | 1.05 to 1.09 |
+| multibyte escape | 4.7 / 4.7 / 4.7 | 4.4 / 4.5 / 4.6 | 0.94 to 0.98 |
 | multibyte find special | 2.5 / 4.7 / 2.5 | 2.7 / 2.5 / 2.6 | 0.54 to 1.08 |
 | code 1 find special | 69.4 / 69.7 / 69.9 | 63.7 / 63.4 / 62.8 | 0.90 to 0.92 |
 | code 1 escape | 91.0 / 92.3 / 90.9 | 85.9 / 85.1 / 86.1 | 0.92 to 0.95 |
+| code 2 find special | 15.6 / 15.5 / 15.5 | 14.5 / 14.4 / 14.5 | 0.93 to 0.93 |
+| code 2 escape | 17.8 / 17.8 / 17.9 | 17.7 / 17.8 / 17.7 | 0.99 to 1.00 |
 | prose find special | 3.4 / 3.5 / 3.5 | 3.3 / 3.3 / 3.3 | 0.95 to 0.97 |
 | prose escape | 4.5 / 4.5 / 4.5 | 4.4 / 4.4 / 4.4 | 0.97 to 0.98 |
-| cbor to json render | 12.7 / 15.7 / 12.6 | 12.0 / 11.7 / 11.7 | 0.74 to 0.94 |
-| escape, 64 KiB | 231.8 / 231.1 / 234.5 | 188.9 / 193.3 / 189.8 | 0.81 to 0.84 |
-| render, 64 KiB | 230.5 / 230.6 / 230.5 | 194.2 / 191.5 / 191.3 | 0.83 to 0.84 |
+| ascii cbor to json render, trusted vs checked | 12.7 / 15.7 / 12.6 | 12.0 / 11.7 / 11.7 | 0.74 to 0.94 |
+| escapes6 escape, 64 KiB windows | 231.8 / 231.1 / 234.5 | 188.9 / 193.3 / 189.8 | 0.81 to 0.84 |
+| escapes6 render, 64 KiB windows | 230.5 / 230.6 / 230.5 | 194.2 / 191.5 / 191.3 | 0.83 to 0.84 |
 
-Every row is at or below the base within run-to-run spread: the largest ratios are 1.01 (ascii, find special) and 1.08 (multibyte, against a base whose other two runs are 2.5 µs and one is 4.7 µs). The escape-dense 64 KiB rows are 0.81 to 0.84.
+The scan rows (find special, escape, render) are 0.74 to 1.02, apart from one multibyte find special run against a 4.7 µs base outlier; the escape-dense 64 KiB rows are 0.81 to 0.84. The validate words rows are 1.02 to 1.09. They do not call the scan, so the difference is probably code layout or noise.
 
 ## 2026-11-25 - e07eb8c
 

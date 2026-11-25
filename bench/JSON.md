@@ -33,9 +33,9 @@ Runs before `8a3a0a9` used the older simpler payload, so they are not directly c
 
 Changes since previous run: on targets with 64-byte vectors, the string scan takes two 32-byte steps before it switches to 64-byte steps. Most strings in this payload end within the first step.
 
-Base is `aaaf864`; tip is `4542079`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `taskset -c 3 zig build bench-json -Doptimize=ReleaseFast`, alternating base and tip, load 2 to 5.
+Base is `aaaf864`; tip is `4542079`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `taskset -c 3 zig build bench-json -Doptimize=ReleaseFast`, alternating base and tip, load 2 to 5. The last column is tip over base, run by run.
 
-| Scenario | Row | Base ns/op (3 runs) | Two-stage ns/op (3 runs) | Ratio |
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
 | --- | --- | ---: | ---: | ---: |
 | small | parse zerde | 4,131 / 4,857 / 4,397 | 4,298 / 4,086 / 4,072 | 0.84 to 1.04 |
 | small | parse std.json | 7,714 / 7,711 / 9,602 | 10,208 / 8,510 / 7,878 | 0.82 to 1.32 |
@@ -58,8 +58,8 @@ Base is `aaaf864`; tip is `4542079`. Environment: `Linux x86_64` (WSL2, 24 cores
 
 Notes:
 
-- Large parse is 0.89 to 0.97 of the base. The third medium tip run is slow for `std.json` too (2,749,254 ns), so that run was disturbed; the other two medium tip runs are 0.95 of the base.
-- A standalone probe pinned to one core took the best of 12 large or 400 medium parses with a retained arena. Large parse: 108.6 to 110.4 ms in five of six rounds (one round 116.8 ms), against 116.1 to 119.0 ms at `aaaf864` and 114.1 to 115.0 ms at `03beb0e`. Medium parse: 1,039,610 to 1,057,201 ns, against 1,113,962 to 1,119,153 ns and 1,093,722 to 1,107,831 ns.
+- Large parse is 0.89 to 0.97 of the base. The third medium tip run is slow for `std.json` too (2,749,254 ns), so that run was probably disturbed; the other two medium tip runs are 0.95 to 0.96 of the base.
+- An ad hoc probe (not in the repository), pinned to one core, took the best of 12 large or 400 medium parses with a retained arena. Large parse: 108.6 to 110.4 ms in five of six rounds (one round 116.8 ms), against 116.1 to 119.0 ms at `aaaf864` and 114.1 to 115.0 ms at `03beb0e`. Medium parse: 1,039,610 to 1,057,201 ns, against 1,113,962 to 1,119,153 ns and 1,093,722 to 1,107,831 ns.
 
 ## 2026-11-25 - e07eb8c
 
