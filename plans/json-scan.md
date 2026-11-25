@@ -18,9 +18,10 @@ variants alternated. Scratch evidence: `tmp/perf2/` (probes `bis.zig`, `skip.zig
 | `e07eb8c` (merged) | 116.4 to 117.6 ms | 1.114 to 1.124 ms |
 
 `bench/JSON.md` (`e07eb8c` section) and `plans/api.md` (i) record the pinned large parse as 1.04 to 1.05 and medium as
-at the base. That probe ran two parses per repetition on a fresh arena, so first-touch page faults inflated it (its
-absolute large figure, 154 to 163 ms, is 30% above the steady-state 114 to 117 ms on the same input). Both records are
-still uncorrected.
+at the base. That figure came from an earlier probe that built a fresh arena for each repetition and timed two parses
+per repetition; its absolute large figures (154.5 to 163.3 ms) are about 35% above the steady-state 114 to 117 ms on the
+same input. Why its ratio differs is not known: a fault cost equal for both builds would pull the ratio toward 1.0, not
+away from it, and that probe's source is gone, so it was not re-run. Both records are still uncorrected.
 
 ### F2. The cause is the 64-byte string scan
 
@@ -54,31 +55,44 @@ model with Zig 0.17.1 (`tmp/simd/cpu.zig`):
 So only builds targeting AMD Zen 4 or Zen 5 scan 64 bytes; every other x86 target scans 32 or 16. The vendor is not
 consulted at run time: the width is fixed when the code is compiled, from the target CPU.
 
-### F4. Mechanism: per-string latency, not throughput
+### F4. Mechanism: latency per string is one candidate; code size and layout is another
 
 - The compiled scan is the same instruction sequence at 32 and 64 bytes with wider registers (`tmp/simd/dis.zig`,
-  objdump). Whole-run instruction counts: 34.98 G (64) against 34.88 G (16-byte cap); cycles about 10% higher at 64.
+  objdump). Code size per inlined call site and instruction encoding length were not compared. Whole-run instruction
+  counts: 34.98 G (64) against 34.88 G (16-byte cap); cycles about 10% higher at 64.
 - In the hottest parse function (`typed.deserializeStruct`) the vector and mask instructions take 0.20 s of cycles at 64
   against 0.09 s at 16; other functions are unchanged, so it is not a core-wide slowdown such as the Zen 5 AVX-512 IPC
   throttling Chips and Cheese measured on this CPU model (link below).
-- Payload strings: 7.66 million per large parse, all but one under 16 bytes.
-- Scanning those strings as independent calls (`tmp/simd/real.zig`): 0.78 to 0.79 ns per string at 16 and 32, 0.83 at
-  64 (about 6%). In a chain where each scan's start depends on the previous result (`tmp/simd/micro.zig`), 64 bytes adds
-  about 0.3 ns per string with an aligned start and another 0.2 to 0.4 ns when the read crosses a cache line. A 64-byte
-  read at a random offset crosses a 64-byte line 63 times in 64.
-- Inference: in the parser the next read waits on where the string ended, so the scan's latency, not its throughput,
-  sets the cost. No published Zen 5 latency figure for a split 64-byte load was found.
+- Payload strings: 7.57 million keys and values per large parse (F9's census, which skips escaped quotes), all but one
+  under 16 bytes. `tmp/simd/real.zig` took its scan starts from every second quote character, 7.66 million starts.
+- Scanning from those starts as independent calls: 0.78 to 0.79 ns per start at 16 and 32, 0.83 at 64 (about 6%). In a
+  chain where each scan's start depends on the previous result (`tmp/simd/micro.zig`), 64 bytes adds about 0.3 ns per
+  string with an aligned start and another 0.2 to 0.4 ns when the read crosses a cache line. A 64-byte read at a random
+  offset crosses a 64-byte line 63 times in 64.
+- Candidate 1 (inference): in the parser the next read waits on where the string ended, so the scan's latency, not its
+  throughput, sets the cost. No published Zen 5 latency figure for a split 64-byte load was found.
+- Candidate 2: code size and layout. Inlining alone moves the parse by 13% (F6: 124.2 against 109.7 ms), more than the
+  whole width effect, and a wider scan inlines a larger body at each call site.
+- The sizes do not match: the parse gap is about 9 ms over 7.57 million strings, about 1.2 ns per string, against 0.05
+  ns (independent) and 0.3 to 0.7 ns (chained) in the microbenchmarks. Neither candidate is established.
 
-### F5. Long text pays for a narrower scan
+### F5. Long ASCII and multibyte text pays for a narrower scan; escape-dense text does not
 
-`zig build bench-bulk -Doptimize=ReleaseFast`, the "bulk" column, ns, two runs each:
+`taskset -c 3 zig build bench-bulk -Doptimize=ReleaseFast` from three checkouts of `aaaf864` that differ only in
+`src/bulk.zig`, five runs each, alternating, the "bulk" column, ns, lowest to highest (logs:
+`tmp/review-scan/bulk/w{64,32,16}-{1..5}.log`):
 
 | Row | 64 | 32 cap | 16 cap |
 | --- | ---: | ---: | ---: |
-| ascii, find special | 2,553 / 2,590 | 5,144 / 6,540 | 9,326 / 9,395 |
-| ascii, escape | 4,639 / 4,580 | 7,278 / 7,282 | 12,192 / 12,195 |
-| code 1, find special | 69,902 / 69,488 | 82,292 / 77,230 | 104,056 / 103,176 |
-| prose, find special | 3,479 / 3,463 | 3,761 / 3,380 | 3,606 / 3,664 |
+| ascii, find special | 2,603 to 3,252 | 5,051 to 6,927 | 9,871 to 10,380 |
+| ascii, escape | 4,771 to 5,951 | 7,512 to 8,849 | 12,824 to 14,805 |
+| escapes, find special | 20,265 to 20,969 | 19,379 to 20,697 | 20,962 to 21,603 |
+| multibyte, find special | 2,594 to 2,773 | 4,990 to 5,565 | 9,954 to 11,308 |
+| code 1, find special | 72,203 to 74,034 | 83,491 to 87,827 | 116,050 to 124,370 |
+| prose, find special | 3,455 to 3,683 | 3,342 to 3,586 | 3,816 to 4,456 |
+| escapes6, escape, 64 KiB windows | 242,082 to 244,896 | 217,704 to 226,969 | 203,712 to 223,223 |
+
+Ranges overlap between widths on the escapes and prose rows; on the ascii, multibyte and code rows they do not.
 
 ### F6. Two-stage scans
 
@@ -106,7 +120,9 @@ In the parser (two 32-byte steps then 64, `tmp/perf2/exp-U`, `exp-V`):
 
 ### F7. What simdjson does
 
-- First pass (`src/generic/stage1/json_string_scanner.h`): classifies the whole document in 64-byte blocks into bit
+- First pass: the string and escape masks are built in `src/generic/stage1/json_string_scanner.h`, the structural
+  classification in `json_scanner.h`, and the positions are written in `json_structural_indexer.h`. It classifies the
+  whole document in 64-byte blocks into bit
   masks (quotes, backslashes, escaped quotes, inside-string, structural characters) and writes the positions of
   structural characters and value starts. A block is 2 × 32-byte registers on AVX2, 1 × 64 on its AVX-512 kernel, and 4
   × 16 on NEON and SSE. Its cost is per input byte; no step waits on where a string ended.
@@ -144,10 +160,10 @@ In the parser (two 32-byte steps then 64, `tmp/perf2/exp-U`, `exp-V`):
 - Large document: 112.8 MB; 16.2 M structural characters, 7.57 M strings, 6.39 M numbers or literals (`tmp/perf2/
   skip.zig` census): about 30 M tokens, one per 3.7 bytes. Medium: 1.14 MB, 306 k tokens.
 - Parse: 116.5 ms (about 1 GB/s, 3.9 ns per token).
-- Bounds on what a first pass could remove: scanning every string as independent calls takes 6.0 to 6.4 ms (about 5.5%
-  of the parse); the cost of the scan waiting is up to about 9 ms (F2's 64 against 16); the profile share of the string
-  and key functions, which also copy strings and match keys, is about 20%. The pass itself reads every byte and writes
-  every position. No first pass was built or measured.
+- Three different measures of what a first pass could remove, not one ceiling: scanning every string as independent
+  calls takes 6.0 to 6.4 ms (about 5.5% of the parse); the width effect alone is about 9 ms (F2's 64 against 16); the
+  profile share of the string and key functions, which also copy strings and match keys, is about 20%. The pass itself
+  reads every byte and writes every position. No first pass was built or measured.
 - Index memory: 4 bytes per position. Exact for this document 121 MB (1.2 MB medium); simdjson-style reservation of one
   position per input byte 451 MB (4.6 MB medium). A typed read today allocates only its output, so a whole-document
   index would be a new term in the wire region sizes (`wire.regionSizes`, `resumableRegionSizes`).
@@ -163,16 +179,21 @@ against 1.12 to 1.14 ms). Not investigated further.
 ### A. Scan width on 64-byte targets (Zen 4/5 builds only)
 
 - **A1. Keep 64.** Long text keeps its speed (F5); large and medium parse stay about 1.02 of the base (F1).
-- **A2. Cap at 32 in `bulk.findSpecial`.** Parse 108 to 110 ms (F2); long text 1.0 to 2.6 times slower on the bulk rows
-  (F5); every x86 target then scans at most 32 (F3).
-- **A3. Two-stage: two 32-byte steps inline, then the 64-byte loop out of line.** Parse about the cap's (F6); long-text
-  speed predicted near 64 by the microbenchmark but not measured in this form; adds a second code path and needs the
-  endian branch in the first stage.
-- **A4. Runtime dispatch by CPU.** Compile the scan per CPU level or model and choose at startup (F7, F8). Only matters
-  for a binary built for several CPUs; zerde is compiled from source for the consumer's target, which fixes the width
-  today (F3).
+- **A2. Cap at 32 in `bulk.findSpecial`.** Parse 108 to 110 ms (F2); long text slower on some bulk rows (F5); every x86
+  target then scans at most 32 (F3).
+- **A3. Cap at 16.** Parse 107 to 108 ms (F2); long text slower than at 32 on the same rows (F5).
+- **A4. Two-stage: two 32-byte steps inline, then the 64-byte loop out of line.** Parse about the 32 cap's (F6);
+  long-text speed predicted near 64 by the microbenchmark but not measured in this form; adds a second code path and
+  needs the endian branch in the first stage.
+- **A5. Keep 64 and avoid the cache-line split.** Load the aligned 64-byte block that holds `from` and shift the bits
+  before `from` off the mask, as aligned-block scanners do. Tests F4's split-load part directly; not measured.
+- **A6. A build option for the width,** so a build chooses 16, 32 or 64 instead of the comptime default.
+- **A7. Runtime dispatch by CPU.** Compile the scan per CPU level or model and choose at startup (F7, F8). A binary
+  built for a CPU level runs on Intel and AMD alike and has one width today (F3: 16 for baseline, 32 for `x86_64_v3`
+  and `_v4`); dispatch would let such a binary use another width on CPUs that have it. A build for a specific CPU, such
+  as zerde's users compiling from source for their own target, fixes the width at compile time.
 
-Each of A2 to A4 changes `src/bulk.zig`, its tests and `tests/mutants.py`, and needs `bench-json`, `bench-cbor`
+Each of A2 to A7 changes `src/bulk.zig` (A6 also `build.zig`), its tests and `tests/mutants.py`, and needs `bench-json`, `bench-cbor`
 (CBOR to JSON transcoding uses the same scan) and `bench-bulk` runs with log entries. Every option is independent of
 correcting the F1 records.
 
@@ -186,7 +207,7 @@ correcting the F1 records.
   window.
 
 Any of B1 and B2 changes the JSON reader's token functions (string, key, whitespace, skip, `Raw`) and error positions.
-The gain on this payload is bounded by F9.
+F9 gives three measures of the share it could remove on this payload.
 
 ### C. The skip path (F10)
 
@@ -195,5 +216,6 @@ The gain on this payload is bounded by F9.
 
 ### D. The records
 
-- **D1. Correct `bench/JSON.md` and `plans/api.md` (i) to the steady-state figures of F1**, with the reason the earlier
-  probe was inflated.
+- **D0. Leave them.**
+- **D1. Correct `bench/JSON.md` and `plans/api.md` (i) to the steady-state figures of F1**, stating that the earlier
+  probe's ratio is not reproduced and its cause is not known.
