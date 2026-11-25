@@ -53,8 +53,9 @@ on (b).
   in it, each with a message that names the rule:
   - A `packed union` field. Its members are views of the same bits, and one member may be an exhaustive enum or a
     packed struct with padding that the bits do not define. Zig 0.17.1 panics with "invalid enum value" when such a
-    member is read after `@fromBackingInt` with bits that name no tag. No member is the active one, so no field-by-field
-    check can apply.
+    member is read after `@fromBackingInt` with bits that name no tag (probed: `packed struct(u8){ u: packed union{ a:
+    u2, b: enum(u2){ a, b, c } }, _: u6 }` from bits 3, then `@tagName(g.u.b)`). No member is the active one, so no
+    field-by-field check can apply.
   - A field whose width depends on the target: `usize`, `isize`, or a C integer type. The backing width, and so the wire
     integer, would then differ between wasm32 and a 64-bit target. The wire integer rule refuses these types for the
     same reason (`wire.zig:81-86`). That rule's test becomes one function, `isTargetSized(T)`, which both rules call.
@@ -103,7 +104,9 @@ on (b).
 (`packed_repr = .fields`) is not included.
 
 **Docs.** README lists `.@"packed"` among the kinds of `reflect.kindOf` (`README.md:319`) and describes the packed
-form. CHANGELOG states that `reflect.Kind` has a new value, which breaks a switch over every value.
+form. CHANGELOG states that `reflect.Kind` has a new value, which breaks a switch over every value. The README says
+that a write does not check the bits, as a write repeats no read-side check (`README.md:269`): a value built with a set
+`_` bit is written as it is and refused when read.
 
 **Acceptance.**
 - Round trips of a `packed struct(u8)` field with padding pass in every format.
@@ -190,9 +193,15 @@ many times.
 that a decode of the same type uses. Its limits bound the rebuild, and nothing else.
 - `fromWire` refuses, while it rebuilds for `encode`, a list longer than the bound a read applies to it: the field's or
   element's `max_len` (`meta.Bounds`, through `.elem`), with the read's error (`typed.checkLength`).
-- It counts every element it rebuilds against `max_items` (`error.TooManyItems`). Counting rebuilt elements, not stored
-  ones, bounds aliasing and a span that names its own container. Each level of nesting rebuilds at least one element,
-  so `max_items` bounds the depth too, and so the recursion.
+- It counts its nesting against `limitsOf(Format, read_cfg).max_depth` (128 when the config sets none, `wire.zig:658`),
+  as a read does, and refuses one level more with the format's own error (`error.CborNestingTooDeep`,
+  `error.JsonNestingTooDeep`). This bounds the recursion whatever the other limits are: a span that names its own
+  container recurses one level per rebuild, and the stack cannot hold the levels a large arena would allow.
+- When `read_cfg` sets `max_items`, it counts every element it rebuilds against it (`error.TooManyItems`). Counting
+  rebuilt elements, not stored ones, bounds aliasing.
+- `encodeArenaSize` needs a bound for every list, as `regionSizes` does: a field's `max_len`, or `max_items` in
+  `read_cfg`. A list with neither is a compile error from the same rule (`bound`, `wire.zig:789-791`), raised by both
+  `encode` and `encodeArenaSize`, so `encode` never runs with no finite arena size.
 - These checks bound the arena. They do not make the output readable under `read_cfg`: `encode` does not apply
   `min_len`, `min`, `max`, a struct's `check` or a `Raw` validator, and a write config and a read config can disagree,
   for example on determinism. The writers' own checks stay as they are (`emitRaw` checks a `Raw` item,
@@ -210,7 +219,9 @@ layout with `describe`. That needs no arena, but it repeats the write rules that
 **Acceptance.**
 - `encode` of a value built at the limits succeeds in `encodeArenaSize`, which is at least its observed peak. It fails
   at that peak minus one.
-- `encode` refuses a list longer than its `max_len` and a value whose spans alias past `max_items`.
+- `encode` refuses a list longer than its `max_len`, a value whose spans alias past `max_items`, and a span that names
+  its own container, with the depth error at `max_depth + 1` levels, under a `read_cfg` that sets no `max_items`.
+- `encode` with a `read_cfg` without `max_items`, of a type whose list has no `max_len`, fails to compile.
 - Existing encode tests pass the new parameter.
 - README and CHANGELOG state the new parameter, the size function, and `fromWire`'s new parameter, and say that the
   limits bound the arena and do not make the output readable under `read_cfg`.
@@ -235,10 +246,15 @@ function decodes an escaped string, and an escaped member name, into the allocat
 No size counts those bytes today; the output's 256-byte slack hides a short one.
 
 **Design.**
-- A field option `validate_bytes: usize` states the most bytes the validator allocates for one item. Under a wire
-  decode, a `validate` without `validate_bytes` is a compile error. The typed (non-wire) read keeps accepting it as
-  today.
-- Both call sites run the validator on a `FixedBufferAllocator` over a block of `validate_bytes`. They give the block
+- A field option `validate_bytes: usize` states the most bytes the validator allocates for one item.
+- When `validate_bytes` is set, every read runs the validator on a block of that size, as below. A typed read takes
+  the block from the allocator it was given and frees it after the call, so a validator that exceeds its bound fails
+  with `OutOfMemory` there too, and a test of the typed read catches an understated bound.
+- When it is not set, a typed read passes its allocator, as today, and a wire read is a compile error. The read knows
+  it is a wire read by its sink: `WireSink` declares `pub const fixed_regions = true;`. `readRawSlice` and the
+  resumable `raw` (`typed_resume.zig:150-160`) take the sink type as a comptime parameter, and their callers pass
+  `@TypeOf(s)`. `TypedSink` declares nothing.
+- Both wire call sites run the validator on a `FixedBufferAllocator` over a block of `validate_bytes`. They give the block
   back right after the call. So growth stranded inside the block never outlives the call, and the cost does not grow
   with the number of items.
   - `readRawSlice` takes the block from the reader's own allocator. That is the `allocator` field of the deserializer,
@@ -249,7 +265,7 @@ No size counts those bytes today; the output's 256-byte slack hides a short one.
   - The resumable read has no scratch. It takes the block from the end of the output arena, with a mark and restore of
     `end_index`, as the `check` rebuild does. `resumableRegionSizes` and `streamRegionSizes` add the largest
     `validate_bytes` to `output`. Their doc line that `scratch` is empty stays true.
-  - The typed read without a wire region keeps passing its allocator.
+  - A typed read takes the block from its own allocator, as above.
 - `cbor` and `json` export the scratch their own validators need as comptime functions of a read config:
   `cbor.validateScratch(cfg)` for `cbor.validate`, and `cbor.pullReaderScratch(cfg)` and `json.pullReaderScratch(cfg)`
   for a validator that reads the item with `pullReader`, as the README describes. A caller can then state
@@ -257,12 +273,12 @@ No size counts those bytes today; the output's 256-byte slack hides a short one.
   `wire.zig:749-795`, which the `.raw` arm already uses at `wire.zig:983`), because a validator grows lists in a fixed
   buffer that can resize only its last allocation. There is no second sizing rule.
 - `json.readRaw` uses the reader's own allocator, as `cbor.readRaw` does (`cbor.zig:717-722`). So a `json.Raw` takes
-  nothing from the output. Its decoded strings move to scratch, so the `.raw` arm's JSON scratch gains a term: the
-  longest string `skipValue` can decode inside the item, which is `fieldLimit(max_len, max_string_len)` of the item
-  (at most `n`), plus alignment. `skipValue` holds one such string at a time and frees it before the next, so the term
-  is the largest one, not their sum. It adds to the recorded names (`json_spans`), which are live at the same time.
-  The implementor confirms by a test whether the freed string's bytes are reclaimed with the records growing after it;
-  if not, the term is the sum the test shows, and the plan is revised.
+  nothing from the output. Its decoded strings move to scratch, so the `.raw` arm's JSON scratch gains a term of `n`
+  bytes, the item's bound, added to the recorded names (`json_spans`), which are live at the same time. The term is the
+  sum of the strings, not the largest: `nextObjectField` decodes a key into the allocator before it adds that key's
+  record with the same allocator (`json.zig:654-663`), so once the records grow past the key, freeing the key does not
+  reclaim it. Each decoded string is no longer than its escaped text, and those texts do not overlap in the item, so
+  together they take at most `n` bytes.
 
 **Decided.** Allowed with a declared byte bound. The alternative was a compile error
 for any `validate` there, which keeps the API smaller but drops the README's own example.
@@ -273,9 +289,10 @@ for any `validate` there, which keeps the API smaller but drops the README's own
 - The same holds through the resumable read with `resumableRegionSizes()`.
 - A validator that allocates more than its `validate_bytes` fails with `OutOfMemory`, not a write past the region.
 - A `json.Raw` with an escaped string leaves `used` unchanged.
-- A `json.Raw` with an escaped string as long as its bound, and one with an escaped member name of that length,
-  succeed in a scratch of `regionSizes().scratch`, which is at least the observed peak, and fail with `OutOfMemory` at
-  that peak minus one.
+- A `json.Raw` with one escaped string as long as its bound, and one whose object has many escaped member names that
+  together fill its bound, each succeed in a scratch of `regionSizes().scratch`, which is at least the observed peak,
+  and fail with `OutOfMemory` at that peak minus one.
+- A wire read of a `Raw` with `validate` and no `validate_bytes` fails to compile; a typed read of it compiles.
 - README and CHANGELOG state `validate_bytes`, that a wire read requires it for any `validate` (a breaking change for a
   wire read whose validator allocates nothing; it states `0`), and the scratch functions `cbor` and `json` export.
 - A mutant covers each new guard.
