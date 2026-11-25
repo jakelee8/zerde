@@ -116,7 +116,7 @@ Native format examples and browser-oriented wasm examples live in [`examples/`](
 Add `zerde` as a Zig dependency:
 
 ```sh
-zig fetch --save git+https://github.com/jakelee8/zerde#feat/zig-package
+zig fetch --save git+https://github.com/jakelee8/zerde#feat/deterministic-cbor
 ```
 
 `zig fetch --save` writes the commit URL and the package hash into your `build.zig.zon`; pin the commit, not the branch name, once it is there.
