@@ -4,6 +4,9 @@
 //! through a small serializer/deserializer protocol. The backend knows how to
 //! emit or read one concrete format; this file knows how to walk arbitrary Zig
 //! data structures.
+//!
+//! A deserializer refuses an object that names a key twice (`error.DuplicateField`) at the latest when the object ends; the
+//! typed layer checks only declared fields (`seen`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

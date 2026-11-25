@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const typed = @import("typed.zig");
 const meta = @import("meta.zig");
+const repeat = @import("repeat.zig");
 const Number = typed.Number;
 const StringToken = typed.StringToken;
 const ValueKind = typed.ValueKind;
@@ -40,7 +41,14 @@ const Frame = struct {
 const ReaderFrame = struct {
     kind: ContainerKind,
     end: usize,
+    /// Where a document's keys start in the repeat record.
+    keys: usize = 0,
 };
+
+/// A document's keys are C strings, compared as bytes.
+fn keyOrder(a: []const u8, b: []const u8) std.math.Order {
+    return std.mem.order(u8, a, b);
+}
 
 const BsonType = enum(u8) {
     double = 0x01,
@@ -60,12 +68,11 @@ pub fn serializer(writer: *std.Io.Writer, comptime cfg: anytype) BsonSerializer(
 
 pub fn readerDeserializer(allocator: Allocator, reader: *std.Io.Reader, comptime cfg: anytype) !BsonDeserializer(@TypeOf(cfg)) {
     const input = try reader.allocRemaining(allocator, .limited(effectiveMaxInputBytes(cfg)));
-    return BsonDeserializer(@TypeOf(cfg)).initOwned(input, cfg);
+    return BsonDeserializer(@TypeOf(cfg)).initOwned(allocator, input, cfg);
 }
 
 pub fn sliceDeserializer(allocator: Allocator, input: []const u8, comptime cfg: anytype) !BsonDeserializer(@TypeOf(cfg)) {
-    _ = allocator;
-    return BsonDeserializer(@TypeOf(cfg)).initBorrowed(input, cfg);
+    return BsonDeserializer(@TypeOf(cfg)).initBorrowed(allocator, input, cfg);
 }
 
 pub fn BsonSerializer(comptime Config: type) type {
@@ -264,6 +271,8 @@ pub fn BsonSerializer(comptime Config: type) type {
 
 pub fn BsonDeserializer(comptime Config: type) type {
     return struct {
+        /// Where the key record is allocated: the allocator the deserializer was made with.
+        allocator: Allocator,
         input: []const u8,
         cfg: Config,
         index: usize = 0,
@@ -272,11 +281,14 @@ pub fn BsonDeserializer(comptime Config: type) type {
         pending_type: ?BsonType = null,
         stack: [128]ReaderFrame = undefined,
         stack_len: usize = 0,
+        /// The keys of the documents open, each checked for a repeat when its document closes.
+        repeats: repeat.Record([]const u8, keyOrder) = .{},
 
         const Self = @This();
 
-        fn initBorrowed(input: []const u8, cfg: Config) Self {
+        fn initBorrowed(allocator: Allocator, input: []const u8, cfg: Config) Self {
             return .{
+                .allocator = allocator,
                 .input = input,
                 .cfg = cfg,
                 .owns_input = false,
@@ -284,8 +296,9 @@ pub fn BsonDeserializer(comptime Config: type) type {
             };
         }
 
-        fn initOwned(input: []const u8, cfg: Config) Self {
+        fn initOwned(allocator: Allocator, input: []const u8, cfg: Config) Self {
             return .{
+                .allocator = allocator,
                 .input = input,
                 .cfg = cfg,
                 .owns_input = true,
@@ -294,6 +307,7 @@ pub fn BsonDeserializer(comptime Config: type) type {
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
+            self.repeats.deinit(self.allocator);
             if (self.owns_input) allocator.free(@constCast(self.input));
         }
 
@@ -420,21 +434,21 @@ pub fn BsonDeserializer(comptime Config: type) type {
             try self.push(.{
                 .kind = .object,
                 .end = try self.readDocumentEnd(),
+                .keys = self.repeats.mark(),
             });
         }
 
+        /// The next key of the document being read, recorded for the repeat check when the document closes.
         pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {
+            const token = (try self.nextSortedKey(allocator)) orelse return null;
+            try self.repeats.add(self.allocator, token.bytes);
+            return token;
+        }
+
+        /// The next key of a `SortedMap`, not recorded: the sorted map checks its own keys.
+        pub fn nextSortedKey(self: *Self, allocator: Allocator) !?StringToken {
             _ = allocator;
-            const frame = self.current();
-            if (frame.kind != .object) return error.InvalidBsonState;
-
-            if (self.index == frame.end - 1) {
-                if (self.input[self.index] != 0x00) return error.InvalidDocumentTerminator;
-                self.index += 1;
-                _ = self.pop();
-                return null;
-            }
-
+            if (!try self.startKey()) return null;
             const tag = try self.readTag();
             const key = try self.readCString();
             self.pending_type = tag;
@@ -444,10 +458,38 @@ pub fn BsonDeserializer(comptime Config: type) type {
             };
         }
 
+        /// The next key of a struct's document, matched to one of `T`'s fields; one that names no field is `.unknown`.
+        pub fn nextObjectFieldIndex(self: *Self, comptime T: type, comptime cfg: anytype) !typed.ObjectFieldLookup {
+            if (!try self.startKey()) return .end;
+            const tag = try self.readTag();
+            const key = try self.readCString();
+            self.pending_type = tag;
+            if (typed.matchStructFieldIndex(T, cfg, key)) |index| return .{ .field_index = index };
+            // With unknown members denied and no extras the typed layer fails at once, so a record would only cost memory.
+            if (comptime !(meta.effectiveDenyUnknownFields(T, cfg) and meta.extrasField(T) == null)) {
+                try self.repeats.add(self.allocator, key);
+            }
+            return .unknown;
+        }
+
+        /// Whether the document being read has another element: false at its terminator, with the document closed.
+        fn startKey(self: *Self) !bool {
+            const frame = self.current();
+            if (frame.kind != .object) return error.InvalidBsonState;
+            if (self.index == frame.end - 1) {
+                if (self.input[self.index] != 0x00) return error.InvalidDocumentTerminator;
+                self.index += 1;
+                try self.repeats.close(frame.keys);
+                _ = self.pop();
+                return false;
+            }
+            return true;
+        }
+
         pub fn skipValue(self: *Self, allocator: Allocator) !void {
             _ = allocator;
             const tag = self.takePendingType() orelse return error.InvalidBsonState;
-            try self.skipPayload(tag);
+            try self.skipPayload(tag, self.stack_len);
         }
 
         fn takePendingType(self: *Self) ?BsonType {
@@ -544,21 +586,68 @@ pub fn BsonDeserializer(comptime Config: type) type {
             return value;
         }
 
-        fn skipPayload(self: *Self, tag: BsonType) !void {
+        /// Steps over the payload of a member the typed walk did not read, with `depth` containers open around it.
+        fn skipPayload(self: *Self, tag: BsonType, depth: usize) !void {
+            try self.skipElement(@intFromEnum(tag), depth);
+        }
+
+        /// Steps over the payload of an element of type `tag`, any BSON type, with `depth` containers open around it. A
+        /// document or array is walked element by element within its length, and a document that names a key twice is
+        /// refused, at any depth.
+        fn skipElement(self: *Self, tag: u8, depth: usize) !void {
             switch (tag) {
-                .null => {},
-                .bool => _ = try self.readByte(),
-                .int32 => _ = try self.readLittle(u32),
-                .int64, .double => _ = try self.readLittle(u64),
-                .string => _ = try self.readStringBytes(),
-                .binary => _ = try self.readBinaryBytes(),
-                .document, .array => {
-                    const start = self.index;
-                    const end = try self.readDocumentEnd();
-                    self.index = end;
-                    _ = start;
+                // undefined, null, min key, max key
+                0x06, 0x0A, 0xFF, 0x7F => {},
+                0x08 => _ = try self.readByte(),
+                0x10 => _ = try self.readLittle(u32),
+                // double, UTC datetime, timestamp, int64
+                0x01, 0x09, 0x11, 0x12 => _ = try self.readLittle(u64),
+                // ObjectId, decimal128
+                0x07 => try self.skipBytes(12),
+                0x13 => try self.skipBytes(16),
+                // string, JavaScript code, symbol
+                0x02, 0x0D, 0x0E => _ = try self.readStringBytes(),
+                0x05 => _ = try self.readBinaryBytes(),
+                // regular expression: its pattern and its options
+                0x0B => {
+                    _ = try self.readCString();
+                    _ = try self.readCString();
                 },
+                // DBPointer: a namespace and an ObjectId
+                0x0C => {
+                    _ = try self.readStringBytes();
+                    try self.skipBytes(12);
+                },
+                // JavaScript code with scope: a length that counts itself, the code, and the scope document
+                0x0F => {
+                    const end = try self.readDocumentEnd();
+                    _ = try self.readStringBytes();
+                    try self.skipElement(0x03, depth);
+                    if (self.index != end) return error.InvalidDocumentLength;
+                },
+                0x03, 0x04 => {
+                    if (depth >= self.stack.len) return error.BsonNestingTooDeep;
+                    const document = tag == 0x03;
+                    const end = try self.readDocumentEnd();
+                    const first = self.repeats.mark();
+                    while (self.index < end - 1) {
+                        const element = try self.readByte();
+                        const key = try self.readCString();
+                        // An array's keys are its indices.
+                        if (document) try self.repeats.add(self.allocator, key);
+                        try self.skipElement(element, depth + 1);
+                    }
+                    if (self.index + 1 != end or self.input[self.index] != 0x00) return error.InvalidDocumentTerminator;
+                    self.index += 1;
+                    if (document) try self.repeats.close(first);
+                },
+                else => return error.UnsupportedBsonType,
             }
+        }
+
+        fn skipBytes(self: *Self, len: usize) !void {
+            if (self.input.len - self.index < len) return error.UnexpectedEndOfInput;
+            self.index += len;
         }
 
         fn push(self: *Self, frame: ReaderFrame) !void {
@@ -621,6 +710,7 @@ pub fn parseSliceWith(
     comptime read_cfg: anytype,
 ) ParseError!T {
     var deserializer = try sliceDeserializer(allocator, input, read_cfg);
+    defer deserializer.deinit(allocator);
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
@@ -641,6 +731,7 @@ pub fn parseSliceAliasedWith(
         .max_input_bytes = effectiveMaxInputBytes(read_cfg),
         .borrow_strings = true,
     });
+    defer deserializer.deinit(allocator);
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;

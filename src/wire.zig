@@ -973,12 +973,12 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
             // for a key that is itself an array or map its canonical bytes, once more at each level of
             // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
-            // the most of the two. JSON records a span of the input for each member (`json.KeyRef`) and
-            // a member takes four bytes at least, so `n / 4 + 1` of them; the bound is for either format.
+            // the most of the two. JSON records each member's name as it reads it (`json.RecordedKey`, a slice of the input
+            // and a flag) and a member takes four bytes at least, so `n / 4 + 1` of them; the bound is for either format.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item");
             // The item is itself a container, below the `depth` that hold it.
             const levels = @min(limits.max_depth -| (depth + 1), n / 4 + 1);
-            const json_spans = growth(n / 4 + 1, @sizeOf(json.KeyRef), @alignOf(json.KeyRef));
+            const json_spans = growth(n / 4 + 1, @sizeOf(json.RecordedKey), @alignOf(json.RecordedKey));
             break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1), json_spans) };
         },
         .list => blk: {

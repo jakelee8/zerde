@@ -298,13 +298,10 @@ What they refuse, and why:
   keys compare by value, so two spellings of one key are one key
 - a CBOR tag other than 55799 (self-described CBOR) around a value a typed field reads
   (`error.UnexpectedTag`); a skipped value may carry any tag
-- a JSON object member repeated in a field the type reads (`error.DuplicateField`); RFC 8259 §4 allows
-  repeated names, so this is a policy, and one that has not been settled. A repeated member in a field
-  the type does not read is skipped
-- a JSON object that names a member twice inside a `json.Raw` item, at any depth and however the name is spelled
-  (`a` and `\u0061` are one name): `error.DuplicateField`, as a `cbor.Raw` refuses a repeated key. The read checks the item
-  after it is well-formed, with a record of the names of the objects open, a span of the input each (16 bytes), compared
-  as decoded text when each object closes; `wire.regionSizes` charges that to the scratch region
+- an object or map that names a key twice, in every format and every read, typed or `zerde.value`, at any depth, skipped
+  values included: `error.DuplicateField`, except ZON, which reports `error.ParseZon` from the Zig parser. A JSON name is
+  compared as decoded text (`a` and `\u0061` are one name). RFC 8259 §4 leaves repeated names to the reader; zerde refuses
+  them, as `std.json` does by default
 - in a dynamic `Value`: a JSON integer beyond 128 bits or a float literal too large for a double
   (`error.InvalidNumber` for an integer beyond 128 bits, `error.FloatOutOfRange` for a float literal that overflows); a CBOR map key that is not text
   (`error.UnexpectedType`), a tag (`error.UnexpectedTag`), and a simple value other than false, true and
