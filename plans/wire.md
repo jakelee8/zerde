@@ -23,25 +23,34 @@ per item, in the order below; (b) and (c) both edit `computeSizes`, so (c) start
 
 **Design.** A `packed struct` is a scalar whose value is its backing integer, as an enum is its number under
 `enum_repr = .integer`, and as `std.Io.Writer` prints one (`lib/std/Io/Writer.zig:976-977`).
-- Write `@backingInt(value)` through `emitInteger`. Read an integer of the backing type and `@fromBackingInt` it; any bit
-  that belongs to a field named `_` must be zero, else `error.InvalidValue` (the name of the existing error the
-  implementer finds closest to the enum's refusal of an unknown number; one error, documented).
-- `Wire(T)` of a packed struct is `Wire(Backing)`; `toWire`/`fromWire`/`describe` and `WireSink` treat it as that
-  integer, with the same padding check on `fromWire`; `typedOwned` costs it 0 and does not demand
-  `deny_unknown_fields`. A backing width `Wire` has no integer for is the existing compile error.
-- `reflect.kindOf` is `.int` (its `intRange` is the backing type's), so generators see one integer.
-- TOML and YAML write and read it as an integer; the resumable counts treat it as a scalar.
-- One predicate, `meta.isPacked(T)`, is the only place that recognises the layout; every arm above calls it.
+- One predicate, `meta.isPacked(T)`, recognises the layout, and one pair of functions in `meta` converts:
+  `packedToInt(T, value)` is `@backingInt(value)`, and `packedFromInt(T, int) !T` refuses any bit pattern the type does
+  not define before it calls `@fromBackingInt`: a set bit of a field named `_`, a field of an exhaustive enum type whose
+  bits name no tag, and the same for each field of a nested packed struct, field by field over `field_names` at compile
+  time. The refusal is `error.InvalidValue` (or the existing error the implementer finds closest to the enum's refusal
+  of an unknown number; one error, documented). A field of any other type (integer, bool, non-exhaustive enum) defines
+  every pattern. So `@fromBackingInt` never sees a value it would trap on.
+- Each walk tests `isPacked(T)` at its dispatch, before its struct arm, and continues with `T`'s backing integer type:
+  the typed write (`typed.zig:486`) and read (`typed.zig:979`), the resumable write and read (`typed_resume.zig`),
+  `Wire`, `toWire`, `fromWire`, `describe`, `WireSink` and `typedOwned` (`wire.zig:75-105`, `265-271`, `330-336`,
+  `604-615`, `480-481`, `1008-1014`), the resumable key and frame counts (`resumable.zig:92-101`, `137`, `167-178`),
+  and TOML and YAML (`toml.zig:388-391`, `yaml.zig:423`). The read calls `packedFromInt` on what the integer arm
+  returns; `fromWire` does the same. No `.int` arm is changed, since none sees the packed type.
+- `reflect` gets its own kind, `.@"packed"`, and a `backing` type for it, so a generator sees one integer of that type
+  and the `.int` arms that read `@typeInfo(T).int` (`grep -n '\.int\b.*=>' src/*.zig`, 25 arms) are not reached with a
+  struct type.
 - A field override on a packed struct field that only applies to structs (`rename_all`, `fields`) is a compile error.
-  `min`/`max` bounds stay refused as for any struct (the existing compile error).
+  `min`/`max` bounds stay refused as for any struct (the existing compile error). A backing width `Wire` has no integer
+  for is the existing compile error.
 
 **Open.** None. The bit-for-bit form is the one the type itself defines. Text output by field name
 (a `packed_repr = .fields`) is not proposed.
 
 **Acceptance.** Round trips of a `packed struct(u8)` field with padding in every format; the wire form is the backing
-integer (bytes compared); a set padding bit is refused on read and on `fromWire`; an object where the integer is due is
-refused; `regionSizes` of a type holding one equals that of the same type with a `u8` field; a mutant for the padding
-check and for the scalar dispatch.
+integer (bytes compared); refused on read and on `fromWire`: a set padding bit, an exhaustive-enum field's unnamed
+pattern (`packed struct(u8){ mode: enum(u2){ a, b, c }, _: u6 }` with mode bits 3), and the same inside a nested
+packed struct; an object where the integer is due is refused; `regionSizes` of a type holding one equals that of the
+same type with a `u8` field; mutants for each refusal and for the dispatch.
 
 ## (b) `regionSizes` does not count the rebuild a `check` needs
 
@@ -70,10 +79,13 @@ the check cannot see bytes that are still in the stream. A type whose check read
 **Open.** Whether a stream read should instead copy the text a checked struct holds into the output so `check`
 can see it; that costs output bytes the stream mode exists to avoid, so it is not proposed.
 
-**Acceptance.** A test whose checked list's typed element is larger than its wire form (for example
-`struct { name: []const u8, n: u32 }`) decodes into a region of exactly `regionSizes().output` at the type's limits and
-fails with `OutOfMemory` at one byte less; the same for the resumable read; the stream-mode compile error by a
-compile-fail case or a `@compileError` message test as the repo already does; mutants for the new term.
+**Acceptance.** The region sizes are upper bounds (`computeSizes` adds a 256-byte slack and pools bounds
+conservatively, `wire.zig:930`), so tightness is tested against what a read uses, as the existing tests do
+(`tests/typed_tests.zig:4487`, `7265`). For a type whose checked list's typed element is larger than its wire form (for
+example `struct { name: []const u8, n: u32 }`) at its limits: the decode succeeds in a region of `regionSizes().output`;
+the size is at least the observed peak, the decode's `used` plus the rebuild; and the decode fails with `OutOfMemory`
+in a region of that peak minus one. The same for the resumable read. The stream-mode compile error by a compile-fail
+case or a `@compileError` message test as the repo already does; mutants for the new term.
 
 ## (c) `wire.encode` has no arena bound
 
@@ -83,27 +95,35 @@ size function covers that arena (`README.md:649`). The writers allocate nothing 
 bounded by any limit: `Memory.resolve` checks a span's region and alignment only (`wire.zig:190-206`), so a list may be
 longer than its `max_len`, and spans may alias, so one array can be rebuilt many times.
 
-**Design.** `encode` takes the read limits as a new comptime parameter, `read_cfg` (the config a decode of the same type
-uses: `max_items`, each field's `max_len`), after `format_cfg`. As `fromWire` rebuilds for `encode` it refuses a list
-longer than its field's `max_len` (`error.LengthOutOfBounds`) and counts every element it rebuilds against `max_items`
-(`error.TooManyItems`), so aliasing and a span that names its own container are bounded too. A new
+**Design.** `encode` takes the read config as a new comptime parameter, `read_cfg` (the config a decode of the same type
+uses), after `format_cfg`. As `fromWire` rebuilds for `encode` it applies every bound the read refuses on, with the
+functions the read uses (`typed.checkLength` and the field and element bounds of `meta.Bounds`, `min_len` included), so
+any value `encode` writes reads back under `read_cfg`; and it counts every element it rebuilds against `max_items`
+(`error.TooManyItems`). Counting rebuilt elements, not stored ones, bounds aliasing and a span that names its own
+container: each level of nesting rebuilds at least one element, so the depth is bounded by `max_items` too. A new
 `encodeArenaSize(Format, T, serde_cfg, read_cfg)` returns the rebuild cost of (b)'s algebra over the whole of `T`, and a
 region of that size is enough for any wire value `encode` accepts. `WireSink.check` keeps calling `fromWire` without the
-counting, since a decoded value is already within its limits; the counting is a parameter of `fromWire`, not a copy.
+checks, since a decoded value is already within its limits; the checking is a comptime parameter of `fromWire`, not a
+copy of it.
 
 **Open.** The alternative to the new parameter is to write straight from the wire layout with `describe`, which
 needs no arena but repeats the write rules the module keeps in one place (`wire.zig:1-30`); the new parameter is proposed.
 
-**Acceptance.** `encode` of a value built at the limits fits in exactly `encodeArenaSize` and fails at one byte less; a
-list longer than its `max_len`, and a value whose spans alias past `max_items`, are refused; existing encode tests pass
-the new parameter; README and CHANGELOG state the new parameter and size function; mutants for both refusals.
+**Acceptance.** `encode` of a value built at the limits succeeds in `encodeArenaSize`, which is at least its observed
+peak, and fails at that peak minus one; a list longer than its `max_len` or shorter than its `min_len`, and a value whose
+spans alias past `max_items`, are refused; existing encode tests pass the new parameter; README and CHANGELOG state the
+new parameter and size function; mutants for each refusal.
 
 ## (d) A `Raw` validator under `wire.decodeInto` takes the output region
 
-**Problem.** `readRawSlice` calls `validate(allocator, token.bytes)` with the typed walk's allocator (`typed.zig:1517`),
-which under `decodeInto` is the output region (`wire.zig:394-419`), and `computeSizes`' `.raw` arm reserves nothing for
-it (`wire.zig:966-983`). The built-in `cbor.validate` records map keys there (`cbor.zig:1695-1703`), and the validator the
-README shows (`README.md:321-326`) starts with `allocator.create(CborDeserializer)`, about 7 KB with its 128-entry stack
+**Problem.** A `Raw` validator runs with the walk's allocator on two paths, and no size counts what it takes:
+- `readRawSlice` calls `validate(allocator, token.bytes)` (`typed.zig:1517`); under `decodeInto` that is the output
+  region (`wire.zig:394-419`), and `computeSizes`' `.raw` arm reserves nothing for it (`wire.zig:966-983`).
+- The resumable read calls `validate(allocator, bytes)` (`typed_resume.zig:158`) with the output arena, and
+  `resumableRegionSizes` has no scratch at all (`wire.zig:833`).
+
+The built-in `cbor.validate` records map keys (`cbor.zig:1695-1703`), and the validator the README shows
+(`README.md:321-326`) starts with `allocator.create(CborDeserializer)`, about 7 KB with its 128-entry stack
 (`cbor.zig:536`), so it fails on the first `Raw`. `Bounds.validate` is a function pointer (`meta.zig:84`), whose cost no
 size function can derive. The same arm has a smaller copy: `json.readRaw` passes the walk's allocator to `skipValue`
 (`json.zig:770-776`), which decodes an escaped string into it and frees it.
@@ -111,13 +131,17 @@ size function can derive. The same arm has a smaller copy: `json.readRaw` passes
 **Design.**
 - A field option `validate_bytes: usize` states the most bytes the validator allocates for one item. Under a wire decode
   a `validate` without `validate_bytes` is a compile error; the typed (non-wire) read keeps accepting it as today.
-- `readRawSlice` runs the validator on a `FixedBufferAllocator` of `validate_bytes` taken from the reader's own scratch
-  for the call and given back after it, so the cost does not grow with the number of items. `computeSizes` adds the
-  largest `validate_bytes` reachable from the root to `scratch`. The typed read without a wire region keeps passing its
-  allocator.
+- Both call sites run the validator on a `FixedBufferAllocator` of `validate_bytes` for the call and give it back after,
+  so the cost does not grow with the number of items. Under `decodeInto` and `decode` it is taken from the reader's
+  scratch, and `computeSizes` adds the largest `validate_bytes` reachable from the root to `scratch`. The resumable read
+  has no scratch, so it takes it from the end of the output arena and gives it back, as the `check` rebuild does, and
+  `resumableRegionSizes` and `streamRegionSizes` add the largest `validate_bytes` to `output`. The typed read without a
+  wire region keeps passing its allocator.
 - `cbor` and `json` export the scratch their own validators need as a comptime function of a read config
   (`cbor.validateScratch(cfg)`, and the size of a pull reader for the README form), so a caller can state
-  `validate_bytes` without guessing.
+  `validate_bytes` without guessing. These sizes come from the existing list-growth algebra (`growth`,
+  `wire.zig:749-795`, as the `.raw` arm already uses at `wire.zig:983`), since a validator grows lists in a fixed buffer
+  that can resize only its last allocation; no second sizing rule.
 - `json.readRaw` uses the reader's own allocator, as `cbor.readRaw` does (`cbor.zig:717-722`), so a `json.Raw` takes
   nothing from the output.
 
@@ -125,9 +149,10 @@ size function can derive. The same arm has a smaller copy: `json.readRaw` passes
 compile error for any `validate` there, which keeps the API smaller but drops the README's own example.
 
 **Acceptance.** `decodeInto` of a list of `Raw` items with the README validator and with `cbor.validate` succeeds in
-regions of exactly `regionSizes()` and fails with `OutOfMemory` at one byte less of scratch; a validator that allocates
-more than its `validate_bytes` fails with `OutOfMemory`, not a write past the region; a `json.Raw` with an escaped string
-leaves `used` unchanged; a mutant for each new guard.
+regions of `regionSizes()`, whose scratch is at least the observed peak, and fails with `OutOfMemory` at that peak minus
+one; the same through the resumable read with `resumableRegionSizes()`; a validator that allocates more than its
+`validate_bytes` fails with `OutOfMemory`, not a write past the region; a `json.Raw` with an escaped string leaves
+`used` unchanged; a mutant for each new guard.
 
 ## Checks
 
