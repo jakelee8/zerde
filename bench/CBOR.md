@@ -58,7 +58,7 @@ Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. `Linux x86_64` (
 Notes:
 
 - Every zerde row is at or below the base but for two pairs: one small parse run (1.15, its pair ran just after load 9) and one large roundtrip run (1.02). The plan's acceptance (write within 1.10, parse within 1.05) holds in every other pair. zbor moved 0.71 to 1.05 on the same runs, so the base runs were slowed too.
-- Pinned to one core (`taskset -c 3`), best of 15 repetitions of the same payload in a standalone probe: small write 970 to 977 ns against 1,001 (1,333 in the first round), parse 2,470 to 2,482 against 2,495 to 2,561; large write 41.5 against 42.5 to 42.7 ms, parse 87.6 to 89.2 against 86.4 to 87.4 ms (1.01 to 1.03).
+- Pinned to one core (`taskset -c 3`), best of 15 repetitions of the same payload in a standalone probe: small write 970 to 977 ns against 1,001 (1,333 in the first round), parse 2,470 to 2,482 against 2,495 to 2,561; large write 41.5 against 42.5 to 42.7 ms, parse 87.6 to 89.2 against 86.4 to 87.4 ms (1.00 to 1.03 round by round).
 
 ## 2026-11-25 - 52757c8
 
