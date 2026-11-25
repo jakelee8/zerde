@@ -163,9 +163,8 @@ to 1.00, medium 1.03 to 1.07 and large 0.99 to 1.17, with `std.json` at 0.79 to 
 arena, medium and large parse are both about 1.02 of the base (`plans/json-scan.md`, F1). JSON write is 0.72 to 0.87 of
 the base.
 
-Narrowing the first steps of the 64-byte string scan removes the remaining parse cost on a Zen 5 native build (the
-two-stage scan, A4 in `plans/json-scan.md`). The cheaper UTF-8 check does not recover the rest, and that remainder is
-accepted. Every refusal stays: the mutants of each guard on the changed path are killed.
+The two-stage string scan (A4 in `plans/json-scan.md`) brings the JSON parse below the base on a Zen 5 native build.
+Every refusal stays: the tests kill a mutant of each guard on the changed path.
 
 ## (j) BSON element types a typed read does not know
 

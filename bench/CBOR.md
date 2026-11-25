@@ -58,7 +58,7 @@ Base is `03beb0e`, as in the `52757c8` entry; tip is `e07eb8c`. Environment: `Li
 Notes:
 
 - Every zerde row is at or below the base except two pairs: one small parse run (1.15; its pair ran just after load 9) and one large roundtrip run (1.02). Every other pair meets the plan's acceptance limits (write within 1.10, parse within 1.05). zbor moved 0.71 to 1.05 on the same runs, so the base runs were slowed too.
-- A standalone probe pinned to one core (`taskset -c 3`) took the best of 15 repetitions of the same payload. Tip against base: small write 970 to 977 ns against 1,001 ns (1,333 ns in the first round); small parse 2,470 to 2,482 ns against 2,495 to 2,561 ns; large write 41.5 ms against 42.5 to 42.7 ms; large parse 87.6 to 89.2 ms against 86.4 to 87.4 ms (1.00 to 1.03 round by round).
+- A standalone probe pinned to one core (`taskset -c 3`) took the best of 15 repetitions of the same payload. Tip against base: small write 970 to 977 ns against 1,001 to 1,333 ns; small parse 2,470 to 2,482 ns against 2,495 to 2,561 ns; large write 41.5 ms against 42.5 to 42.7 ms; large parse 87.6 to 89.2 ms against 86.4 to 87.4 ms (1.00 to 1.03 round by round).
 
 ## 2026-11-25 - 52757c8
 
@@ -118,7 +118,7 @@ Environment for this entry: `Linux x86_64`, Zig `0.17.1`. "Before" is `6e4bf79`,
 Notes:
 
 - the write path moved by up to 12% on code that did not change for this payload, so changes under about 12% are within this machine's run-to-run noise
-- the small parse case (+18.8%) is outside that noise, and the medium and large cases do not show it; the likely cause is the per-string UTF-8 check and per-document setup, which weigh most on a small document [INFERENCE: not profiled]
+- the small parse case (+18.8%) is outside that noise, and the medium and large cases do not show it. The likely cause, not profiled, is the per-string UTF-8 check and per-document setup, which weigh most on a small document.
 - the payload has no unknown keys, so the duplicate check records nothing; a repeat run on the benchmark machine would settle the small parse case
 
 ## 2026-04-20 - 49d8ca8

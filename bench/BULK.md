@@ -127,7 +127,7 @@ reader into the JSON value writer, with UTF-8 checked on the way in and out, aga
 75.2 µs trusted, 82.9 µs checked (1.10x). Validation takes 5 µs of the 83 (native validation runs at about 50 GiB/s on ASCII).
 The rest, about 63 µs, is the scan for characters to escape and the copy. So the option removes the checks but not the cost that
 dominates a long-text render. Only a faster scan, or a copy of text known to need no escapes, would approach a plain `memcpy`.
-On wasm without SIMD validation costs more (see the table above), so the option should help more there [INFERENCE: not measured].
+On wasm without SIMD, validation costs more (see the table above), so the option likely helps more there; this was not measured.
 
 ## 2026-11-24 - 3461d9c
 

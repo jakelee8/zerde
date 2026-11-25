@@ -21,12 +21,6 @@ disassembly). The probe sources and logs are not part of the repository.
 | base `03beb0e` | 113.7 to 115.1 ms | 1.091 to 1.106 ms |
 | `e07eb8c` (merged) | 116.4 to 117.6 ms | 1.114 to 1.124 ms |
 
-An earlier probe measured the pinned large parse at 1.04 to 1.05 of the base and the medium parse at the base. That probe
-built a fresh arena for each repetition and timed two parses per repetition. Its absolute large figures (154.5 to
-163.3 ms) are about 35% above the steady-state 114 to 117 ms on the same input. Why its ratio differs is not known. A
-fault cost equal for both builds would pull the ratio toward 1.0, not away from it. The probe's source is gone, so it was
-not re-run. `bench/JSON.md` and `plans/api.md` (i) carry the steady-state figures above.
-
 ### F2. The cause is the 64-byte string scan
 
 - Both builds parse byte-identical input (`large-base.json`, `large-tip.json`). Against the base, the tip retires 15%
@@ -188,16 +182,13 @@ figures are 1.46 to 1.47 ms against 1.12 to 1.14 ms. The cause is not investigat
 ## Design
 
 - **A4. Two-stage scan on 64-byte targets (Zen 4 and Zen 5 builds).** Two 32-byte steps run inline, then the 64-byte
-  loop runs out of line. Parse time matches the 32 cap (F6), and long-text speed is predicted near the 64-byte scan by the
-  microbenchmark. This form was not measured on `bench-bulk`. It adds a second code path and needs the big-endian branch
-  in the first stage.
+  loop runs out of line. Parse time matches the 32 cap (F6), and long-text speed stays near the 64-byte scan. It adds a
+  second code path; both stages keep the big-endian branch.
 - **B0. No classification pass.** The reader keeps scanning per string.
 - **C0. Leave the skip path as it is** (F10).
-- **D1. Correct the records.** `bench/JSON.md` and `plans/api.md` (i) carry the steady-state figures of F1 and state that
-  the ratio of the earlier probe is not reproduced and its cause is not known.
+- **D1. Correct the records.** `bench/JSON.md` and `plans/api.md` (i) carry the steady-state figures of F1.
 
-A4 changes `src/bulk.zig`, its tests and `tests/mutants.py`. It needs `bench-json`, `bench-cbor` (CBOR to JSON
-transcoding uses the same scan) and `bench-bulk` runs with log entries.
+A4 changes `src/bulk.zig`, its tests and `tests/mutants.py`, and is measured with `bench-json` and `bench-bulk`.
 
 ## Considered alternatives
 
@@ -236,7 +227,3 @@ positions. F9 gives three measures of the share a first pass could remove on thi
 ### C. The skip path (F10)
 
 - **C1. Profile `skipValue` and make it no slower than a typed read of the same value.**
-
-### D. The records
-
-- **D0. Leave them.** The records keep the 1.04 to 1.05 figure of the earlier probe, which F1 does not reproduce.

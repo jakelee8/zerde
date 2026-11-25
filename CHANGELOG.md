@@ -86,8 +86,6 @@
 
 ### Changed
 
-- `bulk.findStringSpecialVector` and `findStringSpecialWords` take a `note_high` parameter and a flag, for the new `bulk.findStringSpecialNotingHigh`.
-- `cbor.Header` is a `packed struct`.
 - CBOR under `deny_unknown_fields` without `extras` rejects an undeclared struct key as it is read (`error.UnknownField`), without checking or recording it.
 - JSON no longer converts a number it skips, so a skipped field accepts a number too large for any type.
 - TOML and YAML parse failures report the failing input offset in `Diagnostic`.
@@ -97,7 +95,6 @@
 - CBOR and JSON write struct field names and enum names as bytes made at compile time and check them as UTF-8 then, not on every write.
 - The JSON reader checks a string as UTF-8 only when the scan for its end saw a byte of 0x80 or above, so ASCII text takes one pass.
 - The CBOR reader decides strict mode and the `max_items` count at compile time. A read config that names neither `mode` nor `max_items` carries no per-head check.
-- `bulk.findStringSpecial` finds the first match in a vector with a bit mask on little-endian targets. `std.simd.firstTrue` used a horizontal minimum, which cost more than the scan at 64 lanes (AVX-512).
 
 ### Fixed
 

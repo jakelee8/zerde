@@ -1,7 +1,7 @@
 # Wire decode benchmark history
 
 `zig build bench-wire -Doptimize=ReleaseFast` decodes a commit of effects with `zerde.wire.decode`, in strict CBOR and in JSON (bytes as base64, the text with its escapes). The commit has a put for every 24 lines of `tests/typed_tests.zig`, `src/cbor.zig` and `README.md`, and a delete after each seventh put. The corpus is this repository's own text, so its size follows the files: compare rows by bytes and effects, not by totals alone. "Arena used" is `end_index` when the decode is done, "peak" is the furthest byte written, and "bound" is `wire.maxArenaSize`.
-Time is ns for one decode, over 200 decodes, in two runs back to back under `flock` at load about 2. The corpus changed between some sections because the files it reads were edited. Each section therefore compares only its own before and after, measured in the same session on the same input.
+Time is ns for one decode, over 200 decodes, in two runs back to back under `flock` at load about 2. The corpus changes when the files it reads change, so each section compares only its own before and after, measured in the same session on the same input.
 
 ## 2026-11-24 - 3bd3e6a
 
