@@ -43,6 +43,10 @@ jobs:
       - name: Run test suite
         run: zig build test
 
+      - name: Check mutant patterns
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 tests/mutants.py --check
+
       - name: Build examples
         run: zig build examples
 

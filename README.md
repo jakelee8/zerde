@@ -298,13 +298,11 @@ What they refuse, and why:
   keys compare by value, so two spellings of one key are one key
 - a CBOR tag other than 55799 (self-described CBOR) around a value a typed field reads
   (`error.UnexpectedTag`); a skipped value may carry any tag
-- a JSON object member repeated in a field the type reads (`error.DuplicateField`); RFC 8259 §4 allows
-  repeated names, so this is a policy, and one that has not been settled. A repeated member in a field
-  the type does not read is skipped
-- a JSON object that names a member twice inside a `json.Raw` item, at any depth and however the name is spelled
-  (`a` and `\u0061` are one name): `error.DuplicateField`, as a `cbor.Raw` refuses a repeated key. The read checks the item
-  after it is well-formed, with a record of the names of the objects open, a span of the input each (16 bytes), compared
-  as decoded text when each object closes; `wire.regionSizes` charges that to the scratch region
+- an object or map that names a key twice, in every format and every read, typed or `zerde.value`, at any depth, skipped
+  values included: `error.DuplicateField`, except ZON, which reports `error.ParseZon` from the Zig parser. A JSON name is
+  compared as decoded text (`a` and `\u0061` are one name). RFC 8259 §4 leaves repeated names to the reader; zerde refuses
+  them, as `std.json` does by default. A struct that denies unknown members without extras refuses the object at its first
+  undeclared key (`error.UnknownField`), so a repeat of that key is never reached
 - in a dynamic `Value`: a JSON integer beyond 128 bits or a float literal too large for a double
   (`error.InvalidNumber` for an integer beyond 128 bits, `error.FloatOutOfRange` for a float literal that overflows); a CBOR map key that is not text
   (`error.UnexpectedType`), a tag (`error.UnexpectedTag`), and a simple value other than false, true and
@@ -578,9 +576,10 @@ bound holds when that limit is the smaller one. `bench-wire` measures both decod
 `zerde.SortedMap(V)` is a map whose keys are data (labels, history, limits): a slice of `Entry { key, value }` sorted by
 encoded text key (shorter first, then bytewise), found with `get`, `getPtr` and `index` by binary search, with no hash table
 and no copy of a key (an aliased read keeps the input's bytes; in a decode into `wire.Wire` it is `{ entries: Span }` over
-`{ key: Span, value: Wire(V) }`). CBOR and JSON read and write it as a map of text keys. A read refuses a key that does
-not sort after the one before it in every mode (`error.NonDeterministicEncoding`, or `error.DuplicateField` when equal),
-a write refuses entries that are not in order (the same errors), a field's `max_len` bounds the entries (checked from the map's
+`{ key: Span, value: Wire(V) }`). CBOR and JSON read and write it as a map of text keys. Every read refuses a repeated key
+(`error.DuplicateField`); a strict CBOR read also refuses a key that does not sort after the one before it
+(`error.NonDeterministicEncoding`); any other read (lenient CBOR, JSON) accepts the keys in any order and sorts the entries, so
+the value is always sorted and binary search holds. A write refuses entries out of order (the same errors), a field's `max_len` bounds the entries (checked from the map's
 head when its length is stated, and at each entry otherwise) and `.elem` bounds each value. A resumable write of one goes entry by entry
 (a key longer than the window goes through it a piece at a time, and a key follows `trusted_text` as any text does), refusing an entry out of
 order when it reaches it.

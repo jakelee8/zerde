@@ -28,6 +28,40 @@ Current scenarios:
 
 The current large case produces a canonical CBOR document of about `76.22 MiB`, with write outputs of about `76.22 MiB` for `zerde` and `75.28 MiB` for `zbor`.
 
+## 2026-11-25 - 52757c8
+
+The whole branch against its base, on the default path (no new option set).
+
+Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-cbor -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+
+Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 2,871 / 2,576 / 2,545 | 3,704 / 3,190 / 3,152 | 1.24 to 1.29 |
+| small | parse zbor | 14,397 / 13,678 / 13,505 | 15,650 / 14,026 / 13,519 | 1.00 to 1.09 |
+| small | write zerde | 1,032 / 1,036 / 1,014 | 2,178 / 1,681 / 1,637 | 1.61 to 2.11 |
+| small | write zbor | 2,052 / 1,945 / 1,919 | 2,072 / 1,914 / 1,877 | 0.98 to 1.01 |
+| small | roundtrip zerde | 3,804 / 3,693 / 3,637 | 5,535 / 5,025 / 5,033 | 1.36 to 1.45 |
+| small | roundtrip zbor | 17,780 / 16,714 / 16,519 | 17,487 / 17,032 / 16,384 | 0.98 to 1.02 |
+| medium | parse zerde | 799,794 / 787,411 / 777,556 | 951,972 / 936,934 / 930,515 | 1.19 to 1.20 |
+| medium | parse zbor | 4,441,216 / 4,080,208 / 4,080,617 | 4,195,665 / 4,452,784 / 4,034,856 | 0.94 to 1.09 |
+| medium | write zerde | 357,129 / 324,543 / 321,198 | 475,163 / 498,835 / 467,529 | 1.33 to 1.54 |
+| medium | write zbor | 553,657 / 555,782 / 545,388 | 560,979 / 560,402 / 544,394 | 1.00 to 1.01 |
+| medium | roundtrip zerde | 1,120,124 / 1,114,270 / 1,100,376 | 1,462,837 / 1,491,129 / 1,449,539 | 1.31 to 1.34 |
+| medium | roundtrip zbor | 5,389,083 / 4,931,104 / 4,939,238 | 5,227,493 / 5,159,146 / 4,821,192 | 0.97 to 1.05 |
+| large | parse zerde | 81,499,614 / 77,632,275 / 76,799,577 | 98,297,260 / 95,834,089 / 91,620,769 | 1.19 to 1.23 |
+| large | parse zbor | 444,759,306 / 434,793,866 / 402,923,170 | 437,628,691 / 418,256,706 / 397,334,635 | 0.96 to 0.99 |
+| large | write zerde | 34,868,052 / 33,124,857 / 32,230,361 | 52,222,203 / 48,076,968 / 47,129,465 | 1.45 to 1.50 |
+| large | write zbor | 61,724,796 / 53,888,883 / 53,319,087 | 59,008,642 / 54,342,611 / 54,062,096 | 0.96 to 1.01 |
+| large | roundtrip zerde | 116,518,666 / 110,060,465 / 108,862,282 | 153,673,572 / 143,130,211 / 142,517,663 | 1.30 to 1.32 |
+| large | roundtrip zbor | 555,008,799 / 491,674,360 / 484,758,130 | 536,255,392 / 492,654,241 / 477,767,420 | 0.97 to 1.00 |
+
+Notes:
+
+- Every zerde row is slower in every pair: parse 1.19 to 1.29, write 1.33 to 2.11, roundtrip 1.30 to 1.46; zbor stayed within 0.94 to 1.09. The write regression is the largest default-path cost of the branch. A comptime gather parameter (removing the one optional branch of `emitBytes` and `emitRaw`) was measured and did not move the write rows (1,643 to 1,675 ns against 1,686 to 1,707 ns, small), so it was not committed. Which of the branch's write changes costs it is not measured here.
+- Listed under "Default-path cost" in `plans/api.md`.
+
 ## 2026-11-23 - 4881395
 
 Changes since previous run:

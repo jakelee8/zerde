@@ -73,12 +73,20 @@ test "invalid msgpack corpus: truncated_string.msgpack" {
     try invalid.expectBinaryParseFails(zerde.msgpack, []const u8, "truncated_string.msgpack", @embedFile("corpus_invalid/msgpack/truncated_string.msgpack"), .{}, .{});
 }
 
+test "invalid msgpack corpus: duplicate_unknown_key.msgpack" {
+    try invalid.expectBinaryParseFails(zerde.msgpack, ProbeDoc, "duplicate_unknown_key.msgpack", @embedFile("corpus_invalid/msgpack/duplicate_unknown_key.msgpack"), .{}, .{});
+}
+
 test "invalid bson corpus: wrong_type.bson" {
     try invalid.expectBinaryParseFails(zerde.bson, CountDoc, "wrong_type.bson", @embedFile("corpus_invalid/bson/wrong_type.bson"), .{}, .{});
 }
 
 test "invalid bson corpus: truncated_document.bson" {
     try invalid.expectBinaryParseFails(zerde.bson, CountDoc, "truncated_document.bson", @embedFile("corpus_invalid/bson/truncated_document.bson"), .{}, .{});
+}
+
+test "invalid bson corpus: duplicate_unknown_key.bson" {
+    try invalid.expectBinaryParseFails(zerde.bson, ProbeDoc, "duplicate_unknown_key.bson", @embedFile("corpus_invalid/bson/duplicate_unknown_key.bson"), .{}, .{});
 }
 
 test "invalid bin corpus: invalid_bool_tag.bin" {
@@ -131,6 +139,10 @@ test "invalid json corpus: invalid_utf8.json" {
 
 test "invalid json corpus: float_for_int.json" {
     try invalid.expectTextParseFails(zerde.json, CountDoc, "float_for_int.json", @embedFile("corpus_invalid/json/float_for_int.json"), .{}, .{});
+}
+
+test "invalid json corpus: duplicate_unknown_key.json" {
+    try invalid.expectTextParseFails(zerde.json, ProbeDoc, "duplicate_unknown_key.json", @embedFile("corpus_invalid/json/duplicate_unknown_key.json"), .{}, .{});
 }
 
 test "invalid json corpus: number_overflow.json" {

@@ -706,12 +706,159 @@ test "a large map of distinct unknown keys is read" {
     try std.testing.expectError(error.DuplicateField, zerde.cbor.parseSlice(Probe, allocator, input.items));
 }
 
-test "JSON duplicate members keep their present behaviour" {
-    // Not a decision: the lead has not settled whether JSON refuses or takes the last. A repeated
-    // field the type knows is refused; a repeated member in a field nobody reads is skipped.
-    try expectJsonError(Probe, error.DuplicateField, "{\"a\":1,\"a\":2}");
-    const probe = try zerde.json.parseSlice(Probe, allocator, "{\"x\":1,\"x\":2,\"a\":3}");
+test "JSON refuses a repeated member, declared or not, at any depth" {
+    const refused = [_][]const u8{
+        "{\"a\":1,\"a\":2}",
+        "{\"x\":1,\"x\":2,\"a\":3}",
+        "{\"x\":1,\"\\u0078\":2}",
+        "{\"x\":{\"k\":1,\"k\":2}}",
+        "{\"x\":[{\"k\":1},{\"k\":2,\"k\":3}]}",
+    };
+    for (refused) |input| try expectJsonError(Probe, error.DuplicateField, input);
+    // The same name in two objects is no repeat.
+    const probe = try zerde.json.parseSlice(Probe, allocator, "{\"x\":{\"k\":1},\"y\":{\"k\":2},\"a\":3}");
     try std.testing.expectEqual(@as(?u8, 3), probe.a);
+    // Extras see the repeat too.
+    try expectJsonError(WithExtrasJson, error.DuplicateField, "{\"id\":1,\"name\":\"n\",\"x\":1,\"x\":2}");
+}
+
+test "an untyped read and the pull reader refuse a repeated member in every format that has maps" {
+    for ([_][]const u8{ "{\"a\":1,\"a\":2}", "[{\"a\":1,\"\\u0061\":2}]" }) |input| {
+        try std.testing.expectError(error.DuplicateField, zerde.value.parseSlice(zerde.json, allocator, input));
+    }
+    var nested = try zerde.value.parseSlice(zerde.json, allocator, "{\"a\":{\"a\":1},\"b\":{\"a\":2}}");
+    nested.deinit(allocator);
+    var pull = try zerde.json.pullReader(allocator, "{\"a\":1,\"a\":2}", .{});
+    defer pull.deinit();
+    const failure = while (true) {
+        const event = pull.next() catch |err| break err;
+        if (event == null) return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(error.DuplicateField, failure);
+
+    const msgpack = [_]u8{ 0x82, 0xa1, 'x', 0x01, 0xa1, 'x', 0x02 };
+    try std.testing.expectError(error.DuplicateField, zerde.msgpack.parseSlice(Probe, allocator, &msgpack));
+    try std.testing.expectError(error.DuplicateField, zerde.value.parseSlice(zerde.msgpack, allocator, &msgpack));
+    const bson = [_]u8{ 0x13, 0, 0, 0, 0x10, 'x', 0, 1, 0, 0, 0, 0x10, 'x', 0, 2, 0, 0, 0, 0 };
+    try std.testing.expectError(error.DuplicateField, zerde.bson.parseSlice(Probe, allocator, &bson));
+    try std.testing.expectError(error.DuplicateField, zerde.value.parseSlice(zerde.bson, allocator, &bson));
+    // TOML and YAML refuse a repeat as they build a table; ZON's own parser refuses it.
+    try std.testing.expectError(error.DuplicateField, zerde.parseSlice(zerde.toml, Probe, allocator, "x = 1\nx = 2\n"));
+    try std.testing.expectError(error.DuplicateField, zerde.value.parseSlice(zerde.toml, allocator, "x = 1\nx = 2\n"));
+    try std.testing.expectError(error.DuplicateField, zerde.parseSlice(zerde.yaml, Probe, allocator, "x: 1\nx: 2\n"));
+    try std.testing.expectError(error.DuplicateField, zerde.value.parseSlice(zerde.yaml, allocator, "x: 1\nx: 2\n"));
+    try std.testing.expectError(error.ParseZon, zerde.parseSlice(zerde.zon, Probe, allocator, ".{ .x = 1, .x = 2 }"));
+    try std.testing.expectError(error.ParseZon, zerde.value.parseSlice(zerde.zon, allocator, ".{ .x = 1, .x = 2 }"));
+}
+
+test "a struct that denies unknown members refuses the first one without recording it" {
+    const Strict = struct {
+        a: ?u8 = null,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const none = std.testing.failing_allocator;
+    try std.testing.expectError(error.UnknownField, zerde.json.parseSlice(Strict, none, "{\"x\":1,\"x\":2}"));
+    try std.testing.expectError(error.UnknownField, zerde.msgpack.parseSlice(Strict, none, &.{ 0x82, 0xa1, 'x', 0x01, 0xa1, 'x', 0x02 }));
+}
+
+/// A BSON document `{x: <sub>}`, `sub` a document's bytes.
+fn bsonWith(sub: []const u8) ![]u8 {
+    const total = 4 + 3 + sub.len + 1;
+    const out = try allocator.alloc(u8, total);
+    std.mem.writeInt(u32, out[0..4], @intCast(total), .little);
+    @memcpy(out[4..7], &[_]u8{ 0x03, 'x', 0 });
+    @memcpy(out[7..][0..sub.len], sub);
+    out[total - 1] = 0;
+    return out;
+}
+
+test "MessagePack and BSON check a value they skip: a repeated key at any depth, the nesting, and BSON's terminator" {
+    const msgpack_repeat = [_]u8{ 0x81, 0xa1, 'x', 0x82, 0xa1, 'k', 0x01, 0xa1, 'k', 0x02 };
+    try std.testing.expectError(error.DuplicateField, zerde.msgpack.parseSlice(Probe, allocator, &msgpack_repeat));
+    const msgpack_distinct = [_]u8{ 0x81, 0xa1, 'x', 0x82, 0xa1, 'k', 0x01, 0xa1, 'j', 0x02 };
+    _ = try zerde.msgpack.parseSlice(Probe, allocator, &msgpack_distinct);
+    // Each skipped map's keys are its own: the same key in two of them is no repeat.
+    _ = try zerde.msgpack.parseSlice(Probe, allocator, &.{ 0x82, 0xa1, 'x', 0x81, 0xa1, 'k', 0x01, 0xa1, 'y', 0x81, 0xa1, 'k', 0x02 });
+    // A key that is not text is compared as its encoding, and is never the text of the same bytes.
+    _ = try zerde.msgpack.parseSlice(Probe, allocator, &.{ 0x81, 0xa1, 'x', 0x82, 0x01, 0x01, 0xa1, 0x01, 0x02 });
+    try std.testing.expectError(error.DuplicateField, zerde.msgpack.parseSlice(Probe, allocator, &.{ 0x81, 0xa1, 'x', 0x82, 0x01, 0x01, 0x01, 0x02 }));
+    var deep: [3 + 200 + 1]u8 = undefined;
+    @memcpy(deep[0..3], &[_]u8{ 0x81, 0xa1, 'x' });
+    @memset(deep[3..203], 0x91);
+    deep[203] = 0x01;
+    try std.testing.expectError(error.MsgpackNestingTooDeep, zerde.msgpack.parseSlice(Probe, allocator, &deep));
+    // And 200 maps, each the value of the one key `k` of the one around it.
+    var deep_maps: [3 + 3 * 200 + 1]u8 = undefined;
+    @memcpy(deep_maps[0..3], &[_]u8{ 0x81, 0xa1, 'x' });
+    for (0..200) |level| @memcpy(deep_maps[3 + 3 * level ..][0..3], &[_]u8{ 0x81, 0xa1, 'k' });
+    deep_maps[deep_maps.len - 1] = 0x01;
+    try std.testing.expectError(error.MsgpackNestingTooDeep, zerde.msgpack.parseSlice(Probe, allocator, &deep_maps));
+
+    const repeat_sub = [_]u8{ 0x13, 0, 0, 0, 0x10, 'k', 0, 1, 0, 0, 0, 0x10, 'k', 0, 2, 0, 0, 0, 0 };
+    const bson_repeat = try bsonWith(&repeat_sub);
+    defer allocator.free(bson_repeat);
+    try std.testing.expectError(error.DuplicateField, zerde.bson.parseSlice(Probe, allocator, bson_repeat));
+    var distinct_sub = repeat_sub;
+    distinct_sub[12] = 'j';
+    const bson_distinct = try bsonWith(&distinct_sub);
+    defer allocator.free(bson_distinct);
+    _ = try zerde.bson.parseSlice(Probe, allocator, bson_distinct);
+    const siblings = [_]u8{ 0x23, 0, 0, 0, 0x03, 'x', 0, 0x0c, 0, 0, 0, 0x10, 'k', 0, 1, 0, 0, 0, 0, 0x03, 'y', 0, 0x0c, 0, 0, 0, 0x10, 'k', 0, 2, 0, 0, 0, 0, 0 };
+    _ = try zerde.bson.parseSlice(Probe, allocator, &siblings);
+    var unterminated = distinct_sub;
+    unterminated[unterminated.len - 1] = 0x01;
+    const bson_unterminated = try bsonWith(&unterminated);
+    defer allocator.free(bson_unterminated);
+    try std.testing.expectError(error.InvalidDocumentTerminator, zerde.bson.parseSlice(Probe, allocator, bson_unterminated));
+
+    // Every element type BSON defines is stepped over inside a skipped document, the typed reader's or not; a type byte
+    // BSON does not define is refused.
+    const elements = [_]u8{
+        0x07, 'o', 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, // ObjectId
+        0x09, 'd', 0, 1, 0, 0, 0, 0, 0, 0, 0, // UTC datetime
+        0x0B, 'r', 0, 'a', 0, 'i', 0, // regular expression
+        0x0C, 'p', 0, 2, 0, 0, 0, 'c', 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, // DBPointer
+        0x0D, 'j', 0, 2, 0, 0, 0, 'f', 0, // JavaScript code
+        0x0E, 's', 0, 2, 0, 0, 0, 's', 0, // symbol
+        0x0F, 'w', 0, 15, 0, 0, 0, 2, 0, 0, 0, 'f', 0, 5, 0, 0, 0, 0, // code with scope
+        0x11, 't', 0, 1, 0, 0, 0, 0, 0, 0, 0, // timestamp
+        0x13, 'm', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, // decimal128
+        0x06, 'u', 0, // undefined
+        0xFF, 'n', 0, // min key
+        0x7F, 'X', 0, // max key
+    };
+    var all_types: [4 + elements.len + 1]u8 = undefined;
+    std.mem.writeInt(u32, all_types[0..4], all_types.len, .little);
+    @memcpy(all_types[4..][0..elements.len], &elements);
+    all_types[all_types.len - 1] = 0;
+    const bson_all = try bsonWith(&all_types);
+    defer allocator.free(bson_all);
+    _ = try zerde.bson.parseSlice(Probe, allocator, bson_all);
+    const undefined_type = [_]u8{ 8, 0, 0, 0, 0x42, 'q', 0, 0 };
+    const bson_undefined_type = try bsonWith(&undefined_type);
+    defer allocator.free(bson_undefined_type);
+    try std.testing.expectError(error.UnsupportedBsonType, zerde.bson.parseSlice(Probe, allocator, bson_undefined_type));
+    // A code-with-scope length that is not what its code and scope take.
+    const long_scope = [_]u8{ 23, 0, 0, 0, 0x0F, 'w', 0, 16, 0, 0, 0, 2, 0, 0, 0, 'f', 0, 5, 0, 0, 0, 0, 0 };
+    const bson_long_scope = try bsonWith(&long_scope);
+    defer allocator.free(bson_long_scope);
+    try std.testing.expectError(error.InvalidDocumentLength, zerde.bson.parseSlice(Probe, allocator, bson_long_scope));
+
+    // 200 documents, each the one member `d` of the one around it.
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(allocator);
+    try nested.appendSlice(allocator, &.{ 5, 0, 0, 0, 0 });
+    for (0..199) |_| {
+        const total: u32 = @intCast(4 + 3 + nested.items.len + 1);
+        var head: [7]u8 = undefined;
+        std.mem.writeInt(u32, head[0..4], total, .little);
+        @memcpy(head[4..7], &[_]u8{ 0x03, 'd', 0 });
+        try nested.insertSlice(allocator, 0, &head);
+        try nested.append(allocator, 0);
+    }
+    const bson_deep = try bsonWith(nested.items);
+    defer allocator.free(bson_deep);
+    try std.testing.expectError(error.BsonNestingTooDeep, zerde.bson.parseSlice(Probe, allocator, bson_deep));
 }
 
 const JsonMetaBox = struct { meta: zerde.json.Raw };
@@ -766,6 +913,37 @@ test "an integral float is not accepted as an enum tag either" {
     try expectJsonError(Role, error.UnexpectedType, "1.0");
     const role = try zerde.cbor.parseSlice(Role, allocator, &.{0x02});
     try std.testing.expectEqual(Role.doctor, role);
+}
+
+test "a strict read takes an enum only in the form its writer writes" {
+    const Kind = enum { alpha, beta };
+    const S = struct {
+        kind: Kind,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const number = [_]u8{ 0xa1, 0x64, 'k', 'i', 'n', 'd', 0x01 };
+    const name = [_]u8{ 0xa1, 0x64, 'k', 'i', 'n', 'd', 0x64, 'b', 'e', 't', 'a' };
+    // The writer writes the name, so the number is not the deterministic encoding.
+    try std.testing.expectError(error.NonDeterministicEncoding, zerde.cbor.parseSliceWith(S, allocator, &number, .{}, strict));
+    try std.testing.expectEqual(Kind.beta, (try zerde.cbor.parseSlice(S, allocator, &number)).kind);
+    try std.testing.expectEqual(Kind.beta, (try zerde.cbor.parseSliceWith(S, allocator, &name, .{}, strict)).kind);
+
+    // The resumable read refuses it too, however the input is cut.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    for (0..number.len + 1) |cut| {
+        _ = arena_state.reset(.retain_capacity);
+        try std.testing.expectError(error.NonDeterministicEncoding, readInChunks(S, .{}, chunk_read, arena_state.allocator(), &number, &.{cut}));
+    }
+
+    // An enum written as its number reads its number under strict.
+    const Holder = struct {
+        level: Level,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const high = [_]u8{ 0xa1, 0x65, 'l', 'e', 'v', 'e', 'l', 0x09 };
+    try std.testing.expectEqual(Level.high, (try zerde.cbor.parseSliceWith(Holder, allocator, &high, .{}, strict)).level);
+    try std.testing.expectEqual(Level.high, (try readInChunks(Holder, .{}, chunk_read, arena_state.allocator(), &high, &.{})).level);
 }
 
 test "MessagePack and BSON refuse text for a byte field" {
@@ -4545,11 +4723,11 @@ test "the pieces stop at the edge of a window exactly: a closing quote, a base64
     var tiny: [3]u8 = undefined;
     var wt = std.Io.Writer.fixed(&tiny);
     var bstate: zerde.typed.TextState = .{};
-    try std.testing.expectError(error.WindowFull, zerde.json.writeBytesPart(&wt, .base64, "a", &bstate));
+    try std.testing.expectError(error.WindowFull, zerde.json.writeBytesPart(&wt, .base64, "a", &bstate, false));
     try std.testing.expectEqualStrings("\"", wt.buffered());
     var rest: [8]u8 = undefined;
     var wr = std.Io.Writer.fixed(&rest);
-    try zerde.json.writeBytesPart(&wr, .base64, "a", &bstate);
+    try zerde.json.writeBytesPart(&wr, .base64, "a", &bstate, false);
     try std.testing.expectEqualStrings("YQ==\"", wr.buffered());
     // A CBOR head of three bytes with two left writes nothing.
     var two: [2]u8 = undefined;
@@ -5162,7 +5340,7 @@ test "a sorted map is written in key order, in both formats, and read back; what
     try std.testing.expectError(error.DuplicateField, zerde.serializeWith(zerde.json, &sink.writer, repeated, .{}, .{}));
 }
 
-test "a sorted map read refuses an unsorted or repeated key in every mode, and a JSON key with an escape is the key it spells" {
+test "a sorted map read refuses a repeated key in every read, and an unsorted one only when strict; any other read sorts it" {
     const E = error.NonDeterministicEncoding;
     const D = error.DuplicateField;
     // CBOR, lenient and strict: {"limits": ...} is the field, with the keys of the map in the order given.
@@ -5170,24 +5348,72 @@ test "a sorted map read refuses an unsorted or repeated key in every mode, and a
     const unsorted = prefix ++ [_]u8{ 0xa2, 0x61, 'w', 0x01, 0x61, 'r', 0x02 };
     const repeat = prefix ++ [_]u8{ 0xa2, 0x61, 'r', 0x01, 0x61, 'r', 0x02 };
     const long_first = prefix ++ [_]u8{ 0xa2, 0x62, 'a', 'a', 0x01, 0x61, 'b', 0x02 };
-    inline for (.{ false, true }) |is_strict| {
-        const read_cfg = if (is_strict) strict else .{ .mode = zerde.cbor.Mode.lenient };
-        try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &unsorted, .{}, read_cfg));
-        try std.testing.expectError(D, zerde.cbor.parseSliceWith(Maps, allocator, &repeat, .{}, read_cfg));
-        try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &long_first, .{}, read_cfg));
+    try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &unsorted, .{}, strict));
+    try std.testing.expectError(E, zerde.cbor.parseSliceWith(Maps, allocator, &long_first, .{}, strict));
+    inline for (.{ zerde.cbor.Mode.lenient, zerde.cbor.Mode.strict }) |mode| {
+        try std.testing.expectError(D, zerde.cbor.parseSliceWith(Maps, allocator, &repeat, .{}, .{ .mode = mode }));
     }
-    // JSON has no mode and keeps no order: a sorted map is where an order is demanded.
-    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"b\":\"x\",\"a\":\"y\"},\"limits\":{}}"));
+    const lenient = try zerde.cbor.parseSlice(Maps, allocator, &long_first);
+    defer zerde.free(allocator, lenient);
+    try std.testing.expect(lenient.limits.isSorted());
+    try std.testing.expectEqualStrings("b", lenient.limits.entries[0].key);
+    try std.testing.expectEqual(@as(?u32, 1), lenient.limits.get("aa"));
+    const swapped = try zerde.cbor.parseSlice(Maps, allocator, &unsorted);
+    defer zerde.free(allocator, swapped);
+    try std.testing.expectEqual(@as(?u32, 2), swapped.limits.get("r"));
+    try std.testing.expectEqual(@as(?u32, 1), swapped.limits.get("w"));
+
+    // JSON has no mode and keeps no order: the entries are sorted, and a repeat anywhere in the map is refused.
+    const ByKey = zerde.SortedMap(u8);
+    const by_length = try zerde.json.parseSlice(ByKey, allocator, "{\"aa\":1,\"b\":2}");
+    defer zerde.free(allocator, by_length);
+    try std.testing.expectEqualStrings("b", by_length.entries[0].key);
+    try std.testing.expectEqualStrings("aa", by_length.entries[1].key);
+    try std.testing.expectEqual(@as(?u8, 1), by_length.get("aa"));
+    try std.testing.expectError(D, zerde.json.parseSlice(ByKey, allocator, "{\"aa\":1,\"b\":2,\"aa\":3}"));
     try std.testing.expectError(D, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"a\":\"y\"},\"limits\":{}}"));
-    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"aa\":\"x\",\"b\":\"y\"},\"limits\":{}}"));
     // `\u0061` is `a`: a repeat of it, and an order that only holds for the spelling.
     try std.testing.expectError(D, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0061\":\"y\"},\"limits\":{}}"));
     const spelled = try zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"\\u0061\":\"x\",\"b\\n\":\"y\"},\"limits\":{}}");
     defer zerde.free(allocator, spelled);
     try std.testing.expectEqualStrings("y", spelled.labels.get("b\n").?);
+    const escaped = try zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0063\\u0063\":\"y\",\"\\u0062\":\"z\"},\"limits\":{}}");
+    defer zerde.free(allocator, escaped);
+    try std.testing.expect(escaped.labels.isSorted());
+    try std.testing.expectEqualStrings("y", escaped.labels.get("cc").?);
     // The same with the values failing after keys were read: nothing is left allocated (the testing allocator checks).
     try std.testing.expectError(error.ValueOutOfRange, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\"},\"limits\":{\"\\u0061\":5,\"b\":101}}"));
-    try std.testing.expectError(E, zerde.json.parseSlice(Maps, allocator, "{\"id\":1,\"labels\":{\"a\":\"x\",\"\\u0063\\u0063\":\"y\",\"\\u0062\":\"z\"},\"limits\":{}}"));
+
+    // A decode into the wire layout sorts the entries too, keys resolved through the memory.
+    const text = "{\"labels\":{\"cc\":\"x\",\"\\u0062\":\"y\",\"a\":\"z\"}}";
+    var region: Region = .{};
+    @memcpy(region.bytes[0..text.len], text);
+    const cfg = .{ .max_items = 64, .max_string_len = 16, .max_input_bytes = 4096 };
+    const bound = comptime wire.maxArenaSize(zerde.json, LabelsOnly, .{}, cfg);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[text.len..][0..bound]);
+    const w = try wire.decode(zerde.json, LabelsOnly, &arena, region.base(), region.bytes[0..text.len], .{}, cfg);
+    const mem = region.memory();
+    const entries = try mem.listOf(wire.Wire(Labels.Entry), w.labels.entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    for (entries, [_][]const u8{ "a", "b", "cc" }, [_][]const u8{ "z", "y", "x" }) |entry, key, value| {
+        try std.testing.expectEqualStrings(key, try mem.bytesOf(entry.key));
+        try std.testing.expectEqualStrings(value, try mem.bytesOf(entry.value));
+    }
+}
+
+/// A JSON read of an unsorted sorted map, `DuplicateField` taken as the result it should be when `repeats`.
+fn parseUnsortedLabels(failing: std.mem.Allocator, input: []const u8, repeats: bool) !void {
+    const value = zerde.json.parseSlice(LabelsOnly, failing, input) catch |err| {
+        if (repeats and err == error.DuplicateField) return;
+        return err;
+    };
+    zerde.free(failing, value);
+    if (repeats) return error.TestUnexpectedResult;
+}
+
+test "an unsorted sorted map read frees what it read, on a repeat and on every failed allocation" {
+    try std.testing.checkAllAllocationFailures(allocator, parseUnsortedLabels, .{ "{\"labels\":{\"cc\":\"x\",\"\\u0062\":\"y\",\"a\":\"z\"}}", false });
+    try std.testing.checkAllAllocationFailures(allocator, parseUnsortedLabels, .{ "{\"labels\":{\"cc\":\"x\",\"\\u0062\":\"y\",\"\\u0063c\":\"z\"}}", true });
 }
 
 test "a sorted map's bounds are checked before it is allocated, and its values have their own" {
@@ -6789,6 +7015,30 @@ test "a resumable read gives the value of the whole strict read, for every way t
     try expectChunked(WireMsg, .{}, chunk_read, .{ .id = .{ 0, 0, 0, 0 }, .effects = &.{}, .grid = &.{}, .pair = .{ 0, 65535 } });
 }
 
+/// A struct of one field `d` of type `Inner`, read with no unknown member.
+fn OneFieldOf(comptime Inner: type) type {
+    return struct {
+        d: Inner,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+}
+
+const DeepLeaf = struct {
+    a_field_name_longer_than_any_other: u8,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+
+/// `DeepLeaf` inside `levels` structs.
+fn DeepOf(comptime levels: usize) type {
+    return if (levels == 0) DeepLeaf else OneFieldOf(DeepOf(levels - 1));
+}
+
+test "a resumable read sizes its key buffer and frames over the whole type, however deep the longest name is" {
+    // Seventeen structs, the longest name in the innermost.
+    const D0 = DeepOf(16);
+    try expectChunked(D0, .{}, chunk_read, std.mem.zeroes(D0));
+}
+
 const ChunkInner = struct {
     a: u8,
     b: ?[]const u8 = null,
@@ -7402,7 +7652,7 @@ test "a resumable read of unions reads each form, and refuses the others as the 
     }
 }
 
-test "a resumable read of enums takes a name or a number, and an enum written as its number only the number" {
+test "a resumable read of enums takes the name of an enum written as its name, and the number of one written as its number" {
     const ByNumber = struct {
         l: ChunkLevel,
         pub const serde = .{ .deny_unknown_fields = true };
@@ -7415,7 +7665,7 @@ test "a resumable read of enums takes a name or a number, and an enum written as
     try expectValueInChunks(ByNumber, integers, chunk_read, .{ .l = .low }, &[_]u8{ 0xa1, 0x61, 'l', 0x01 });
     try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .beta }, &[_]u8{ 0xa1, 0x61, 'k', 0x64, 'b', 'e', 't', 'a' });
     try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .gamma_long_name }, &[_]u8{ 0xa1, 0x61, 'k', 0x6f, 'g', 'a', 'm', 'm', 'a', '_', 'l', 'o', 'n', 'g', '_', 'n', 'a', 'm', 'e' });
-    try expectValueInChunks(ByName, .{}, chunk_read, .{ .k = .beta }, &[_]u8{ 0xa1, 0x61, 'k', 0x01 });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.NonDeterministicEncoding, &[_]u8{ 0xa1, 0x61, 'k', 0x01 });
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'l', 0x63, 'l', 'o', 'w' });
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'l', 0x05 });
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'l', 0x19, 0x01, 0x2c });
@@ -7423,7 +7673,7 @@ test "a resumable read of enums takes a name or a number, and an enum written as
     try expectRefusedInChunks(ByNumber, integers, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'l', 0xf5 });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x64, 'z', 'e', 't', 'a' });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x78, 0x1e, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'a', 'b', 'c', 'd' });
-    try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidEnumTag, &[_]u8{ 0xa1, 0x61, 'k', 0x09 });
+    try expectRefusedInChunks(ByName, .{}, chunk_read, error.NonDeterministicEncoding, &[_]u8{ 0xa1, 0x61, 'k', 0x09 });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.UnexpectedType, &[_]u8{ 0xa1, 0x61, 'k', 0x41, 0x00 });
     try expectRefusedInChunks(ByName, .{}, chunk_read, error.InvalidUtf8, &[_]u8{ 0xa1, 0x61, 'k', 0x62, 0xc3, 0x28 });
 }
@@ -8212,8 +8462,10 @@ test "a key and a string are read by every format with no allocation, whatever t
     defer zon.deinit(allocator);
     try expectKeyReadsFree(&zon);
     var msgpack = try zerde.msgpack.sliceDeserializer(allocator, &.{ 0x82, 0xa1, 'a', 0x01, 0xa1, 'c', 0xa3, 'r', 'e', 'd' }, .{});
+    defer msgpack.deinit(allocator);
     try expectKeyReadsFree(&msgpack);
     var bson = try zerde.bson.sliceDeserializer(allocator, &.{ 23, 0, 0, 0, 0x10, 'a', 0, 1, 0, 0, 0, 0x02, 'c', 0, 4, 0, 0, 0, 'r', 'e', 'd', 0, 0 }, .{});
+    defer bson.deinit(allocator);
     try expectKeyReadsFree(&bson);
 }
 

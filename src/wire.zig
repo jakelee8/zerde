@@ -376,8 +376,9 @@ pub fn Decoded(comptime T: type) type {
 /// A decode into the caller's regions, with no allocator in the API: `output` (at least
 /// `regionSizes(...).output` bytes) takes the arrays and rewritten strings the wire value points at, and
 /// stays; `scratch` (at least `regionSizes(...).scratch` bytes, a size known at compile time) takes what the
-/// reader keeps while it reads (the key records of a lenient CBOR read of a `Raw`), is free for reuse as soon
-/// as the call returns, and is empty for a strict CBOR read and for JSON. A region too small is
+/// reader keeps while it reads (the key records of a `Raw`: lenient CBOR's, and JSON's for the repeated-key
+/// check), is free for reuse as soon as the call returns, and is empty for a strict CBOR read and for a JSON
+/// read without a `Raw`. A region too small is
 /// `error.OutOfMemory`. `base` is the address spans are relative to, and the input and `output` must be
 /// memory it reaches. Everything else is `decode`.
 pub fn decodeInto(
@@ -437,6 +438,12 @@ pub const WireSink = struct {
 
     pub fn text(self: WireSink, comptime _: type, bytes: []const u8) !Span {
         return spanOf(self.base, bytes);
+    }
+
+    /// The text a `text` result names. The key of a sorted entry was just placed in a region `memory` covers (a sorted
+    /// entry's key is never left in the stream, `typedOwned`), so it resolves.
+    pub fn textOf(self: WireSink, text_value: Span) []const u8 {
+        return self.memory.bytesOf(text_value) catch unreachable;
     }
 
     pub fn bytesOf(self: WireSink, comptime _: type, bytes: []const u8) !Span {
@@ -811,7 +818,7 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 
 /// The two regions of `decodeInto`, in bytes: `output` holds the arrays and rewritten strings the wire value
 /// points at, `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
-/// a lenient CBOR `Raw` and the name spans of a JSON `Raw` otherwise), and
+/// a lenient CBOR `Raw` and the recorded names of a JSON `Raw` (`json.RecordedKey`) otherwise), and
 /// together they are `maxArenaSize`. Each is an upper bound under the same rules, so a region of exactly its
 /// size is enough for any input the config allows.
 pub const Sizes = struct { output: usize, scratch: usize };
@@ -967,12 +974,12 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
             // for a key that is itself an array or map its canonical bytes, once more at each level of
             // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
-            // the most of the two. JSON records a span of the input for each member (`json.KeyRef`) and
-            // a member takes four bytes at least, so `n / 4 + 1` of them; the bound is for either format.
+            // the most of the two. JSON records each member's name as it reads it (`json.RecordedKey`, a slice of the input
+            // and a flag) and a member takes four bytes at least, so `n / 4 + 1` of them; the bound is for either format.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item");
             // The item is itself a container, below the `depth` that hold it.
             const levels = @min(limits.max_depth -| (depth + 1), n / 4 + 1);
-            const json_spans = growth(n / 4 + 1, @sizeOf(json.KeyRef), @alignOf(json.KeyRef));
+            const json_spans = growth(n / 4 + 1, @sizeOf(json.RecordedKey), @alignOf(json.RecordedKey));
             break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1), json_spans) };
         },
         .list => blk: {

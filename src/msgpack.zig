@@ -9,6 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const typed = @import("typed.zig");
 const meta = @import("meta.zig");
+const repeat = @import("repeat.zig");
 const Number = typed.Number;
 const ObjectFieldLookup = typed.ObjectFieldLookup;
 const StringToken = typed.StringToken;
@@ -30,7 +31,18 @@ const ContainerKind = enum {
 const Container = struct {
     kind: ContainerKind,
     remaining: usize,
+    /// Where a map's keys start in the repeat record.
+    keys: usize = 0,
 };
+
+/// A map key the deserializer has read: the payload of a text key, or the whole encoded item of any other (met only in a
+/// skipped map). A text key never equals another kind of key.
+pub const RecordedKey = struct { bytes: []const u8, text: bool };
+
+fn recordedOrder(a: RecordedKey, b: RecordedKey) std.math.Order {
+    if (a.text != b.text) return std.math.order(@intFromBool(a.text), @intFromBool(b.text));
+    return std.mem.order(u8, a.bytes, b.bytes);
+}
 
 pub fn serializer(writer: *std.Io.Writer, comptime cfg: anytype) MsgpackSerializer(@TypeOf(cfg)) {
     return MsgpackSerializer(@TypeOf(cfg)).init(writer, cfg);
@@ -38,12 +50,11 @@ pub fn serializer(writer: *std.Io.Writer, comptime cfg: anytype) MsgpackSerializ
 
 pub fn readerDeserializer(allocator: Allocator, reader: *std.Io.Reader, comptime cfg: anytype) !MsgpackDeserializer(@TypeOf(cfg)) {
     const input = try reader.allocRemaining(allocator, .limited(effectiveMaxInputBytes(cfg)));
-    return MsgpackDeserializer(@TypeOf(cfg)).initOwned(input, cfg);
+    return MsgpackDeserializer(@TypeOf(cfg)).initOwned(allocator, input, cfg);
 }
 
 pub fn sliceDeserializer(allocator: Allocator, input: []const u8, comptime cfg: anytype) !MsgpackDeserializer(@TypeOf(cfg)) {
-    _ = allocator;
-    return MsgpackDeserializer(@TypeOf(cfg)).initBorrowed(input, cfg);
+    return MsgpackDeserializer(@TypeOf(cfg)).initBorrowed(allocator, input, cfg);
 }
 
 pub fn MsgpackSerializer(comptime Config: type) type {
@@ -234,6 +245,8 @@ pub fn MsgpackSerializer(comptime Config: type) type {
 
 pub fn MsgpackDeserializer(comptime Config: type) type {
     return struct {
+        /// Where the key record is allocated: the allocator the deserializer was made with.
+        allocator: Allocator,
         input: []const u8,
         cfg: Config,
         index: usize = 0,
@@ -241,11 +254,14 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
         can_borrow_strings: bool,
         stack: [128]Container = undefined,
         stack_len: usize = 0,
+        /// The keys of the maps open, each checked for a repeat when its map closes.
+        repeats: repeat.Record(RecordedKey, recordedOrder) = .{},
 
         const Self = @This();
 
-        fn initBorrowed(input: []const u8, cfg: Config) Self {
+        fn initBorrowed(allocator: Allocator, input: []const u8, cfg: Config) Self {
             return .{
+                .allocator = allocator,
                 .input = input,
                 .cfg = cfg,
                 .owns_input = false,
@@ -253,8 +269,9 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
             };
         }
 
-        fn initOwned(input: []const u8, cfg: Config) Self {
+        fn initOwned(allocator: Allocator, input: []const u8, cfg: Config) Self {
             return .{
+                .allocator = allocator,
                 .input = input,
                 .cfg = cfg,
                 .owns_input = true,
@@ -263,6 +280,7 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
+            self.repeats.deinit(self.allocator);
             if (self.owns_input) allocator.free(@constCast(self.input));
         }
 
@@ -399,13 +417,23 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
             try self.push(.{
                 .kind = .object,
                 .remaining = len,
+                .keys = self.repeats.mark(),
             });
         }
 
+        /// The next key of the map being read, recorded for the repeat check when the map closes.
         pub fn nextObjectField(self: *Self, allocator: Allocator) !?StringToken {
+            const token = (try self.nextSortedKey(allocator)) orelse return null;
+            try self.repeats.add(self.allocator, .{ .bytes = token.bytes, .text = true });
+            return token;
+        }
+
+        /// The next key of a `SortedMap`, not recorded: the sorted map checks its own keys.
+        pub fn nextSortedKey(self: *Self, allocator: Allocator) !?StringToken {
             const frame = self.current();
             if (frame.kind != .object) return error.InvalidMsgpackState;
             if (frame.remaining == 0) {
+                try self.repeats.close(frame.keys);
                 _ = self.pop();
                 return null;
             }
@@ -417,21 +445,24 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
             const frame = self.current();
             if (frame.kind != .object) return error.InvalidMsgpackState;
             if (frame.remaining == 0) {
+                try self.repeats.close(frame.keys);
                 _ = self.pop();
                 return .end;
             }
 
             frame.remaining -= 1;
             const key = try self.readBorrowedString();
-            return if (typed.matchStructFieldIndex(T, cfg, key)) |index|
-                .{ .field_index = index }
-            else
-                .unknown;
+            if (typed.matchStructFieldIndex(T, cfg, key)) |index| return .{ .field_index = index };
+            // With unknown members denied and no extras the typed layer fails at once, so a record would only cost memory.
+            if (comptime !(meta.effectiveDenyUnknownFields(T, cfg) and meta.extrasField(T) == null)) {
+                try self.repeats.add(self.allocator, .{ .bytes = key, .text = true });
+            }
+            return .unknown;
         }
 
         pub fn skipValue(self: *Self, allocator: Allocator) !void {
             _ = allocator;
-            try self.skipOne();
+            try self.skipOne(self.stack_len);
         }
 
         fn decodeInteger(self: *Self, tag: u8) !i128 {
@@ -500,7 +531,8 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
             return try decodeContainerLen(self, tag, expected);
         }
 
-        fn skipOne(self: *Self) !void {
+        /// Steps over one value with `depth` containers open around it, refusing a map that repeats a key, at any depth.
+        fn skipOne(self: *Self, depth: usize) !void {
             const tag = try self.readByte();
             switch (classify(tag)) {
                 .nil, .boolean => {},
@@ -517,15 +549,27 @@ pub fn MsgpackDeserializer(comptime Config: type) type {
                     self.index += len;
                 },
                 .array => {
+                    if (depth >= self.stack.len) return error.MsgpackNestingTooDeep;
                     const len = try decodeContainerLen(self, tag, .array);
-                    for (0..len) |_| try self.skipOne();
+                    for (0..len) |_| try self.skipOne(depth + 1);
                 },
                 .map => {
+                    if (depth >= self.stack.len) return error.MsgpackNestingTooDeep;
                     const len = try decodeContainerLen(self, tag, .map);
+                    const first = self.repeats.mark();
                     for (0..len) |_| {
-                        try self.skipOne();
-                        try self.skipOne();
+                        const start = self.index;
+                        const key_tag = try self.peekByte();
+                        if (classify(key_tag) == .string) {
+                            self.index += 1;
+                            try self.repeats.add(self.allocator, .{ .bytes = try self.readBorrowedStringTagged(key_tag), .text = true });
+                        } else {
+                            try self.skipOne(depth + 1);
+                            try self.repeats.add(self.allocator, .{ .bytes = self.input[start..self.index], .text = false });
+                        }
+                        try self.skipOne(depth + 1);
                     }
+                    try self.repeats.close(first);
                 },
                 .extension => return error.UnsupportedExtensionType,
                 .invalid => return error.UnexpectedToken,
@@ -675,6 +719,7 @@ pub fn parseSliceWith(
     comptime read_cfg: anytype,
 ) ParseError!T {
     var deserializer = try sliceDeserializer(allocator, input, read_cfg);
+    defer deserializer.deinit(allocator);
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
@@ -695,6 +740,7 @@ pub fn parseSliceAliasedWith(
         .max_input_bytes = effectiveMaxInputBytes(read_cfg),
         .borrow_strings = true,
     });
+    defer deserializer.deinit(allocator);
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;

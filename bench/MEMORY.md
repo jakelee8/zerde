@@ -28,6 +28,27 @@ For each format it records:
 The large scenario sizes differ by format because each writer emits its own
 canonical representation.
 
+## 2026-11-25 - 52757c8
+
+The whole branch against its base, on the default path (no new option set). Base is `03beb0e` (`origin/zig-0.17`), tip
+`52757c8`; `zig build bench-memory -Doptimize=ReleaseFast`, three runs each, alternating, `Linux x86_64` (WSL2), Zig
+`0.17.1`. The counts are the same in all three runs of a tree.
+
+Expected from the repeated-key change (`5870942`): a key record for each unknown member a typed read skips; the payload
+has none, so the typed reads allocate what they did.
+
+Every format but JSON allocates the same as the base. JSON makes the same allocation calls, with fewer remaps and fewer
+bytes (a rewritten string is measured and allocated once, at its exact length):
+
+| JSON | Base: remaps, allocated, peak | Tip: remaps, allocated, peak |
+| --- | --- | --- |
+| small parse | 13, 3,483 B, 2,456 B | 7, 2,745 B, 2,329 B |
+| small roundtrip | 19, 7,910 B, 6,883 B | 13, 7,172 B, 6,756 B |
+| medium parse | 1,868, 856,829 B, 629,645 B | 30, 630,755 B, 629,563 B |
+| medium roundtrip | 1,888, 2,220,874 B, 1,993,690 B | 50, 1,994,800 B, 1,993,608 B |
+| large parse | 180,251, 76,698,913 B, 54,529,735 B | 47, 54,533,821 B, 54,529,653 B |
+| large roundtrip | 180,282, 194,832,547 B, 172,663,369 B | 78, 172,667,455 B, 172,663,287 B |
+
 ## 2026-04-22 - ac2fe7e
 
 Changes since previous run:

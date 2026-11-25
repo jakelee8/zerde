@@ -83,6 +83,7 @@ pub const Mode = enum {
     /// differently and need not be neighbours: a map with both as keys is `error.DuplicateField`, and a key
     /// that is an array or a map and holds a float zero anywhere inside it is `error.NonDeterministicEncoding`
     /// (the one input strict refuses that is well-formed and valid, because telling its repeats needs a record).
+    /// An enum written as its number where the type writes its name is `error.NonDeterministicEncoding`.
     strict,
 };
 pub const WriteConfig = struct {
@@ -545,6 +546,11 @@ pub fn CborDeserializer(comptime Config: type) type {
 
         /// Whether the keys of a map are guaranteed to ascend, so each repeats or follows the one before (a strict read).
         pub fn keysAscend(self: *Self) bool {
+            return self.strict;
+        }
+
+        /// The read accepts only the deterministic encoding (`Mode.strict`): one value, one encoding.
+        pub fn isStrict(self: *const Self) bool {
             return self.strict;
         }
 

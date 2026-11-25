@@ -29,6 +29,64 @@ The current large case produces a JSON document of about `107.58 MiB`.
 
 Runs before `8a3a0a9` used the older simpler payload, so they are not directly comparable to the newer mixed-payload runs.
 
+## 2026-11-25 - 52757c8
+
+The whole branch against its base, on the default path (no new option set).
+
+Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-json -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+
+Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 4,553 / 4,306 / 4,173 | 5,460 / 5,642 / 5,387 | 1.20 to 1.31 |
+| small | parse std.json | 8,554 / 9,486 / 7,941 | 7,904 / 7,867 / 7,679 | 0.83 to 0.97 |
+| small | write zerde | 3,791 / 3,866 / 3,380 | 4,107 / 3,813 / 3,693 | 0.99 to 1.09 |
+| small | write std.json | 4,342 / 4,420 / 3,896 | 3,917 / 4,013 / 3,849 | 0.90 to 0.99 |
+| small | roundtrip zerde | 8,952 / 8,113 / 7,912 | 9,568 / 9,689 / 9,305 | 1.07 to 1.19 |
+| small | roundtrip std.json | 13,759 / 12,932 / 12,586 | 12,608 / 12,894 / 12,390 | 0.92 to 1.00 |
+| medium | parse zerde | 1,317,897 / 1,219,791 / 1,232,755 | 1,693,376 / 1,665,682 / 1,628,898 | 1.28 to 1.37 |
+| medium | parse std.json | 2,435,126 / 2,392,516 / 2,288,067 | 2,277,747 / 2,305,354 / 2,229,883 | 0.94 to 0.97 |
+| medium | write zerde | 1,063,792 / 947,730 / 931,892 | 1,037,989 / 1,045,238 / 1,024,263 | 0.98 to 1.10 |
+| medium | write std.json | 1,193,365 / 1,094,399 / 1,082,511 | 1,114,360 / 1,125,439 / 1,077,175 | 0.93 to 1.03 |
+| medium | roundtrip zerde | 2,362,280 / 2,212,770 / 2,187,343 | 2,707,661 / 2,760,847 / 2,661,195 | 1.15 to 1.25 |
+| medium | roundtrip std.json | 3,936,448 / 3,566,339 / 3,368,251 | 3,527,318 / 4,884,455 / 3,398,454 | 0.90 to 1.37 |
+| large | parse zerde | 139,041,044 / 127,926,873 / 124,800,033 | 173,697,068 / 174,334,566 / 165,430,531 | 1.25 to 1.36 |
+| large | parse std.json | 236,067,404 / 230,138,257 / 228,781,311 | 240,039,975 / 233,706,440 / 223,133,861 | 0.98 to 1.02 |
+| large | write zerde | 97,250,963 / 96,876,569 / 91,413,290 | 111,421,542 / 102,416,601 / 100,896,647 | 1.06 to 1.15 |
+| large | write std.json | 108,038,928 / 108,972,292 / 105,366,798 | 127,636,997 / 110,204,889 / 106,166,260 | 1.01 to 1.18 |
+| large | roundtrip zerde | 225,912,855 / 219,647,458 / 215,110,652 | 302,445,863 / 268,702,885 / 264,633,642 | 1.22 to 1.34 |
+| large | roundtrip std.json | 345,835,036 / 342,191,323 / 330,302,559 | 392,901,862 / 344,054,666 / 335,757,349 | 1.01 to 1.14 |
+
+Notes:
+
+- The typed zerde parse is 1.20 to 1.37 times the base in every pair and every scenario, and the roundtrip 1.07 to 1.34; `std.json` moved 0.83 to 1.18 on the same machine, but for one medium roundtrip run (1.37). The write is 0.98 to 1.15. The parse change is the branch's, not the repeated-key check: the `5870942` section measured the typed parse unchanged across that commit. Which of the branch's read changes (UTF-8 checks on every string, limits, the destination-passing walk) costs it is not measured here.
+- Listed under "Default-path cost" in `plans/api.md`.
+
+## 2026-11-24 - 5870942
+
+Changes since previous run:
+
+- every read refuses an object that names a key twice: the JSON deserializer records each key it returns (and each unknown key a typed read skips, unless the type denies unknown members) and checks each object's keys when it closes
+- new rows `value parse zerde` and `value parse std.json`: the same input into `zerde.value` and into `std.json.Value` (both refuse a repeated name)
+
+Environment for this entry only: `Linux x86_64` (WSL2, 24 cores, shared; load average 3 to 10 while it ran), Zig `0.17.1`. "Before" is `1ed10b9`, the commit that added the value rows; "after" is `5870942`. Three runs each, alternating before and after, `zig build bench-json -Doptimize=ReleaseFast` under one `flock`. ns/op, run 1 / run 2 / run 3.
+
+| Row | Scenario | Before | After |
+| --- | --- | ---: | ---: |
+| value parse zerde | small | 7939 / 8265 / 7913 | 10334 / 10056 / 10221 |
+| value parse zerde | medium | 2411320 / 2408970 / 2441306 | 3295482 / 3075614 / 3475500 |
+| value parse zerde | large | 252130956 / 249342836 / 255650040 | 330518157 / 319929492 / 334972429 |
+| value parse std.json | small | 15644 / 15513 / 15336 | 16260 / 15013 / 15626 |
+| value parse std.json | large | 528656169 / 479105537 / 485833036 | 518953828 / 479640622 / 483995081 |
+| parse zerde (typed) | small | 5513 / 5485 / 6456 | 5776 / 5418 / 5748 |
+| parse zerde (typed) | large | 165406066 / 163523097 / 165058272 | 169912025 / 166403705 / 168057518 |
+
+Notes:
+
+- the untyped read pays 25 to 35% for the repeated-key check (a key record and a sort per object); it stays about 1.5x faster than `std.json.Value`, which makes the same check
+- the typed parse is unchanged within the spread: a typed read records only unknown keys, and the payload has none
+
 ## 2026-11-23 - 4881395
 
 Changes since previous run:

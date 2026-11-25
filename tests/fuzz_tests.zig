@@ -111,6 +111,7 @@ const json_invalid_corpus: []const []const u8 = &.{
     @embedFile("corpus_invalid/json/float_for_int.json"),
     @embedFile("corpus_invalid/json/number_overflow.json"),
     @embedFile("corpus_invalid/json/nesting_too_deep.json"),
+    @embedFile("corpus_invalid/json/duplicate_unknown_key.json"),
 };
 
 const zon_invalid_corpus: []const []const u8 = &.{
@@ -145,11 +146,13 @@ const cbor_invalid_corpus: []const []const u8 = &.{
 const msgpack_invalid_corpus: []const []const u8 = &.{
     @embedFile("corpus_invalid/msgpack/wrong_type.msgpack"),
     @embedFile("corpus_invalid/msgpack/truncated_string.msgpack"),
+    @embedFile("corpus_invalid/msgpack/duplicate_unknown_key.msgpack"),
 };
 
 const bson_invalid_corpus: []const []const u8 = &.{
     @embedFile("corpus_invalid/bson/wrong_type.bson"),
     @embedFile("corpus_invalid/bson/truncated_document.bson"),
+    @embedFile("corpus_invalid/bson/duplicate_unknown_key.bson"),
 };
 
 const bin_invalid_corpus: []const []const u8 = &.{

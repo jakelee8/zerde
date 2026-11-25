@@ -28,6 +28,39 @@ Current scenarios:
 
 This run uses the baseline library's MessagePack output as the shared parse input so both libraries consume the same enum representation.
 
+## 2026-11-25 - 52757c8
+
+The whole branch against its base, on the default path (no new option set).
+
+Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-msgpack -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+
+Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 2,533 / 2,496 / 2,407 | 2,169 / 2,173 / 2,104 | 0.86 to 0.87 |
+| small | parse msgpack.zig | 2,823 / 2,513 / 2,681 | 2,711 / 2,517 / 2,494 | 0.93 to 1.00 |
+| small | write zerde | 787 / 774 / 767 | 773 / 763 / 774 | 0.98 to 1.01 |
+| small | write msgpack.zig | 921 / 892 / 888 | 935 / 901 / 898 | 1.01 to 1.02 |
+| small | roundtrip zerde | 3,264 / 3,254 / 3,306 | 3,373 / 3,011 / 2,938 | 0.89 to 1.03 |
+| small | roundtrip msgpack.zig | 3,434 / 3,416 / 3,644 | 3,543 / 3,469 / 3,430 | 0.94 to 1.03 |
+| medium | parse zerde | 809,462 / 799,090 / 796,477 | 798,249 / 715,726 / 687,802 | 0.86 to 0.99 |
+| medium | parse msgpack.zig | 629,254 / 616,432 / 679,691 | 751,639 / 648,928 / 655,918 | 0.97 to 1.19 |
+| medium | write zerde | 249,853 / 229,551 / 240,004 | 283,269 / 229,833 / 241,065 | 1.00 to 1.13 |
+| medium | write msgpack.zig | 283,299 / 274,568 / 273,192 | 282,273 / 275,940 / 288,222 | 1.00 to 1.06 |
+| medium | roundtrip zerde | 1,064,337 / 1,035,046 / 1,033,608 | 942,708 / 972,003 / 934,037 | 0.89 to 0.94 |
+| medium | roundtrip msgpack.zig | 906,091 / 895,956 / 951,486 | 916,963 / 1,095,685 / 945,251 | 0.99 to 1.22 |
+| large | parse zerde | 81,125,238 / 78,832,933 / 78,886,053 | 73,924,362 / 79,478,138 / 68,319,441 | 0.87 to 1.01 |
+| large | parse msgpack.zig | 63,600,188 / 62,365,409 / 67,392,749 | 68,486,144 / 67,545,444 / 66,387,899 | 0.99 to 1.08 |
+| large | write zerde | 27,004,328 / 24,425,320 / 24,157,972 | 25,043,731 / 23,952,615 / 24,175,908 | 0.93 to 1.00 |
+| large | write msgpack.zig | 28,859,357 / 27,505,269 / 27,648,889 | 30,198,679 / 29,536,715 / 27,662,345 | 1.00 to 1.07 |
+| large | roundtrip zerde | 109,496,266 / 104,521,820 / 102,216,902 | 99,153,629 / 95,192,977 / 92,595,337 | 0.91 to 0.91 |
+| large | roundtrip msgpack.zig | 95,004,705 / 91,408,879 / 94,414,055 | 96,883,309 / 95,184,813 / 93,584,291 | 0.99 to 1.04 |
+
+Notes:
+
+- The zerde parse is faster (0.86 to 1.01), the write unchanged (0.93 to 1.13) and the roundtrip faster (0.89 to 1.03); `msgpack.zig` moved 0.93 to 1.22. No default-path cost.
+
 ## 2026-04-21 - 500513c
 
 Changes since previous run:

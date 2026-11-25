@@ -224,6 +224,8 @@ pub fn enumValue(comptime T: type, deserializer: anytype, comptime cfg: anytype,
             // An enum written as its number reads only a number.
             .string => if (comptime meta.effectiveEnumRepr(T, cfg) == .integer) return error.UnexpectedType,
             .number => {
+                // A strict read takes only the form the writer uses: the name, for an enum written as its name.
+                if (comptime meta.effectiveEnumRepr(T, cfg) == .name) if (typed.readsStrict(deserializer)) return error.NonDeterministicEncoding;
                 const raw_tag = switch (try deserializer.readNumber()) {
                     .integer => |n| n,
                     .float => return error.UnexpectedType,
@@ -566,11 +568,7 @@ pub fn sortedMap(
     while (level.index < level.count) {
         if (level.phase == 1) {
             const key = try text(3, allocator, deserializer, .{}, rc);
-            if (level.index > 0) switch (sorted.order(level.prev, key)) {
-                .lt => {},
-                .eq => return error.DuplicateField,
-                .gt => return error.NonDeterministicEncoding,
-            };
+            if (level.index > 0) try sorted.checkNext(level.prev, key);
             level.prev = key;
             entries[level.index].key = try s.text([]const u8, key);
             level.phase = 2;

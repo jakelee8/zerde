@@ -6,11 +6,12 @@
 //! read a key is a span of the input, and in a decode into `wire.Wire` the map is `{ entries: Span }` over an array of
 //! `{ key: Span, value: Wire(V) }`.
 //!
-//! The typed layer reads and writes it as a map of text keys in CBOR and JSON. A read refuses a key that does not sort
-//! after the one before it (`error.NonDeterministicEncoding` when it sorts before, `error.DuplicateField` when equal), in
-//! every mode, so what it holds is sorted and has no repeat; a write refuses entries that are not (the same errors), so what it
-//! puts out is in key order and a deterministic CBOR write is canonical. A field's `max_len` bounds the entries, and
-//! `.elem` bounds each value. A resumable write of one is a compile error.
+//! The typed layer reads and writes it as a map of text keys in CBOR and JSON. Every read refuses a repeated key
+//! (`error.DuplicateField`); a strict CBOR read also refuses a key that does not sort after the one before it
+//! (`error.NonDeterministicEncoding`); any other read (lenient CBOR, JSON) accepts the keys in any order and sorts the
+//! entries, so the value is always sorted and binary search holds. A write refuses entries out of order (the same errors), so
+//! what it puts out is in key order and a deterministic CBOR write is canonical. A field's `max_len` bounds the entries, and
+//! `.elem` bounds each value.
 
 const std = @import("std");
 
@@ -67,6 +68,15 @@ pub fn SortedMap(comptime V: type) type {
 pub fn order(a: []const u8, b: []const u8) std.math.Order {
     if (a.len != b.len) return std.math.order(a.len, b.len);
     return std.mem.order(u8, a, b);
+}
+
+/// The order rule of a sorted map at one step: `key` must sort after `before`.
+pub fn checkNext(before: []const u8, key: []const u8) error{ DuplicateField, NonDeterministicEncoding }!void {
+    switch (order(before, key)) {
+        .lt => {},
+        .eq => return error.DuplicateField,
+        .gt => return error.NonDeterministicEncoding,
+    }
 }
 
 /// Whether `T` is a `SortedMap`.

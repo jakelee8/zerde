@@ -28,6 +28,39 @@ Current scenarios:
 
 This run uses a signed-integer and string-signature payload because that is the shared typed subset both libraries support cleanly.
 
+## 2026-11-25 - 52757c8
+
+The whole branch against its base, on the default path (no new option set).
+
+Base is `03beb0e` (`origin/zig-0.17`, where this branch started); tip is `52757c8` (`fix/library-review`, the source of every later commit of the branch). `Linux x86_64` (WSL2, 24 cores, shared), Zig `0.17.1`; three runs each, alternating base and tip suite by suite, `zig build bench-bson -Doptimize=ReleaseFast` under one `flock`. Load average 2 to 10 during the runs; the comparison library's rows are the control for the machine.
+
+Expected from the repeated-key change (`5870942`): a key record in an untyped read and for each unknown member a typed read skips, and MessagePack and BSON walking a skipped value; this payload has no unknown members and these rows read no untyped value, so none of it shows here (see the `5870942` section of `bench/JSON.md` for the untyped cost).
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 2,763 / 2,719 / 2,582 | 2,137 / 2,151 / 2,157 | 0.77 to 0.84 |
+| small | parse zig-bson | 23,461 / 22,762 / 21,732 | 22,039 / 22,119 / 21,993 | 0.94 to 1.01 |
+| small | write zerde | 16,727 / 15,132 / 13,700 | 14,074 / 14,206 / 13,652 | 0.84 to 1.00 |
+| small | write zig-bson | 97,569 / 88,751 / 85,688 | 87,370 / 87,723 / 84,962 | 0.90 to 0.99 |
+| small | roundtrip zerde | 18,455 / 18,391 / 16,803 | 16,895 / 17,312 / 16,308 | 0.92 to 0.97 |
+| small | roundtrip zig-bson | 115,661 / 112,036 / 108,371 | 109,555 / 113,150 / 107,559 | 0.95 to 1.01 |
+| medium | parse zerde | 822,935 / 824,445 / 804,171 | 654,247 / 669,609 / 651,623 | 0.80 to 0.81 |
+| medium | parse zig-bson | 10,430,575 / 10,344,723 / 9,487,913 | 9,616,137 / 10,750,909 / 9,142,333 | 0.92 to 1.04 |
+| medium | write zerde | 1,402,716 / 1,414,045 / 1,444,227 | 1,391,890 / 1,386,812 / 1,392,332 | 0.96 to 0.99 |
+| medium | write zig-bson | 14,146,985 / 13,498,975 / 12,738,047 | 13,094,462 / 12,881,380 / 12,338,125 | 0.93 to 0.97 |
+| medium | roundtrip zerde | 2,279,156 / 2,227,319 / 2,209,144 | 2,078,797 / 2,081,105 / 2,061,012 | 0.91 to 0.93 |
+| medium | roundtrip zig-bson | 28,002,290 / 25,546,771 / 24,988,072 | 26,320,034 / 26,567,812 / 24,865,228 | 0.94 to 1.04 |
+| large | parse zerde | 82,807,414 / 81,164,470 / 80,136,323 | 65,563,183 / 68,191,471 / 65,437,230 | 0.79 to 0.84 |
+| large | parse zig-bson | 1,273,635,194 / 1,279,997,585 / 1,227,002,128 | 1,303,439,478 / 1,265,660,573 / 1,248,570,125 | 0.99 to 1.02 |
+| large | write zerde | 151,855,491 / 145,984,281 / 145,619,594 | 156,857,777 / 146,664,996 / 147,068,774 | 1.00 to 1.03 |
+| large | write zig-bson | 1,396,840,484 / 1,371,059,878 / 1,312,273,516 | 1,382,011,421 / 1,420,293,846 / 1,315,675,571 | 0.99 to 1.04 |
+| large | roundtrip zerde | 233,042,585 / 232,946,116 / 225,773,780 | 214,587,865 / 218,802,120 / 212,187,819 | 0.92 to 0.94 |
+| large | roundtrip zig-bson | 2,697,862,546 / 2,659,223,369 / 2,518,652,490 | 2,805,007,495 / 2,798,834,002 / 2,566,364,205 | 1.02 to 1.05 |
+
+Notes:
+
+- The zerde parse is faster in every pair (0.77 to 0.84): a typed read matches a key to a field where it reads it (`nextObjectFieldIndex`, added with the repeated-key change). Write 0.84 to 1.03, roundtrip 0.91 to 0.97; `zig-bson` moved 0.89 to 1.05. No default-path cost.
+
 ## 2026-04-21 - ced89d0
 
 Changes since previous run:

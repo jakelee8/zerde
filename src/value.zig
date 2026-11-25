@@ -3,6 +3,10 @@
 //! The typed path remains the default fast path for `zerde`. This module is an
 //! explicit escape hatch for cases such as transcoding, inspection, tooling,
 //! and format-to-format conversion when no Zig schema is available up front.
+//!
+//! A read refuses an object or map that names a key twice, in every format and at any depth, skipped values included:
+//! `error.DuplicateField`, except ZON, which reports `error.ParseZon` from the Zig parser. A JSON name is compared as
+//! decoded text (`a` and `\u0061` are one name).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
