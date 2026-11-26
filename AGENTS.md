@@ -2,7 +2,7 @@
 
 ## Checks for a change
 
-- Every code change: `zig build test`. It also runs the property-style roundtrip fuzzing, the parser hardening fuzzing and the invalid-input leak tests.
+- Every code change: `zig build test`. It also runs the property-style roundtrip fuzzing, the parser hardening fuzzing and the invalid-input leak tests. After an edit to `src/`, also run `python3 tests/mutants.py --check`: it fails when a mutant's pattern is gone from the source, as CI does.
 - A new guard: add its mutant (the guard removed or weakened) to `tests/mutants.py`, and run `python3 tests/mutants.py` on a clean tree before you commit. Do not commit while it runs: it edits `src/`.
 - Benchmarked code: the matching `zig build bench-<format> -Doptimize=ReleaseFast`. `bench/README.md` describes the benchmark workflow.
 - `examples/`: `zig build examples`. `bin/`, the transcoder CLI: `zig build transcode`.
