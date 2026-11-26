@@ -33,6 +33,8 @@ pub const SerdeConfig = meta.SerdeConfig;
 pub const Diagnostic = diagnostic_impl.Diagnostic;
 pub const DiagnosticLocation = diagnostic_impl.Location;
 pub const DiagnosticPathSegment = diagnostic_impl.PathSegment;
+pub const DiagnosticDetail = diagnostic_impl.Detail;
+pub const DiagnosticKind = diagnostic_impl.Kind;
 
 /// Reflection over schema types, for generators; see `reflect.zig`.
 pub const reflect = @import("reflect.zig");

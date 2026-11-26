@@ -29,6 +29,7 @@
 - A struct with a `check` that holds a text or byte string is a compile error under `wire.StreamResumable` itself, and under `streamRegionSizes`: the string stays in the stream and the check read output bytes at its stream offset (or got `error.OffsetOutOfRange`) instead of the text. A `Raw` and a sorted map's key are copied into the output and keep working.
 - `wire.encode` takes the read config of a decode of the same type as a new last comptime parameter, `read_cfg`, and holds its rebuild to that read's limits (`error.LengthOutOfBounds`, `error.TooManyItems`, the format's nesting error). Every list that is not a list of scalars needs a bound for it (a field's `max_len`, or `max_items` in `read_cfg`): a compile error otherwise. `wire.fromWire` takes a new second parameter, `limited`: `null` for what it did, or `wire.Limited(Format, serde_cfg, read_cfg)`.
 - `reflect.Kind` has a new value, `.@"packed"`, so a `switch` over every value of it no longer compiles until it handles it.
+- `Diagnostic.pushField`, `pushIndex` and `pop` are removed. A path longer than 64 segments now keeps its innermost segments and prints `root[...]` before them.
 
 ### Added
 

@@ -249,7 +249,10 @@ pub fn deserializeWithDiagnostics(
     diagnostics: ?*diagnostic_mod.Diagnostic,
 ) anyerror!T {
     var result: T = undefined;
-    try deserializeValue(TypedSink{}, T, &result, allocator, deserializer, cfg, diagnostics, true, NoRead{});
+    deserializeValue(TypedSink{}, T, &result, allocator, deserializer, cfg, diagnostics, true, NoRead{}) catch |err| {
+        diagnostics.?.finishPath();
+        return err;
+    };
     return result;
 }
 
@@ -1970,9 +1973,10 @@ pub fn deserializeElement(
 ) anyerror!void {
     if (comptime bounds.elem == null) return deserializeIndexedValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, index, rc);
     const elem = comptime bounds.elem.?;
-    if (track_diagnostics) diagnostics.?.pushIndex(index);
-    deserializeBounded(s, T, elem.*, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| return err;
-    if (track_diagnostics) diagnostics.?.pop();
+    deserializeBounded(s, T, elem.*, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| {
+        if (track_diagnostics) diagnostics.?.unwindIndex(index);
+        return err;
+    };
 }
 
 pub fn deserializeIndexedValue(
@@ -1987,9 +1991,10 @@ pub fn deserializeIndexedValue(
     index: usize,
     rc: anytype,
 ) anyerror!void {
-    if (track_diagnostics) diagnostics.?.pushIndex(index);
-    deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| return err;
-    if (track_diagnostics) diagnostics.?.pop();
+    deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| {
+        if (track_diagnostics) diagnostics.?.unwindIndex(index);
+        return err;
+    };
 }
 
 /// Whether the field has a `max_len`.
@@ -2069,12 +2074,13 @@ pub fn deserializeFieldValue(
     comptime bounds: meta.Bounds,
     rc: anytype,
 ) anyerror!void {
-    if (track_diagnostics) diagnostics.?.pushField(field_name);
     (if (comptime bounds.isDefault())
         deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)
     else
-        deserializeBounded(s, T, bounds, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)) catch |err| return err;
-    if (track_diagnostics) diagnostics.?.pop();
+        deserializeBounded(s, T, bounds, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)) catch |err| {
+        if (track_diagnostics) diagnostics.?.unwindField(field_name);
+        return err;
+    };
 }
 
 /// Index of the field whose wire key is the text `actual`.
