@@ -995,6 +995,7 @@ pub fn StreamResumable(comptime T: type, comptime serde_cfg: anytype, comptime c
 }
 
 fn ResumableIn(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype, comptime in_stream: bool) type {
+    if (in_stream) comptime assertStreamChecks(T, serde_cfg, limitsOf(cbor, cbor_cfg), 0);
     const Reading = resumable.Reading(WireSink, T, serde_cfg, cbor_cfg, in_stream);
 
     return struct {
@@ -1052,6 +1053,7 @@ fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: any
     }
 
     // A `check` rebuilds the struct it checks from the wire layout, after the read has filled the output for that subtree.
+    if (in_stream) comptime assertStreamChecks(T, serde_cfg, limits, 0);
     const check = comptime checkBytes(T, serde_cfg, limits, 0);
     // A validator's block is taken from the reader's memory, which is `scratch`; a resumable read has none, and takes it from the end of `output`.
     const scratch = cost.scratch + if (limits.copy) 0 else cost.validate;
@@ -1132,9 +1134,6 @@ fn checkBytes(comptime T: type, comptime cfg: anytype, comptime limits: Limits, 
             if (comptime typed.isSortedMap(T)) break :blk checkBytes([]const T.Entry, cfg, limits, depth -| 1);
             var most: u64 = 0;
             if (comptime @hasDecl(T, "check")) {
-                if (limits.in_stream and holdsStreamText(T, cfg, limits, depth)) {
-                    @compileError("a check cannot read text or bytes that stay in the stream (`StreamResumable`), and this one's struct holds some: " ++ @typeName(T));
-                }
                 most = listsOf(rebuildOwned(T, .{}, cfg, limits, depth), limits, true);
             }
             for (reflect.fields(T, cfg)) |field| {
@@ -1151,6 +1150,31 @@ fn checkBytes(comptime T: type, comptime cfg: anytype, comptime limits: Limits, 
         },
         else => 0,
     };
+}
+
+/// The compile error of `StreamResumable`: a struct that declares `check` and holds a text or byte string that stays in the stream. Its check
+/// rebuilds the struct from the output region, which has no such bytes (a span holds a stream offset), so it would read other bytes.
+/// Walks the types reachable from `T`; a `Raw` and a sorted map's key are in the output and are no fault.
+fn assertStreamChecks(comptime T: type, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) void {
+    if (depth > limits.max_depth) return;
+    switch (comptime reflect.kindOf(T)) {
+        .list => assertStreamChecks(@typeInfo(T).pointer.child, cfg, limits, depth + 1),
+        .array => assertStreamChecks(@typeInfo(T).array.child, cfg, limits, depth + 1),
+        .optional => assertStreamChecks(@typeInfo(T).optional.child, cfg, limits, depth),
+        .@"struct" => {
+            if (comptime typed.isSortedMap(T)) return assertStreamChecks([]const T.Entry, cfg, limits, depth -| 1);
+            if (comptime @hasDecl(T, "check") and holdsStreamText(T, cfg, limits, depth)) {
+                @compileError("a check cannot read text or bytes that stay in the stream (`StreamResumable`), and this one's struct holds some: " ++ @typeName(T));
+            }
+            for (reflect.fields(T, cfg)) |field| {
+                if (!field.extras) assertStreamChecks(field.type, cfg, limits, depth + 1);
+            }
+        },
+        .@"union" => for (reflect.variants(T, cfg)) |variant| {
+            if (variant.type != void) assertStreamChecks(variant.type, cfg, limits, depth + 1);
+        },
+        else => {},
+    }
 }
 
 /// Whether the value of `T` holds a text or a byte string that `StreamResumable` leaves in the stream: any but a sorted map's key,

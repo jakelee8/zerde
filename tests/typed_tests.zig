@@ -9989,3 +9989,36 @@ test "a packed struct with an inferred backing integer round trips and is refuse
     try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedInferredPadded, null, arena_state.allocator(), memory, 2));
     try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedInferredPadded, null, arena_state.allocator(), memory, 0x30));
 }
+
+test "a checked struct that holds a text is no fault in a stream read where max_depth does not reach it" {
+    const Checked = struct {
+        name: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .name = .{ .max_len = 8 } } };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const Middle = struct {
+        held: Checked,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const Root = struct {
+        middle: Middle,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // The root, the middle and the checked struct are three levels; a read at two never gets to it.
+    const Stream = wire.StreamResumable(Root, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8, .max_depth = 2 });
+    try std.testing.expect(@sizeOf(Stream) > 0);
+}
+
+test "the stream check walk stops at max_depth in a type that recurses" {
+    const Tree = struct {
+        kids: []const @This(),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .kids = .{ .max_len = 2 } } };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const Stream = wire.StreamResumable(Tree, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8, .max_depth = 4 });
+    try std.testing.expect(@sizeOf(Stream) > 0);
+}

@@ -9,6 +9,8 @@ const Checked = struct {
     }
 };
 
-test "stream region sizes" {
-    _ = zerde.wire.streamRegionSizes(Checked, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8, .max_depth = 2 });
+test "stream decoder" {
+    var decoder: zerde.wire.StreamResumable(Checked, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8, .max_depth = 2 }) = undefined;
+    var output: [8]u8 = undefined;
+    decoder.init(&output, 0);
 }

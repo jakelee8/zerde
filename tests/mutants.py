@@ -756,7 +756,7 @@ MUTANTS = [
     # the arena a check needs
     ("wire.zig", "const output = lists + text + check + (if (limits.copy) cost.validate else 0) + slack;", "const output = lists + text + (if (limits.copy) cost.validate else 0) + slack;"),
     ("wire.zig", "most = listsOf(rebuildOwned(T, .{}, cfg, limits, depth), limits, true);", "most = 0;"),
-    ("wire.zig", "if (limits.in_stream and holdsStreamText(T, cfg, limits, depth)) {", "if (false) {"),
+    ("wire.zig", "if (comptime @hasDecl(T, \"check\") and holdsStreamText(T, cfg, limits, depth)) {", "if (false) {"),
     ("wire.zig", ".text, .byte_string => true,\n        .list => holdsStreamText(", ".text, .byte_string => false,\n        .list => holdsStreamText("),
     ("wire.zig", "                if (@hasDecl(T, \"zerde_sorted_entry\") and std.mem.eql(u8, field.name, \"key\")) continue;\n", ""),
     ("wire.zig", ".list => holdsStreamText(@typeInfo(T).pointer.child, cfg, limits, depth + 1),", ".list => false,"),
@@ -821,6 +821,15 @@ MUTANTS = [
     ("cbor.zig", "    if (readOption(cfg, \"mode\", Mode.lenient) == .strict) return object;", "    if (false) return object;"),
     ("cbor.zig", "return @max(sizing.growth(n / 2 + 8, @sizeOf(KeyRecord), @alignOf(KeyRecord)), sizing.growth(n * levels, 1, 1));", "return sizing.growth(n / 2 + 8, @sizeOf(KeyRecord), @alignOf(KeyRecord));"),
     ("meta.zig", ".@\"enum\" => |enum_info| if (isTargetSized(enum_info.tag_type)) {", ".@\"enum\" => |enum_info| if (false and isTargetSized(enum_info.tag_type)) {"),
+    ("wire.zig", "    if (in_stream) comptime assertStreamChecks(T, serde_cfg, limits, 0);\n", ""),
+    ("wire.zig", "    if (in_stream) comptime assertStreamChecks(T, serde_cfg, limitsOf(cbor, cbor_cfg), 0);\n", ""),
+    ("wire.zig", ".list => assertStreamChecks(@typeInfo(T).pointer.child, cfg, limits, depth + 1),", ".list => {},"),
+    ("wire.zig", ".array => assertStreamChecks(@typeInfo(T).array.child, cfg, limits, depth + 1),", ".array => {},"),
+    ("wire.zig", ".optional => assertStreamChecks(@typeInfo(T).optional.child, cfg, limits, depth),", ".optional => {},"),
+    ("wire.zig", "return assertStreamChecks([]const T.Entry, cfg, limits, depth -| 1);", "return assertStreamChecks([]const T.Entry, cfg, limits, depth);"),
+    ("wire.zig", "if (!field.extras) assertStreamChecks(field.type, cfg, limits, depth + 1);", "_ = field;"),
+    ("wire.zig", "if (variant.type != void) assertStreamChecks(variant.type, cfg, limits, depth + 1);", "_ = variant;"),
+    ("wire.zig", "    if (depth > limits.max_depth) return;\n    switch (comptime reflect.kindOf(T)) {\n        .list => assertStreamChecks", "    switch (comptime reflect.kindOf(T)) {\n        .list => assertStreamChecks"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the `+ element.lists.fixed` of the shared-budget list in
 # `rebuildOwned` (the per-item bound in `listsOf` is always the smaller whenever that term is not 0), the BSON `readBytes` text arm
