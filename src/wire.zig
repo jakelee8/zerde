@@ -48,6 +48,8 @@ const root = @import("root.zig");
 const cbor = @import("cbor.zig");
 const json = @import("json.zig");
 const resumable = @import("resumable.zig");
+const sizing = @import("sizing.zig");
+const growth = sizing.growth;
 
 pub const Error = error{
     /// A span's offset or end does not fit `u32`, or lies before the base address.
@@ -472,8 +474,9 @@ pub fn Decoded(comptime T: type) type {
 /// `regionSizes(...).output` bytes) takes the arrays and rewritten strings the wire value points at, and
 /// stays; `scratch` (at least `regionSizes(...).scratch` bytes, a size known at compile time) takes what the
 /// reader keeps while it reads (the key records of a `Raw`: lenient CBOR's, and JSON's for the repeated-key
-/// check), is free for reuse as soon as the call returns, and is empty for a strict CBOR read and for a JSON
-/// read without a `Raw`. A region too small is
+/// check and the strings it decodes) and the block that a `Raw` field's validator runs on (`Bounds.validate_bytes`, which a validator
+/// must state here), is free for reuse as soon as the call returns, and is empty for a strict CBOR read and for a JSON
+/// read without a `Raw`, if there is no validator. A region too small is
 /// `error.OutOfMemory`. `base` is the address spans are relative to, and the input and `output` must be
 /// memory it reaches. Everything else is `decode`.
 pub fn decodeInto(
@@ -522,6 +525,9 @@ pub const WireSink = struct {
     base: usize,
     memory: Memory,
     arena: *std.heap.FixedBufferAllocator,
+
+    /// The typed walk reads into regions that a size function reserves: a validator of a `Raw` states its bound (`Bounds.validate_bytes`).
+    pub const fixed_regions = true;
 
     pub fn Of(comptime T: type) type {
         return Wire(T);
@@ -831,6 +837,8 @@ const Cost = struct {
     lists: Amount = .{},
     text: Amount = .{},
     scratch: u64 = 0,
+    /// The most any validator of a `Raw` allocates for one item (`Bounds.validate_bytes`): in `scratch`, or in `output` for a resumable read.
+    validate: u64 = 0,
     list_size: u64 = 0,
     list_align: u64 = 0,
 
@@ -839,6 +847,7 @@ const Cost = struct {
             .lists = a.lists.plus(b.lists),
             .text = a.text.plus(b.text),
             .scratch = @max(a.scratch, b.scratch),
+            .validate = @max(a.validate, b.validate),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
         };
@@ -856,26 +865,12 @@ const Cost = struct {
             .lists = a.lists.most(b.lists),
             .text = a.text.most(b.text),
             .scratch = @max(a.scratch, b.scratch),
+            .validate = @max(a.validate, b.validate),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
         };
     }
 };
-
-/// The bytes a list of `n` items of `size` and `alignment` takes in a fixed buffer, worst case: an
-/// array list grows from nothing through the capacities the standard library gives it, each a new
-/// allocation (the buffer reuses only the last one), and is copied to its exact size at the end.
-fn growth(n: u64, size: u64, alignment: u64) u64 {
-    if (n == 0) return 0;
-    const init = @max(1, 128 / size);
-    var capacity: u64 = 0;
-    var total: u64 = 0;
-    while (capacity < n) {
-        capacity = (capacity + 1) + ((capacity + 1) / 2 + init);
-        total += capacity * size + alignment - 1;
-    }
-    return total + n * size + alignment - 1;
-}
 
 /// The most `growth` costs for one item of the shared budget: a list of `k` items uses `k + 1` of
 /// it (its own place and its elements), and costs most per item just after it grew, so the ratio is
@@ -940,7 +935,8 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 /// The two regions of `decodeInto`, in bytes: `output` holds the arrays and rewritten strings the wire value
 /// points at, and the rebuild of a struct's `check` (the typed form of the struct's lists, made from the wire layout for the
 /// call and given back; the largest rebuild over every struct with a `check`), `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
-/// a lenient CBOR `Raw` and the recorded names of a JSON `Raw` (`json.RecordedKey`) otherwise), and
+/// a lenient CBOR `Raw` (`cbor.itemScratch`), the recorded names of a JSON `Raw` and the strings it decodes (`json.itemScratch`) otherwise)
+/// and the largest `validate_bytes` of any `Raw` validator, the block a validator runs on (`typed.runValidate`), and
 /// together they are `maxArenaSize`. Each is an upper bound under the same rules, so a region of exactly its
 /// size is enough for any input the config allows.
 pub const Sizes = struct { output: usize, scratch: usize };
@@ -952,7 +948,8 @@ pub fn regionSizes(comptime Format: type, comptime T: type, comptime serde_cfg: 
 /// `regionSizes` for a resumable decode (`Resumable`) of strict CBOR: every string, byte string and `Raw` is copied into `output`
 /// as it arrives, each in an allocation of exactly its length (a `Raw`'s grows in place to at most its bound and is cut to its
 /// length), so they are charged where a whole-input strict read charges nothing; the arrays are charged as it charges them, and
-/// `scratch` is empty, since the reader's state is in the `Resumable`, and `output` includes the rebuild of a `check` as `regionSizes` does.
+/// `scratch` is empty, since the reader's state is in the `Resumable`, and `output` includes the rebuild of a `check` as `regionSizes` does
+/// and the largest `validate_bytes` of a `Raw` validator, whose block comes off the end of the output for the length of the call.
 /// Every string must have a bound (`max_len`, or
 /// `max_string_len`), a `Raw` as well, and a `SortedMap`'s keys the config's `max_string_len`. `cbor_cfg` must say `mode = .strict`.
 pub fn resumableRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
@@ -1056,9 +1053,11 @@ fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: any
 
     // A `check` rebuilds the struct it checks from the wire layout, after the read has filled the output for that subtree.
     const check = comptime checkBytes(T, serde_cfg, limits, 0);
-    const output = lists + text + check + slack;
-    if (output + cost.scratch > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
-    return .{ .output = @intCast(output), .scratch = @intCast(cost.scratch) };
+    // A validator's block is taken from the reader's memory, which is `scratch`; a resumable read has none, and takes it from the end of `output`.
+    const scratch = cost.scratch + if (limits.copy) 0 else cost.validate;
+    const output = lists + text + check + (if (limits.copy) cost.validate else 0) + slack;
+    if (output + scratch > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
+    return .{ .output = @intCast(output), .scratch = @intCast(scratch) };
 }
 
 /// The bytes the lists of `cost` take: from the fields, and, where the items are bounded, from the budget alone. `strict` says that
@@ -1209,23 +1208,21 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             break :blk .{ .text = .{ .fixed = n } };
         },
         .raw => blk: {
+            // The validator runs on a block of the bytes it states, which no size function can derive from a function pointer.
+            const validate: u64 = if (bounds.validate != null) bounds.validate_bytes orelse 0 else 0;
             // A strict read keeps no record of a key (it compares neighbours, and refuses a composite key that
             // holds a float zero), so a raw item of CBOR costs nothing.
             if (limits.strict) {
                 // A resumable read copies it, whole, into the output.
-                if (!limits.copy) break :blk .{};
-                break :blk .{ .text = .{ .fixed = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item") } };
+                if (!limits.copy) break :blk .{ .validate = validate };
+                break :blk .{ .text = .{ .fixed = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item") }, .validate = validate };
             }
-            // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
-            // for a key that is itself an array or map its canonical bytes, once more at each level of
-            // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
-            // the most of the two. JSON records each member's name as it reads it (`json.RecordedKey`, a slice of the input
-            // and a flag) and a member takes four bytes at least, so `n / 4 + 1` of them; the bound is for either format.
+            // Checking a raw item records its map keys (`cbor.itemScratch`), and JSON records each member's name and decodes the
+            // strings it checks into the reader's memory (`json.itemScratch`); the bound is for either format.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item");
             // The item is itself a container, below the `depth` that hold it.
             const levels = @min(limits.max_depth -| (depth + 1), n / 4 + 1);
-            const json_spans = growth(n / 4 + 1, @sizeOf(json.RecordedKey), @alignOf(json.RecordedKey));
-            break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1), json_spans) };
+            break :blk .{ .scratch = @max(cbor.itemScratch(n, levels), json.itemScratch(n)), .validate = validate };
         },
         .list => blk: {
             const Elem = @typeInfo(T).pointer.child;

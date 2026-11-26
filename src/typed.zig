@@ -1002,7 +1002,7 @@ pub fn deserializeValue(
             if (T == ByteString) {
                 try readByteString(s, T, dest, allocator, deserializer, .{}, rc);
             } else if (comptime isRaw(T)) {
-                dest.* = try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, .{}, rc));
+                dest.* = try s.bytesOf(T, try readRawSlice(@TypeOf(s), T, allocator, deserializer, .{}, rc));
             } else if (comptime isSortedMap(T)) {
                 try deserializeSortedMap(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, .{}, rc);
             } else {
@@ -1528,17 +1528,36 @@ fn readByteSlice(allocator: Allocator, deserializer: anytype, comptime bounds: m
 }
 
 /// Reads the next item as raw bytes into memory the caller owns, or into the input when the parse aliases it.
-fn readRawSlice(comptime T: type, allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror![]const u8 {
-    if (comptime @TypeOf(rc) != NoRead) return resume_read.raw(T, allocator, deserializer, bounds, rc);
+fn readRawSlice(comptime Sink: type, comptime T: type, allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror![]const u8 {
+    if (comptime @TypeOf(rc) != NoRead) return resume_read.raw(Sink, T, allocator, deserializer, bounds, rc);
     const DeserializerType = @TypeOf(deserializer.*);
     if (!@hasDecl(DeserializerType, "readRaw") or DeserializerType.raw_format != T.zerde_raw_format) {
         @compileError("format " ++ @typeName(DeserializerType) ++ " cannot read a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
     }
     const token = try deserializer.readRaw(allocator);
     try checkLength(bounds, token.bytes.len);
-    if (bounds.validate) |validate| try validate(allocator, token.bytes);
+    // A read into fixed regions keeps what the reader holds apart from the output: the validator's block comes from there.
+    if (comptime bounds.validate != null) try runValidate(Sink, bounds, if (comptime @hasDecl(Sink, "fixed_regions")) deserializer.allocator else allocator, token.bytes);
     if (@hasDecl(DeserializerType, "borrowStrings") and deserializer.borrowStrings()) return token.bytes;
     return allocator.dupe(u8, token.bytes);
+}
+
+/// Runs the validator of a `Raw` field on `bytes`. With `validate_bytes` it runs on a fixed buffer of that size, taken from `allocator`
+/// and given back after the call, whatever the sink: a validator that allocates more fails with `error.OutOfMemory`, so a test of the
+/// typed read finds an understated bound. Without it a typed read passes `allocator` itself, and a read into fixed regions
+/// (a sink that declares `fixed_regions`, `wire.WireSink`) is a compile error: no size function can know what a validator takes.
+pub fn runValidate(comptime Sink: type, comptime bounds: meta.Bounds, allocator: Allocator, bytes: []const u8) anyerror!void {
+    const validate = bounds.validate orelse return;
+    const size = bounds.validate_bytes orelse {
+        if (comptime @hasDecl(Sink, "fixed_regions")) {
+            @compileError("a validator under a wire read takes its memory from the region that `regionSizes` reserves, so it states how much: set `validate_bytes`, the most bytes it allocates for one item (0 for none)");
+        }
+        return validate(allocator, bytes);
+    };
+    const block = try allocator.alloc(u8, size);
+    defer allocator.free(block);
+    var fixed = std.heap.FixedBufferAllocator.init(block);
+    try validate(fixed.allocator(), bytes);
 }
 
 fn deserializeStruct(
@@ -2017,7 +2036,7 @@ fn deserializeBounded(
             if (T == ByteString) {
                 try readByteString(s, T, dest, allocator, deserializer, bounds, rc);
             } else if (comptime isRaw(T)) {
-                dest.* = try s.bytesOf(T, try readRawSlice(T, allocator, deserializer, bounds, rc));
+                dest.* = try s.bytesOf(T, try readRawSlice(@TypeOf(s), T, allocator, deserializer, bounds, rc));
             } else if (comptime isSortedMap(T)) {
                 try deserializeSortedMap(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, bounds, rc);
             } else {

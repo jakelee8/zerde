@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const typed = @import("typed.zig");
 const meta = @import("meta.zig");
 const bulk = @import("bulk.zig");
+const sizing = @import("sizing.zig");
 const Number = typed.Number;
 const StringToken = typed.StringToken;
 const ValueKind = typed.ValueKind;
@@ -1694,6 +1695,29 @@ fn checkString(input: []const u8, index: *usize, header: Header, check_text: boo
 /// Checks that `bytes` is exactly one well-formed CBOR item, and has no map with a repeated key.
 pub fn validate(allocator: Allocator, bytes: []const u8) !void {
     try validateItem(allocator, bytes, false);
+}
+
+/// The most a lenient read keeps of a fixed buffer while it checks one item of `n` bytes: the records of its map keys, at most `n / 2` of
+/// them, and, for a key that is itself an array or map, its canonical bytes, once more at each of `levels` levels of nesting that holds it
+/// (a level takes at least four bytes). The records and the bytes share the `n` bytes, so the most of the two. A strict read keeps neither.
+pub fn itemScratch(comptime n: u64, comptime levels: u64) u64 {
+    return @max(sizing.growth(n / 2 + 8, @sizeOf(KeyRecord), @alignOf(KeyRecord)), sizing.growth(n * levels, 1, 1));
+}
+
+/// The most `validate` allocates for one item of `n` bytes, which is what it takes from a fixed buffer: a field's `validate_bytes` for
+/// `.validate = cbor.validate`. The item can nest as deep as `max_nesting`.
+pub fn validateScratch(comptime n: u64) u64 {
+    return itemScratch(n, @min(max_nesting, n / 4 + 1));
+}
+
+/// The most a validator takes of a fixed buffer when it reads one item of `n` bytes with `pullReader(allocator, bytes, cfg)`: the reader's
+/// own object, which is large (the container stack), and for a lenient read the key records of `itemScratch` and the one text that
+/// the reader holds at a time, joined from its chunks, which is at most the item.
+pub fn pullReaderScratch(comptime cfg: anytype, comptime n: u64) u64 {
+    comptime checkLimits(cfg);
+    const object = @sizeOf(CborDeserializer(@TypeOf(cfg))) + @alignOf(CborDeserializer(@TypeOf(cfg))) - 1;
+    if (readOption(cfg, "mode", Mode.lenient) == .strict) return object;
+    return object + itemScratch(n, @min(limit(cfg, "max_depth", max_nesting), n / 4 + 1)) + n;
 }
 
 /// `validate`, refusing -0.0 (`error.NegativeZero`) when `refuse_zero`.

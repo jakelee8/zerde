@@ -9624,3 +9624,344 @@ test "encode counts an array and a union as containers, and holds a union's payl
     for (large_entries) |*entry| entry.value.entries.len = 3;
     try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, Nested, &spare, mem, maps, &out.writer, .{}, .{}, limits));
 }
+
+// ---- a Raw validator under a wire read ------------------------------------------------------------------------
+
+/// A validator that allocates `100` bytes and gives them back.
+fn hungry(gpa: std.mem.Allocator, bytes: []const u8) anyerror!void {
+    _ = bytes;
+    const block = try gpa.alloc(u8, 100);
+    gpa.free(block);
+}
+
+fn RawItems(comptime Raw: type, comptime item: anytype) type {
+    return struct {
+        items: []const Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .items = .{ .max_len = 3, .elem = item } } };
+    };
+}
+
+const cbor_pull_bytes = zerde.cbor.pullReaderScratch(.{}, 64);
+const json_pull_bytes = zerde.json.pullReaderScratch(.{}, 64);
+const ProfiledRaws = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = checkMetaCbor, .validate_bytes = cbor_pull_bytes });
+const ValidatedRaws = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = zerde.cbor.validate, .validate_bytes = zerde.cbor.validateScratch(64) });
+const PlainRaws = RawItems(zerde.cbor.Raw, .{ .max_len = 64 });
+const ProfiledJsonRaws = RawItems(zerde.json.Raw, .{ .max_len = 64, .validate = checkMetaJson, .validate_bytes = json_pull_bytes });
+const PlainJsonRaws = RawItems(zerde.json.Raw, .{ .max_len = 64 });
+
+/// A CBOR map of `count` pairs of a one-byte text key and a small integer, in key order.
+fn cborPairs(out: *std.ArrayList(u8), count: u8, comptime chunked: bool) !void {
+    try out.append(allocator, 0xa0 + count);
+    for (0..count) |index| {
+        if (chunked) try out.appendSlice(allocator, &.{ 0x7f, 0x61, 'a' + @as(u8, @intCast(index)), 0xff }) else try out.appendSlice(allocator, &.{ 0x61, 'a' + @as(u8, @intCast(index)) });
+        try out.append(allocator, 0x00);
+    }
+}
+
+/// `{"items": [<each item>]}` as lenient CBOR.
+fn cborItems(items: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, &.{ 0xa1, 0x65, 'i', 't', 'e', 'm', 's', 0x80 + @as(u8, @intCast(items.len)) });
+    for (items) |item| try out.appendSlice(allocator, item);
+    return out.toOwnedSlice(allocator);
+}
+
+/// The least `scratch` in which `decodeInto` of `input` (at the start of `region`) succeeds; every smaller one is `OutOfMemory`.
+fn leastScratch(comptime Format: type, comptime T: type, comptime read: anytype, region: *Region, input_len: usize, output: []u8, scratch: []u8) !usize {
+    var low: usize = 0;
+    var high: usize = scratch.len;
+    while (low < high) {
+        const middle = (low + high) / 2;
+        if (wire.decodeInto(Format, T, output, scratch[0..middle], region.base(), region.bytes[0..input_len], .{}, read)) |_| {
+            high = middle;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            low = middle + 1;
+        }
+    }
+    return low;
+}
+
+/// The least `output` in which `decodeInto` of `input` succeeds, which is what the read takes of it at its peak.
+fn leastOutput(comptime Format: type, comptime T: type, comptime read: anytype, region: *Region, input_len: usize, output: []u8, scratch: []u8) !usize {
+    var low: usize = 0;
+    var high: usize = output.len;
+    while (low < high) {
+        const middle = (low + high) / 2;
+        if (wire.decodeInto(Format, T, output[0..middle], scratch, region.base(), region.bytes[0..input_len], .{}, read)) |_| {
+            high = middle;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            low = middle + 1;
+        }
+    }
+    return low;
+}
+
+/// `input` decodes into `T` in the regions of `regionSizes`, uses of `output` what the same type without a validator uses, and takes of
+/// `scratch` no more than `regionSizes` gives and one byte more than a region one byte smaller fails with.
+fn expectValidatedScratch(comptime Format: type, comptime T: type, comptime Plain: type, comptime read: anytype, input: []const u8) !void {
+    const sizes = comptime wire.regionSizes(Format, T, .{}, read);
+    const plain_sizes = comptime wire.regionSizes(Format, Plain, .{}, read);
+    var region: Region = .{};
+    @memcpy(region.bytes[0..input.len], input);
+    const output = region.bytes[std.mem.alignForward(usize, input.len, 16)..][0..sizes.output];
+    var scratch: [32768]u8 = undefined;
+    const decoded = try wire.decodeInto(Format, T, output, scratch[0..sizes.scratch], region.base(), region.bytes[0..input.len], .{}, read);
+    // The validator took nothing of the output: what the output holds is what it holds without one.
+    const plain = try wire.decodeInto(Format, Plain, output, scratch[0..plain_sizes.scratch], region.base(), region.bytes[0..input.len], .{}, read);
+    try std.testing.expectEqual(plain.used, decoded.used);
+    try std.testing.expect(decoded.used <= sizes.output);
+    // The scratch is at least what the decode takes of it, and no smaller region will do.
+    const peak = try leastScratch(Format, T, read, &region, input.len, output, &scratch);
+    try std.testing.expect(peak <= sizes.scratch);
+    try std.testing.expect(peak > 0);
+    try std.testing.expectError(error.OutOfMemory, wire.decodeInto(Format, T, output, scratch[0 .. peak - 1], region.base(), region.bytes[0..input.len], .{}, read));
+    // And the output needs none of it, not even for the length of a call: the least output that will do is the plain type's.
+    try std.testing.expectEqual(
+        try leastOutput(Format, Plain, read, &region, input.len, output, scratch[0..plain_sizes.scratch]),
+        try leastOutput(Format, T, read, &region, input.len, output, scratch[0..sizes.scratch]),
+    );
+}
+
+test "a validator under decodeInto runs in the scratch region that regionSizes reserves, and the output is as it is without one" {
+    const read = .{ .max_string_len = 64, .max_items = 200 };
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(allocator);
+    try cborPairs(&many, 20, false);
+    var chunked: std.ArrayList(u8) = .empty;
+    defer chunked.deinit(allocator);
+    try cborPairs(&chunked, 12, true);
+    var long_text: std.ArrayList(u8) = .empty;
+    defer long_text.deinit(allocator);
+    try long_text.appendSlice(allocator, &.{ 0xa1, 0x61, 'k', 0x7f });
+    for (0..14) |_| try long_text.appendSlice(allocator, &.{ 0x63, 'a', 'b', 'c' });
+    try long_text.append(allocator, 0xff);
+    const profiled = try cborItems(&.{ many.items, chunked.items, long_text.items });
+    defer allocator.free(profiled);
+    // The README's validator, which reads the item with a pull reader (an object of some 8 KB), and `cbor.validate`.
+    try expectValidatedScratch(zerde.cbor, ProfiledRaws, PlainRaws, read, profiled);
+    try expectValidatedScratch(zerde.cbor, ValidatedRaws, PlainRaws, read, profiled);
+    // Nested maps and a composite key, which `cbor.validate` takes and the pull reader would not.
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(allocator);
+    for (0..20) |_| try nested.appendSlice(allocator, &.{ 0xa1, 0x61, 'x' });
+    try nested.append(allocator, 0x00);
+    var composite: std.ArrayList(u8) = .empty;
+    defer composite.deinit(allocator);
+    try composite.append(allocator, 0xa0 + 15);
+    for (0..15) |index| try composite.appendSlice(allocator, &.{ 0x82, 0x01, @as(u8, @intCast(index)), 0x00 });
+    const adversarial = try cborItems(&.{ nested.items, composite.items, many.items });
+    defer allocator.free(adversarial);
+    try expectValidatedScratch(zerde.cbor, ValidatedRaws, PlainRaws, read, adversarial);
+}
+
+test "a validator under a JSON decodeInto, and the strings a json.Raw decodes, take the scratch region and nothing of the output" {
+    const read = .{ .max_string_len = 64, .max_items = 200 };
+    // Names that need an escape, as many as the 64 bytes hold, in a profile the README validator accepts.
+    const names = "{\"\\n\":1,\"\\t\":2,\"\\r\":3,\"\\b\":4,\"\\f\":5,\"\\\"\":6,\"\\\\\":7,\"\\/\":8,\"a\":9}";
+    try std.testing.expect(names.len <= 64);
+    const escaped_array = comptime blk: {
+        var text: [64]u8 = undefined;
+        text[0] = '"';
+        for (0..30) |index| {
+            text[1 + 2 * index] = '\\';
+            text[2 + 2 * index] = 'n';
+        }
+        text[61] = 'x';
+        text[62] = 'x';
+        text[63] = '"';
+        break :blk text;
+    };
+    const escaped_string: []const u8 = &escaped_array;
+    const unicode_names = "{\"\\u0061\":\"\\n\",\"\\u0062\":\"\\n\",\"\\u0063\":\"\\n\",\"\\u0064\":\"\\n\"}";
+    try std.testing.expect(unicode_names.len <= 64);
+    const input = "{\"items\":[" ++ names ++ "," ++ unicode_names ++ "]}";
+    try expectValidatedScratch(zerde.json, ProfiledJsonRaws, PlainJsonRaws, read, input);
+    // A Raw item with no validator: one escaped string as long as its bound, and one object whose escaped names fill it.
+    try expectValidatedScratch(zerde.json, PlainJsonRaws, PlainJsonRaws, read, "{\"items\":[" ++ escaped_string ++ "]}");
+    try expectValidatedScratch(zerde.json, PlainJsonRaws, PlainJsonRaws, read, "{\"items\":[" ++ names ++ "]}");
+}
+
+test "a validator that allocates more than its validate_bytes fails with OutOfMemory, in every read" {
+    const Hungry = struct {
+        fn Of(comptime Raw: type, comptime bytes: usize) type {
+            return RawItems(Raw, .{ .max_len = 64, .validate = hungry, .validate_bytes = bytes });
+        }
+    };
+    const cbor_input = try cborItems(&.{&.{ 0xa1, 0x61, 'a', 0x00 }});
+    defer allocator.free(cbor_input);
+    const json_input = "{\"items\":[{\"a\":0}]}";
+    const read = .{ .max_string_len = 64, .max_items = 20 };
+    // The typed read takes the block from its allocator and gives it back: the testing allocator checks it.
+    inline for (.{ .{ zerde.cbor, cbor_input }, .{ zerde.json, json_input } }) |case| {
+        const Format = case[0];
+        const Raw = if (Format == zerde.cbor) zerde.cbor.Raw else zerde.json.Raw;
+        const short = Hungry.Of(Raw, 99);
+        const enough = Hungry.Of(Raw, 100);
+        try std.testing.expectError(error.OutOfMemory, Format.parseSlice(short, allocator, case[1]));
+        zerde.free(allocator, try Format.parseSlice(enough, allocator, case[1]));
+        // The wire read runs it in the scratch region that the size reserves, and never writes past it.
+        var region: Region = .{};
+        @memcpy(region.bytes[0..case[1].len], case[1]);
+        const input = region.bytes[0..case[1].len];
+        const output = region.bytes[std.mem.alignForward(usize, input.len, 16)..];
+        var scratch: [16384]u8 = undefined;
+        const enough_sizes = comptime wire.regionSizes(Format, enough, .{}, read);
+        const short_sizes = comptime wire.regionSizes(Format, short, .{}, read);
+        try std.testing.expectEqual(short_sizes.scratch + 1, enough_sizes.scratch);
+        _ = try wire.decodeInto(Format, enough, output[0..enough_sizes.output], scratch[0..enough_sizes.scratch], region.base(), input, .{}, read);
+        try std.testing.expectError(error.OutOfMemory, wire.decodeInto(Format, short, output[0..short_sizes.output], scratch[0..short_sizes.scratch], region.base(), input, .{}, read));
+        // And `decode`, whose one arena is the sum of the two regions.
+        const enough_total = comptime wire.maxArenaSize(Format, enough, .{}, read);
+        const short_total = comptime wire.maxArenaSize(Format, short, .{}, read);
+        var enough_arena = std.heap.FixedBufferAllocator.init(output[0..enough_total]);
+        _ = try wire.decode(Format, enough, &enough_arena, region.base(), input, .{}, read);
+        var short_arena = std.heap.FixedBufferAllocator.init(output[0..short_total]);
+        try std.testing.expectError(error.OutOfMemory, wire.decode(Format, short, &short_arena, region.base(), input, .{}, read));
+    }
+}
+
+test "a validator under a resumable read takes its block from the end of the output, and the output size counts it" {
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 100 };
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(allocator);
+    try cborPairs(&many, 20, false);
+    const input = try cborItems(&.{many.items});
+    defer allocator.free(input);
+    inline for (.{ .{ ProfiledRaws, cbor_pull_bytes }, .{ ValidatedRaws, zerde.cbor.validateScratch(64) } }) |case| {
+        const T = case[0];
+        const sizes = comptime wire.resumableRegionSizes(T, .{}, strict_read);
+        const plain = comptime wire.resumableRegionSizes(PlainRaws, .{}, strict_read);
+        try std.testing.expectEqual(@as(usize, 0), sizes.scratch);
+        var region: Region = .{};
+        // The least output in which the whole decode succeeds, and one byte less is refused.
+        var low: usize = 0;
+        var high: usize = sizes.output;
+        while (low < high) {
+            const middle = (low + high) / 2;
+            var decoder: wire.Resumable(T, .{}, strict_read) = undefined;
+            decoder.init(region.bytes[0..middle], region.base());
+            if (decoder.feed(input)) |_| {
+                high = middle;
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                low = middle + 1;
+            }
+        }
+        // What it takes is the Raw copies and the array, and the validator's block on top of them for the length of one call.
+        var decoder: wire.Resumable(T, .{}, strict_read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        _ = try decoder.feed(input);
+        const used = (try decoder.finish()).used;
+        // The block is exactly what the field states, and the size counts exactly that more than a read without a validator.
+        try std.testing.expectEqual(used + case[1], low);
+        try std.testing.expectEqual(plain.output + case[1], sizes.output);
+        // The block is given back: the output holds what a read without a validator holds.
+        var bare: wire.Resumable(PlainRaws, .{}, strict_read) = undefined;
+        bare.init(region.bytes[0..plain.output], region.base());
+        _ = try bare.feed(input);
+        try std.testing.expectEqual((try bare.finish()).used, used);
+    }
+}
+
+test "a validator that allocates more than its validate_bytes fails with OutOfMemory in a resumable read" {
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 100 };
+    const input = try cborItems(&.{&.{ 0xa1, 0x61, 'a', 0x00 }});
+    defer allocator.free(input);
+    var region: Region = .{};
+    inline for (.{ 99, 100 }) |bytes| {
+        const T = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = hungry, .validate_bytes = bytes });
+        const sizes = comptime wire.resumableRegionSizes(T, .{}, strict_read);
+        var decoder: wire.Resumable(T, .{}, strict_read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        if (bytes == 100) {
+            _ = try decoder.feed(input);
+        } else {
+            try std.testing.expectError(error.OutOfMemory, decoder.feed(input));
+        }
+    }
+    // The same where a text stays in the stream.
+    inline for (.{ 99, 100 }) |bytes| {
+        const T = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = hungry, .validate_bytes = bytes });
+        const sizes = comptime wire.streamRegionSizes(T, .{}, strict_read);
+        var decoder: wire.StreamResumable(T, .{}, strict_read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        if (bytes == 100) {
+            _ = try decoder.feed(input);
+        } else {
+            try std.testing.expectError(error.OutOfMemory, decoder.feed(input));
+        }
+    }
+}
+
+test "the scratch a validator needs is the growth rule of the arena bounds, and the largest of the validators is counted" {
+    // `growth(n / 2 + 8, 24, 8)` for the key records and `growth(n * levels, 1, 1)` for the canonical bytes of composite keys, the most of
+    // the two; the bytes win once an item can nest: 4 levels of 8 bytes do not, 65 levels of 256 do.
+    try std.testing.expectEqual(@as(usize, 813), zerde.cbor.validateScratch(8));
+    try std.testing.expectEqual(@as(usize, 4908), zerde.cbor.validateScratch(64));
+    try std.testing.expectEqual(@as(usize, 80086), zerde.cbor.validateScratch(256));
+    // A pull reader's own object is the same for every item, and a strict reader keeps nothing else.
+    const object = zerde.cbor.pullReaderScratch(.{}, 64) - zerde.cbor.validateScratch(64) - 64;
+    try std.testing.expect(object > 4096);
+    try std.testing.expectEqual(object, zerde.cbor.pullReaderScratch(.{}, 256) - zerde.cbor.validateScratch(256) - 256);
+    try std.testing.expectEqual(object, zerde.cbor.pullReaderScratch(.{ .mode = zerde.cbor.Mode.strict }, 256));
+    // A shallower reader keeps fewer levels of a composite key.
+    try std.testing.expect(zerde.cbor.pullReaderScratch(.{ .max_depth = 4 }, 256) < zerde.cbor.pullReaderScratch(.{}, 256));
+    // JSON: the names it records (a member takes four bytes) and the strings it decodes, together at most the item.
+    try std.testing.expectEqual(@as(usize, 1700), zerde.json.itemScratch(64));
+    try std.testing.expectEqual(@as(usize, 6202), zerde.json.itemScratch(256));
+    const json_object = zerde.json.pullReaderScratch(.{}, 64) - zerde.json.itemScratch(64);
+    try std.testing.expect(json_object > 1024);
+    try std.testing.expectEqual(json_object, zerde.json.pullReaderScratch(.{}, 256) - zerde.json.itemScratch(256));
+    // The sizes count the largest validator of the type, whichever field or variant it is in.
+    const A = struct {
+        small: zerde.cbor.Raw,
+        large: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+            .small = .{ .max_len = 8, .validate = hungry, .validate_bytes = 10 },
+            .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 },
+        } };
+    };
+    const B = struct {
+        large: zerde.cbor.Raw,
+        small: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+            .small = .{ .max_len = 8, .validate = hungry, .validate_bytes = 10 },
+            .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 },
+        } };
+    };
+    const Choice = union(enum) {
+        small: zerde.cbor.Raw,
+        large: zerde.cbor.Raw,
+        pub const serde = .{ .fields = .{
+            .small = .{ .max_len = 8, .validate = hungry, .validate_bytes = 10 },
+            .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 },
+        } };
+    };
+    const Flipped = union(enum) {
+        large: zerde.cbor.Raw,
+        small: zerde.cbor.Raw,
+        pub const serde = Choice.serde;
+    };
+    const Lone = struct {
+        large: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 } } };
+    };
+    const read = .{ .max_string_len = 8, .max_items = 20 };
+    const lone = comptime wire.regionSizes(zerde.cbor, Lone, .{}, read);
+    inline for (.{ A, B, Choice, Flipped }) |T| {
+        try std.testing.expectEqual(lone.scratch, comptime wire.regionSizes(zerde.cbor, T, .{}, read).scratch);
+    }
+    // A validator that states 0 takes nothing, so a wire read of it needs no more than one without.
+    const Nothing = struct {
+        item: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .item = .{ .max_len = 8, .validate = zerde.cbor.validate, .validate_bytes = 0 } } };
+    };
+    const Bare = struct {
+        item: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .item = .{ .max_len = 8 } } };
+    };
+    try std.testing.expectEqual(comptime wire.regionSizes(zerde.cbor, Bare, .{}, read), comptime wire.regionSizes(zerde.cbor, Nothing, .{}, read));
+}

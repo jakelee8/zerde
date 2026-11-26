@@ -142,7 +142,7 @@ pub fn byteArray(comptime N: usize, dest: *[N]u8, deserializer: anytype, rc: any
 /// The next item as the bytes it is written in: checked as it arrives for its form (`chunk.Reader.scanItem`) and,
 /// once whole, for what needs the whole (the order of its keys, its text). It is held whole while it is read, so it is
 /// bounded as a string is: by its `max_len` and by `max_string_len`.
-pub fn raw(comptime T: type, allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror![]const u8 {
+pub fn raw(comptime Sink: type, comptime T: type, allocator: Allocator, deserializer: anytype, comptime bounds: meta.Bounds, rc: anytype) anyerror![]const u8 {
     if (comptime T.zerde_raw_format != .cbor) @compileError("a resumable read reads CBOR, not a " ++ @tagName(T.zerde_raw_format) ++ " Raw item");
     const leaf = &rc.leaf;
     if (!leaf.started) {
@@ -155,7 +155,8 @@ pub fn raw(comptime T: type, allocator: Allocator, deserializer: anytype, compti
     try typed.checkLength(bounds, rc.scan.filled);
     const bytes = try rc.scan.finish();
     leaf.* = .{};
-    if (bounds.validate) |validate| try validate(allocator, bytes);
+    // The block comes off the end of the output arena, which has no region of its own for it, and is given back at once.
+    if (comptime bounds.validate != null) try typed.runValidate(Sink, bounds, allocator, bytes);
     return bytes;
 }
 

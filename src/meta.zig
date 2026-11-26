@@ -82,6 +82,10 @@ pub const Bounds = struct {
     /// For a `Raw` field: a function that checks the item (`fn (allocator, bytes) !void`), run after
     /// the read has checked it and its length, with the item's own bytes. Its error is the read's.
     validate: ?*const fn (std.mem.Allocator, []const u8) anyerror!void = null,
+    /// For a `Raw` field with a `validate`: the most bytes the validator allocates for one item. A read runs the validator on a block of
+    /// this size (so one that needs more fails with `error.OutOfMemory`) and gives the block back after the call. A wire read
+    /// (`wire.decodeInto`, `wire.decode`, `wire.Resumable`) must state it, for any validator: `0` for one that allocates nothing.
+    validate_bytes: ?usize = null,
 
     pub fn isDefault(comptime self: Bounds) bool {
         return self.min_len == 0 and self.max_len == std.math.maxInt(usize) and self.min == null and self.max == null and self.elem == null and self.validate == null;
@@ -314,7 +318,7 @@ pub fn effectiveFieldKey(comptime T: type, comptime field_name: []const u8, comp
 pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) Bounds {
     @setEvalBranchQuota(20_000);
     var bounds: Bounds = .{};
-    inline for (.{ "min_len", "max_len", "min", "max", "validate" }) |option| {
+    inline for (.{ "min_len", "max_len", "min", "max", "validate", "validate_bytes" }) |option| {
         const found: ?@FieldType(Bounds, option) = comptime blk: {
             if (fieldOverrideHas(cfg, field_name, option)) break :blk fieldOverride(cfg, field_name, option);
             if (@hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, option)) break :blk fieldOverride(T.serde, field_name, option);
@@ -335,7 +339,7 @@ pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, compti
 /// The bounds a struct literal states, as `.{ .max_len = 8, .elem = .{ .min = 0 } }`.
 fn boundsOf(comptime attrs: anytype) Bounds {
     var bounds: Bounds = .{};
-    inline for (.{ "min_len", "max_len", "min", "max", "validate" }) |option| {
+    inline for (.{ "min_len", "max_len", "min", "max", "validate", "validate_bytes" }) |option| {
         if (comptime hasField(@TypeOf(attrs), option)) @field(bounds, option) = @field(attrs, option);
     }
     if (comptime hasField(@TypeOf(attrs), "elem")) {
