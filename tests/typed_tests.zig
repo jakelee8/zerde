@@ -10113,3 +10113,38 @@ test "the shared budget of a list is charged at the size and alignment of the la
         try std.testing.expectEqual(@as(usize, 528 * n + 256), (comptime wire.regionSizes(zerde.cbor, BudgetTop, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 600, .max_items = n })).output);
     }
 }
+
+test "toWire writes the presence byte 1 and the index of the variant as its tag" {
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..1024]);
+    const some = try wire.toWire(?u32, build.allocator(), region.base(), 7);
+    try std.testing.expectEqual(@as(u8, 1), some.present);
+    try std.testing.expectEqual(@as(u32, 7), some.value);
+    try std.testing.expectEqual(@as(u8, 0), (try wire.toWire(?u32, build.allocator(), region.base(), null)).present);
+    const Choice = union(enum) { a: u8, b: u16, c: u32, d };
+    const c = try wire.toWire(Choice, build.allocator(), region.base(), .{ .c = 9 });
+    try std.testing.expectEqual(@as(u8, 2), c.tag);
+    try std.testing.expectEqual(@as(u32, 9), c.payload.c);
+    try std.testing.expectEqual(@as(u8, 3), (try wire.toWire(Choice, build.allocator(), region.base(), .d)).tag);
+}
+
+test "lists that share the budget are charged by the most, not the sum, of what one item of it can cost" {
+    const Big = struct {
+        x: [512]u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // The large bounded list makes the cap generous, so the shared lists are charged by their own figure.
+    const One = struct {
+        a: []const u16,
+        big: []const Big,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .big = .{ .max_len = 1 } } };
+    };
+    const Two = struct {
+        a: []const u16,
+        b: []const u16,
+        big: []const Big,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .big = .{ .max_len = 1 } } };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 100 };
+    try std.testing.expectEqual(comptime wire.regionSizes(zerde.cbor, One, .{}, read), comptime wire.regionSizes(zerde.cbor, Two, .{}, read));
+}
