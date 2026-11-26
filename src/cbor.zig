@@ -25,6 +25,7 @@ const typed = @import("typed.zig");
 const meta = @import("meta.zig");
 const bulk = @import("bulk.zig");
 const sizing = @import("sizing.zig");
+const diagnostic_mod = @import("diagnostic.zig");
 const Number = typed.Number;
 const StringToken = typed.StringToken;
 const ValueKind = typed.ValueKind;
@@ -621,22 +622,26 @@ pub fn CborDeserializer(comptime Config: type) type {
             return self.index;
         }
 
-        pub fn peekKind(self: *Self) !ValueKind {
-            const header = try self.peekHeader();
-            return switch (header.major) {
-                0, 1 => .number,
-                2 => .bytes,
-                3 => .string,
-                4 => .array,
-                5 => .object,
-                7 => switch (header.ai) {
-                    20, 21 => .bool,
-                    22 => .null,
-                    25, 26, 27 => .number,
-                    else => error.UnexpectedToken,
-                },
-                else => error.UnexpectedToken,
+        /// The value whose first head is at `offset`, with a self-described tag read through.
+        pub fn valueAt(self: *Self, offset: usize) diagnostic_mod.Found {
+            var cursor = offset;
+            const first = parseHeader(self.input, &cursor) catch return .{ .offset = offset, .kind = null };
+            const tagged = first.major == 6;
+            const header = self.peekHeaderAt(offset) catch return .{ .offset = offset, .kind = null, .tagged = tagged };
+            const kind: ?diagnostic_mod.Kind = switch (headerKind(header) catch return .{ .offset = offset, .kind = null, .tagged = tagged }) {
+                .number => if (header.major == 7) .float else .integer,
+                .null => .null,
+                .bool => .bool,
+                .string => .string,
+                .bytes => .bytes,
+                .array => .array,
+                .object => .object,
             };
+            return .{ .offset = offset, .kind = kind, .tagged = tagged };
+        }
+
+        pub fn peekKind(self: *Self) !ValueKind {
+            return headerKind(try self.peekHeader());
         }
 
         pub fn readNull(self: *Self) !void {
@@ -1049,7 +1054,11 @@ pub fn CborDeserializer(comptime Config: type) type {
         /// layer can read: it would be dropped without anyone having agreed what it meant. A strict
         /// read refuses every tag when it reads the head.
         fn peekHeader(self: *Self) !Header {
-            var cursor = self.index;
+            return self.peekHeaderAt(self.index);
+        }
+
+        fn peekHeaderAt(self: *Self, offset: usize) !Header {
+            var cursor = offset;
             while (true) {
                 const header = try parseHeader(self.input, &cursor);
                 if (header.major != 6) return header;
@@ -2775,6 +2784,23 @@ pub fn parseSliceAliasedWith(
     const value = try typed.deserialize(T, allocator, &deserializer, serde_cfg);
     try deserializer.finish();
     return value;
+}
+
+fn headerKind(header: Header) !ValueKind {
+    return switch (header.major) {
+        0, 1 => .number,
+        2 => .bytes,
+        3 => .string,
+        4 => .array,
+        5 => .object,
+        7 => switch (header.ai) {
+            20, 21 => .bool,
+            22 => .null,
+            25, 26, 27 => .number,
+            else => error.UnexpectedToken,
+        },
+        else => error.UnexpectedToken,
+    };
 }
 
 /// Reads one head and checks that it is well-formed: a reserved additional-info value, an

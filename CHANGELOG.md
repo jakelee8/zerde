@@ -69,6 +69,7 @@
 - `cbor.valueWriter` and `json.valueWriter`: writers for runtime-defined values with `writeEvent`. CBOR lengths are definite. Maps are sorted on close (CBOR deterministic: encoded-key order; JSON: length-first `sort_keys`). A repeated key gives `error.DuplicateField`.
 - `max_container_bytes` for both value writers (unbounded by default) limits the output one open container buffers. A write or close past it gives `error.ContainerTooLarge`, before any allocation.
 - Wire-type hooks `zerdeDecode` (over a pull reader), `zerdeEncode` and `zerdeFree` for CBOR and JSON. `zerdeEncode` receives a streaming `Encoder` that enforces its stated lengths, nesting, UTF-8 and, when deterministic, ascending keys. An unfinished hook gives `error.HookIncomplete`. `zerde.free` leaves a type with a hook and no `zerdeFree` alone.
+- `Diagnostic.detail` (`zerde.DiagnosticDetail`, `zerde.DiagnosticKind`) gives the expected and found kind, the bounds or range, or the missing, duplicate or unknown field; for JSON and CBOR a value's failure points at the value's first byte.
 
 #### Fixed-layout decoding
 

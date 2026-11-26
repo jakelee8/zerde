@@ -10148,3 +10148,154 @@ test "lists that share the budget are charged by the most, not the sum, of what 
     const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 100 };
     try std.testing.expectEqual(comptime wire.regionSizes(zerde.cbor, One, .{}, read), comptime wire.regionSizes(zerde.cbor, Two, .{}, read));
 }
+
+// Diagnostics
+
+/// Parses `input` with diagnostics, expects `expected_err`, and compares the formatted diagnostic with `expected_text`.
+fn expectDiagnostic(comptime Format: type, comptime T: type, input: []const u8, comptime serde_cfg: anytype, comptime format_cfg: anytype, expected_err: anyerror, expected_text: []const u8) !zerde.Diagnostic {
+    var d: zerde.Diagnostic = .{};
+    const err = if (zerde.parseSliceWithDiagnostics(Format, T, allocator, input, &d, serde_cfg, format_cfg)) |_| return error.TestUnexpectedSuccess else |err| err;
+    try std.testing.expectEqual(expected_err, err);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try d.format(&out.writer, err);
+    try std.testing.expectEqualStrings(expected_text, out.written());
+    return d;
+}
+
+const DenyA = struct {
+    a: u32,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+
+fn NestedList(comptime n: usize) type {
+    return if (n == 0) u32 else []const NestedList(n - 1);
+}
+
+test "a JSON diagnostic names an integer field given a float" {
+    _ = try expectDiagnostic(zerde.json, struct { a: u32 }, "{\"a\":1.5}", .{}, .{}, error.UnexpectedType, "UnexpectedType at root.a (offset 5, line 1, column 6): expected integer, found float");
+}
+
+test "a JSON diagnostic points at the failing value's first byte, past whitespace" {
+    _ = try expectDiagnostic(zerde.json, struct { a: u32 }, "{\n  \"a\": true\n}", .{}, .{}, error.InvalidNumber, "InvalidNumber at root.a (offset 9, line 2, column 8): expected integer, found bool");
+}
+
+test "a JSON diagnostic names a missing field of a nested struct" {
+    _ = try expectDiagnostic(zerde.json, struct { a: u32, b: struct { c: u32, d: u32 } }, "{\"a\":1,\"b\":{\"c\":2}}", .{}, .{}, error.MissingField, "MissingField at root.b (offset 18, line 1, column 19): missing field \"d\"");
+}
+
+test "a JSON diagnostic names an unknown field's key" {
+    _ = try expectDiagnostic(zerde.json, DenyA, "{\"a\":1,\"zz\":2}", .{}, .{}, error.UnknownField, "UnknownField (offset 12, line 1, column 13): unknown field \"zz\"");
+}
+
+test "a JSON diagnostic names a duplicate field" {
+    _ = try expectDiagnostic(zerde.json, struct { a: u32 }, "{\"a\":1,\"a\":2}", .{}, .{}, error.DuplicateField, "DuplicateField (offset 11, line 1, column 12): duplicate field \"a\"");
+}
+
+test "a JSON diagnostic names a field that refuses null" {
+    _ = try expectDiagnostic(zerde.json, struct { x: ?u32 }, "{\"x\":null}", .{ .fields = .{ .x = .{ .optional = .absent } } }, .{}, error.UnexpectedType, "UnexpectedType at root.x (offset 5, line 1, column 6): expected integer, found null");
+}
+
+test "a JSON diagnostic gives an element's own length bound" {
+    _ = try expectDiagnostic(zerde.json, struct { xs: []const []const u8 }, "{\"xs\":[\"abc\"]}", .{ .fields = .{ .xs = .{ .max_len = 10, .elem = .{ .max_len = 2 } } } }, .{}, error.LengthOutOfBounds, "LengthOutOfBounds at root.xs[0] (offset 7, line 1, column 8): length must be at most 2");
+}
+
+test "a JSON diagnostic gives a field's maximum length" {
+    _ = try expectDiagnostic(zerde.json, struct { name: []const u8 }, "{\"name\":\"abcd\"}", .{ .fields = .{ .name = .{ .max_len = 3 } } }, .{}, error.LengthOutOfBounds, "LengthOutOfBounds at root.name (offset 8, line 1, column 9): length must be at most 3");
+}
+
+test "a JSON diagnostic gives an integer type's range on overflow" {
+    _ = try expectDiagnostic(zerde.json, struct { n: u8 }, "{\"n\":300}", .{}, .{}, error.IntegerOverflow, "IntegerOverflow at root.n (offset 5, line 1, column 6): value must be within [0, 255]");
+}
+
+test "a JSON diagnostic gives a field's maximum value" {
+    _ = try expectDiagnostic(zerde.json, struct { n: u32 }, "{\"n\":20}", .{ .fields = .{ .n = .{ .max = 10 } } }, .{}, error.ValueOutOfRange, "ValueOutOfRange at root.n (offset 5, line 1, column 6): value must be at most 10");
+}
+
+test "a JSON syntax error is not reported as a kind mismatch" {
+    const d = try expectDiagnostic(zerde.json, []const u32, "[1 2]", .{}, .{}, error.UnexpectedToken, "UnexpectedToken (offset 4, line 1, column 5)");
+    try std.testing.expect(d.detail == .none);
+}
+
+/// `text` `n` times over, at compile time.
+fn times(comptime text: []const u8, comptime n: usize) *const [text.len * n]u8 {
+    comptime var out: [text.len * n]u8 = undefined;
+    inline for (0..n) |i| @memcpy(out[i * text.len ..][0..text.len], text);
+    const final = out;
+    return &final;
+}
+
+test "a JSON diagnostic keeps the innermost 64 path segments" {
+    @setEvalBranchQuota(100_000);
+    const input = times("[", 70) ++ "\"x\"" ++ times("]", 70);
+    _ = try expectDiagnostic(zerde.json, NestedList(70), input, .{}, .{}, error.InvalidNumber, "InvalidNumber at root[...]" ++ times("[0]", 64) ++ " (offset 70, line 1, column 71): expected integer, found string");
+}
+
+test "a JSON diagnostic keeps the first 64 bytes of a long unknown key" {
+    _ = try expectDiagnostic(zerde.json, DenyA, "{\"" ++ times("k", 70) ++ "\":1}", .{}, .{}, error.UnknownField, "UnknownField (offset 74, line 1, column 75): unknown field \"" ++ times("k", 64) ++ "...\"");
+}
+
+test "a JSON diagnostic gives a field's minimum length" {
+    _ = try expectDiagnostic(zerde.json, struct { name: []const u8 }, "{\"name\":\"a\"}", .{ .fields = .{ .name = .{ .min_len = 2 } } }, .{}, error.LengthOutOfBounds, "LengthOutOfBounds at root.name (offset 8, line 1, column 9): length must be at least 2");
+}
+
+test "a JSON diagnostic gives a field's value range" {
+    _ = try expectDiagnostic(zerde.json, struct { n: u32 }, "{\"n\":20}", .{ .fields = .{ .n = .{ .min = 1, .max = 10 } } }, .{}, error.ValueOutOfRange, "ValueOutOfRange at root.n (offset 5, line 1, column 6): value must be within [1, 10]");
+}
+
+test "a malformed JSON token has no kind" {
+    const d = try expectDiagnostic(zerde.json, struct { a: u32 }, "{\"a\":nope}", .{}, .{}, error.InvalidNumber, "InvalidNumber at root.a (offset 5, line 1, column 6)");
+    try std.testing.expect(d.detail == .none);
+}
+
+test "a JSON diagnostic names a union variant's payload" {
+    _ = try expectDiagnostic(zerde.json, union(enum) { a: u32 }, "{\"a\":\"x\"}", .{}, .{}, error.InvalidNumber, "InvalidNumber at root.a (offset 5, line 1, column 6): expected integer, found string");
+}
+
+test "a CBOR diagnostic names an integer field given text" {
+    _ = try expectDiagnostic(zerde.cbor, struct { a: u32 }, &.{ 0xa1, 0x61, 0x61, 0x61, 0x78 }, .{}, .{}, error.UnexpectedType, "UnexpectedType at root.a (offset 3): expected integer, found string");
+}
+
+test "a CBOR diagnostic names an array element" {
+    _ = try expectDiagnostic(zerde.cbor, struct { xs: []const bool }, &.{ 0xa1, 0x62, 0x78, 0x73, 0x82, 0xf5, 0x01 }, .{}, .{}, error.UnexpectedType, "UnexpectedType at root.xs[1] (offset 6): expected bool, found integer");
+}
+
+test "a CBOR diagnostic expects bytes for a byte array" {
+    _ = try expectDiagnostic(zerde.cbor, struct { d: [4]u8 }, &.{ 0xa1, 0x61, 0x64, 0x64, 0x61, 0x62, 0x63, 0x64 }, .{}, .{}, error.UnexpectedType, "UnexpectedType at root.d (offset 3): expected bytes, found string");
+}
+
+test "a CBOR diagnostic reads through the self-described tag" {
+    _ = try expectDiagnostic(zerde.cbor, struct { a: u32 }, &.{ 0xa1, 0x61, 0x61, 0xd9, 0xd9, 0xf7, 0x61, 0x78 }, .{}, .{}, error.UnexpectedType, "UnexpectedType at root.a (offset 3): expected integer, found string");
+}
+
+test "a CBOR diagnostic names a float" {
+    _ = try expectDiagnostic(zerde.cbor, struct { a: u32 }, &.{ 0xa1, 0x61, 0x61, 0xf9, 0x3e, 0x00 }, .{}, .{}, error.UnexpectedType, "UnexpectedType at root.a (offset 3): expected integer, found float");
+}
+
+test "a CBOR diagnostic names a tag" {
+    _ = try expectDiagnostic(zerde.cbor, struct { a: u32 }, &.{ 0xa1, 0x61, 0x61, 0xc1, 0x00 }, .{}, .{}, error.UnexpectedTag, "UnexpectedTag at root.a (offset 3): expected integer, found tag");
+}
+
+test "a CBOR unknown key that is not text has no text" {
+    _ = try expectDiagnostic(zerde.cbor, DenyA, &.{ 0xa1, 0x01, 0x00 }, .{}, .{}, error.UnknownField, "UnknownField (offset 2): unknown field");
+}
+
+const strict_cbor = .{ .mode = zerde.cbor.Mode.strict };
+const merge_serde = .{ .declared_in_order = true, .deny_unknown_fields = true };
+
+test "a strict CBOR merge walk names a missing field" {
+    _ = try expectDiagnostic(zerde.cbor, struct { a: u32, b: u32 }, &.{ 0xa1, 0x61, 0x61, 0x01 }, merge_serde, strict_cbor, error.MissingField, "MissingField (offset 4): missing field \"b\"");
+}
+
+test "a strict CBOR merge walk names an unknown field" {
+    _ = try expectDiagnostic(zerde.cbor, struct { a: u32, b: u32 }, &.{ 0xa2, 0x61, 0x61, 0x01, 0x61, 0x63, 0x02 }, merge_serde, strict_cbor, error.UnknownField, "UnknownField (offset 6): unknown field \"c\"");
+}
+
+test "a strict CBOR diagnostic names the self-described tag it refuses" {
+    _ = try expectDiagnostic(zerde.cbor, struct { a: u32 }, &.{ 0xa1, 0x61, 0x61, 0xd9, 0xd9, 0xf7, 0x61, 0x78 }, .{}, strict_cbor, error.UnexpectedTag, "UnexpectedTag at root.a (offset 3): expected integer, found tag");
+}
+
+test "a strict CBOR tag on a nested key is not the value's own" {
+    const d = try expectDiagnostic(zerde.cbor, struct { a: struct { b: u32 } }, &.{ 0xa1, 0x61, 0x61, 0xa1, 0xc1, 0x61, 0x62, 0x01 }, .{}, strict_cbor, error.UnexpectedTag, "UnexpectedTag at root.a (offset 5)");
+    try std.testing.expect(d.detail == .none);
+}

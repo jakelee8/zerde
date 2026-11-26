@@ -75,6 +75,9 @@ Tagged commits on `main` are published through `.github/workflows/release.yml`.
 Use `zerde.parseSliceWithDiagnostics(...)` or
 `zerde.deserializeWithDiagnostics(...)` when you need error context that points
 at a specific field path and input location.
+`Diagnostic.detail` (`zerde.DiagnosticDetail`, `zerde.DiagnosticKind`) gives the
+expected and found kind, the bounds or range, or the missing, duplicate or
+unknown field; for JSON and CBOR a value's failure points at the value's first byte.
 
 ## Corpus Tests
 

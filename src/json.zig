@@ -443,7 +443,33 @@ pub fn JsonDeserializer(comptime Config: type) type {
         }
 
         pub fn errorLocation(self: *Self) diagnostic_mod.Location {
-            return diagnostic_mod.locationFromOffset(self.input, self.parser.index);
+            return self.locationAt(self.parser.index);
+        }
+
+        pub fn errorOffset(self: *Self) usize {
+            return self.parser.index;
+        }
+
+        pub fn locationAt(self: *Self, offset: usize) diagnostic_mod.Location {
+            return diagnostic_mod.locationFromOffset(self.input, offset);
+        }
+
+        /// The value that starts at `offset`, after whitespace, checked with the parser's own grammar.
+        pub fn valueAt(self: *Self, offset: usize) diagnostic_mod.Found {
+            var parser = self.parser;
+            parser.index = offset;
+            const kind_of_token = peekValueKind(&parser) catch return .{ .offset = parser.index, .kind = null };
+            const start = parser.index;
+            const kind: ?diagnostic_mod.Kind = switch (kind_of_token) {
+                .null => literalKind(&parser, "null", .null),
+                .bool => if (parser.peek() == 't') literalKind(&parser, "true", .bool) else literalKind(&parser, "false", .bool),
+                .number => numberKind(&parser),
+                .string => .string,
+                .array => .array,
+                .object => .object,
+                .bytes => null,
+            };
+            return .{ .offset = start, .kind = kind };
         }
 
         /// Reads a `[N]u8` field in the configured `ReadConfig.bytes` encoding.
@@ -460,16 +486,7 @@ pub fn JsonDeserializer(comptime Config: type) type {
 
         // The typed layer uses this to branch for optionals, enums, and skipping.
         pub fn peekKind(self: *Self) !ValueKind {
-            self.parser.skipWhitespace();
-            return switch (self.parser.peek() orelse return error.UnexpectedEndOfInput) {
-                'n' => .null,
-                't', 'f' => .bool,
-                '-', '0'...'9' => .number,
-                '"' => .string,
-                '[' => .array,
-                '{' => .object,
-                else => error.UnexpectedToken,
-            };
+            return peekValueKind(&self.parser);
         }
 
         pub fn readNull(self: *Self) !void {
@@ -1940,6 +1957,33 @@ fn verifyText(text: []const u8) !void {
     try parser.skipValueTrusted(0);
     parser.skipWhitespace();
     if (parser.index != text.len) return error.TrailingCharacters;
+}
+
+// The typed layer uses this to branch for optionals, enums, and skipping.
+fn peekValueKind(parser: *Parser) !ValueKind {
+    parser.skipWhitespace();
+    return switch (parser.peek() orelse return error.UnexpectedEndOfInput) {
+        'n' => .null,
+        't', 'f' => .bool,
+        '-', '0'...'9' => .number,
+        '"' => .string,
+        '[' => .array,
+        '{' => .object,
+        else => error.UnexpectedToken,
+    };
+}
+
+/// Integer or float, by the number token's form; null when the token is malformed.
+fn numberKind(parser: *Parser) ?diagnostic_mod.Kind {
+    const number = parser.parseNumberSlice() catch return null;
+    if (number.is_float) return .float;
+    return .integer;
+}
+
+/// `kind` when the literal `text` is spelled out; null otherwise.
+fn literalKind(parser: *Parser, comptime text: []const u8, kind: diagnostic_mod.Kind) ?diagnostic_mod.Kind {
+    parser.consumeLiteral(text) catch return null;
+    return kind;
 }
 
 const Parser = struct {

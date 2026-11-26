@@ -608,7 +608,7 @@ test "parseSliceWithDiagnostics captures json path and location" {
     try diagnostic.format(&out.writer, captured_err);
 
     try std.testing.expectEqualStrings(
-        "InvalidNumber at root.crew[0].bounty (offset 19, line 1, column 20)",
+        "InvalidNumber at root.crew[0].bounty (offset 19, line 1, column 20): expected integer, found string",
         out.written(),
     );
 }
