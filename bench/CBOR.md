@@ -28,6 +28,29 @@ Current scenarios:
 
 The current large case produces a canonical CBOR document of about `76.22 MiB`, with write outputs of about `76.22 MiB` for `zerde` and `75.28 MiB` for `zbor`.
 
+## 2026-11-26 - f785b34
+
+Changes since previous run: diagnostics carry a detail (expected and found kind, bounds, range, field names), and in a diagnostic parse the field path is recorded as an error unwinds instead of pushed and popped around every field and element. The `parse zerde diag` row (`parseSliceWithDiagnostics`, borrowed strings) is new in this run; the base has it too.
+
+Base is `2d9901b` (the commit that adds the `parse zerde diag` row); tip is `f785b34`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `zig build bench-cbor -Doptimize=ReleaseFast`, three rounds, each running base then tip, load 1.5 to 3.6. The zbor rows are the control. The last column is tip over base, run by run.
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 2,633 / 2,708 / 2,776 | 2,778 / 2,515 / 2,677 | 0.93 to 1.06 |
+| small | parse zerde diag | 3,822 / 2,987 / 2,969 | 2,856 / 2,590 / 2,761 | 0.75 to 0.93 |
+| small | parse zbor | 15,435 / 15,064 / 14,903 | 15,604 / 13,853 / 14,654 | 0.92 to 1.01 |
+| medium | parse zerde | 790,159 / 812,016 / 788,214 | 835,655 / 735,490 / 782,702 | 0.91 to 1.06 |
+| medium | parse zerde diag | 885,734 / 814,276 / 847,940 | 801,716 / 773,518 / 799,707 | 0.91 to 0.95 |
+| medium | parse zbor | 4,742,232 / 4,573,763 / 4,533,322 | 4,746,726 / 4,173,871 / 4,450,791 | 0.91 to 1.00 |
+| large | parse zerde | 83,719,573 / 78,700,836 / 79,027,203 | 79,610,773 / 72,994,222 / 77,086,149 | 0.93 to 0.98 |
+| large | parse zerde diag | 87,641,739 / 81,313,853 / 83,621,405 | 84,916,511 / 76,147,388 / 81,127,072 | 0.94 to 0.97 |
+| large | parse zbor | 462,895,377 / 407,685,819 / 446,674,893 | 491,319,628 / 415,302,308 / 438,791,653 | 0.98 to 1.06 |
+
+Notes:
+
+- Rule: the tip's median is at most the base's median plus the base's spread (max minus min of its three runs). Every `parse zerde` and `parse zerde diag` row passes.
+- `parse zerde` medians are 0.97 to 0.99 of the base. `parse zerde diag` is 0.75 to 0.97 of the base in all nine runs: the unwind-time path is cheaper than the push and pop it replaces.
+
 ## 2026-11-25 - e07eb8c
 
 Changes since previous run: default-path fixes from `plans/api.md` (item i). The writer emits field names and enum names as bytes built at compile time, with no UTF-8 check on each write. The reader decides strict mode and the `max_items` count at compile time when the config does not name them. `Header` is a `packed struct`, so the head read no longer stalls on copying its byte fields.
