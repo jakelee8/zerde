@@ -82,7 +82,7 @@
 #### Packed structs
 
 - A `packed struct` is one integer, its backing integer, in every format and in `wire.Wire(T)` (widened to 8, 16, 32 or 64 bits, with its signedness). It was read as a struct of its fields, so a field of the type could not be read and `Wire(T)` did not compile for a type that held one. A read refuses a pattern the type does not define with `error.InvalidValue` (a set `_` bit, an exhaustive enum field that names no tag, the same in a nested packed struct); a number too wide for the backing integer is `error.IntegerOverflow`. `wire.fromWire` refuses with `error.InvalidValue` (`wire.Error`). The type's own `check` runs after the read. Hooks win.
-- A packed struct with a `packed union` field, or with a `usize`, `isize` or C integer field (in it or in a packed struct nested in it), is a compile error, as is a backing integer of more than 64 bits on the wire, a bound on a field that holds one, and `rename_all` or `fields` on the packed type.
+- A packed struct with a `packed union` field, or with a `usize`, `isize`, C integer or enum-of-those field (in it or in a packed struct nested in it), is a compile error, as is a backing integer of more than 64 bits on the wire, a bound on a field that holds one, and a struct-only option (`rename_all`, `fields`, `extras`, `omit_null_fields`, `deny_unknown_fields`, `field_order`, `declared_in_order`) in the packed type's `serde`.
 - `reflect.kindOf` gives `.@"packed"` and `reflect.backing(T)` its integer type.
 - `zig build test` compiles the sources in `tests/compile_fail` and expects each to fail with the error its table in `build.zig` names.
 

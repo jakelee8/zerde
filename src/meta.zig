@@ -134,6 +134,9 @@ pub fn checkPacked(comptime T: type) void {
             .int => if (isTargetSized(FieldType)) {
                 @compileError("a packed struct on the wire is the same integer on every target, so no field is usize, isize or a C integer type: " ++ @typeName(T) ++ "." ++ name);
             },
+            .@"enum" => |enum_info| if (isTargetSized(enum_info.tag_type)) {
+                @compileError("a packed struct on the wire is the same integer on every target, so no field is an enum of usize, isize or a C integer type: " ++ @typeName(T) ++ "." ++ name);
+            },
             .@"struct" => if (isPacked(FieldType)) checkPacked(FieldType),
             else => {},
         }
@@ -143,7 +146,7 @@ pub fn checkPacked(comptime T: type) void {
 /// The backing integer of `value`: its bits, as they are.
 pub fn packedToInt(comptime T: type, value: T) PackedInt(T) {
     comptime checkPacked(T);
-    return @backingInt(value);
+    return @bitCast(value);
 }
 
 /// The packed struct whose bits are `int`, or `error.InvalidValue` for a bit pattern the type does not define: a set bit of a
@@ -152,7 +155,8 @@ pub fn packedToInt(comptime T: type, value: T) PackedInt(T) {
 pub fn packedFromInt(comptime T: type, int: PackedInt(T)) error{InvalidValue}!T {
     comptime checkPacked(T);
     if (!bitsDefined(T, @bitCast(int))) return error.InvalidValue;
-    return @fromBackingInt(int);
+    // `@bitCast`, since `@backingInt` and `@fromBackingInt` refuse a packed struct whose backing integer is inferred.
+    return @bitCast(int);
 }
 
 fn bitsDefined(comptime T: type, bits: @Int(.unsigned, @bitSizeOf(T))) bool {

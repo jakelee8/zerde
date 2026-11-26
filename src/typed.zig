@@ -973,22 +973,14 @@ pub fn deserializeValue(
     // A packed struct is read as its backing integer (the integer arm below, with its range check), and refused where the
     // bits name a value the type does not define; its own `check` then runs, as a struct's does.
     if (comptime meta.isPacked(T)) {
-        const Backing = meta.PackedInt(T);
-        const bits: Backing = if (@hasDecl(DeserializerType, "readInt"))
-            try deserializer.readInt(Backing)
-        else
-            try decodeIntNumber(Backing, try deserializer.readNumber());
-        dest.* = try s.scalar(T, try meta.packedFromInt(T, bits));
+        dest.* = try s.scalar(T, try meta.packedFromInt(T, try readIntOf(meta.PackedInt(T), deserializer)));
         try s.check(T, allocator, dest);
         return;
     }
     switch (@typeInfo(T)) {
         .bool => dest.* = try s.scalar(T, try deserializer.readBool()),
         // Formats parse numbers once into a common token; the typed layer is responsible for exact casts.
-        .int, .comptime_int => dest.* = try s.scalar(T, if (@hasDecl(DeserializerType, "readInt"))
-            try deserializer.readInt(T)
-        else
-            try decodeIntNumber(T, try deserializer.readNumber())),
+        .int, .comptime_int => dest.* = try s.scalar(T, try readIntOf(T, deserializer)),
         .float, .comptime_float => dest.* = try s.scalar(T, if (@hasDecl(DeserializerType, "readFloat"))
             try deserializer.readFloat(T)
         else
@@ -1244,6 +1236,12 @@ pub fn variantHasInteger(comptime T: type, comptime name: []const u8, comptime c
         .text => false,
         .integer => |key| key == number,
     };
+}
+
+/// An integer of type `T` from the deserializer, by its own `readInt` or through the common number token.
+fn readIntOf(comptime T: type, deserializer: anytype) anyerror!T {
+    if (@hasDecl(@TypeOf(deserializer.*), "readInt")) return deserializer.readInt(T);
+    return decodeIntNumber(T, try deserializer.readNumber());
 }
 
 fn decodeIntNumber(comptime T: type, number: Number) Error!T {

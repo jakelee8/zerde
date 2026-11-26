@@ -9965,3 +9965,27 @@ test "the scratch a validator needs is the growth rule of the arena bounds, and 
     };
     try std.testing.expectEqual(comptime wire.regionSizes(zerde.cbor, Bare, .{}, read), comptime wire.regionSizes(zerde.cbor, Nothing, .{}, read));
 }
+
+// ---- a packed struct whose backing integer is inferred ----------------------------------------------------------
+
+const PackedInferred = packed struct { a: u4 = 0, b: u4 = 0 };
+const PackedInferredPadded = packed struct { flag: bool = false, _: u3 = 0, mode: Access = .none, rest: u2 = 0 };
+
+test "a packed struct with an inferred backing integer round trips and is refused as one with a declared one" {
+    try std.testing.expect(wire.Wire(PackedInferred) == u8);
+    try expectPackedRoundTrips(PackedInferred, .{ .a = 5, .b = 9 }, .{ .b = 15 });
+    try expectPackedRoundTrips(PackedInferredPadded, .{ .flag = true, .mode = .write, .rest = 3 }, .{});
+    const Doc = struct { p: PackedInferredPadded };
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Doc, allocator, "{\"p\":2}"));
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Doc, allocator, "{\"p\":48}"));
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var region: Region = .{};
+    const memory = region.memory();
+    const good: PackedInferred = .{ .a = 1, .b = 2 };
+    const as_wire = try wire.toWire(PackedInferred, arena_state.allocator(), region.base(), good);
+    try std.testing.expectEqual(@as(u8, 0x21), as_wire);
+    try std.testing.expectEqual(good, try wire.fromWire(PackedInferred, null, arena_state.allocator(), memory, as_wire));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedInferredPadded, null, arena_state.allocator(), memory, 2));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedInferredPadded, null, arena_state.allocator(), memory, 0x30));
+}

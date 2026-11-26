@@ -737,8 +737,8 @@ MUTANTS = [
     ("meta.zig", ".int => if (isTargetSized(FieldType)) {", ".int => if (false) {"),
     ("meta.zig", "if (comptime serdeHasField(T, option)) {", "if (false) {"),
     ("typed.zig", "    if (comptime meta.isPacked(T)) {\n        try reserveRoom(rc, atomic_room);", "    if (false) {\n        try reserveRoom(rc, atomic_room);"),
-    ("typed.zig", "    if (comptime meta.isPacked(T)) {\n        const Backing = meta.PackedInt(T);", "    if (false) {\n        const Backing = meta.PackedInt(T);"),
-    ("typed.zig", "dest.* = try s.scalar(T, try meta.packedFromInt(T, bits));\n        try s.check(T, allocator, dest);", "dest.* = try s.scalar(T, try meta.packedFromInt(T, bits));"),
+    ("typed.zig", "    if (comptime meta.isPacked(T)) {\n        dest.* = try s.scalar(T, try meta.packedFromInt(", "    if (false) {\n        dest.* = try s.scalar(T, try meta.packedFromInt("),
+    ("typed.zig", "meta.PackedInt(T), deserializer)));\n        try s.check(T, allocator, dest);", "meta.PackedInt(T), deserializer)));"),
     ("typed.zig", "if (comptime meta.isPacked(T)) @compileError(\"bounds do not apply to a packed struct", "if (false) @compileError(\"bounds do not apply to a packed struct"),
     ("reflect.zig", "else if (meta.isPacked(T)) .@\"packed\" else .@\"struct\",", "else .@\"struct\","),
     ("wire.zig", "if (backing.bits <= bits) return @Int(backing.signedness, bits);", "if (true) return @Int(backing.signedness, bits);"),
@@ -820,6 +820,7 @@ MUTANTS = [
     ("cbor.zig", "return object + itemScratch(n, @min(limit(cfg, \"max_depth\", max_nesting), n / 4 + 1)) + n;", "return object + itemScratch(n, @min(limit(cfg, \"max_depth\", max_nesting), n / 4 + 1));"),
     ("cbor.zig", "    if (readOption(cfg, \"mode\", Mode.lenient) == .strict) return object;", "    if (false) return object;"),
     ("cbor.zig", "return @max(sizing.growth(n / 2 + 8, @sizeOf(KeyRecord), @alignOf(KeyRecord)), sizing.growth(n * levels, 1, 1));", "return sizing.growth(n / 2 + 8, @sizeOf(KeyRecord), @alignOf(KeyRecord));"),
+    ("meta.zig", ".@\"enum\" => |enum_info| if (isTargetSized(enum_info.tag_type)) {", ".@\"enum\" => |enum_info| if (false and isTargetSized(enum_info.tag_type)) {"),
 ]
 # Not reproducible by a source mutation (equivalent or structural): the `+ element.lists.fixed` of the shared-budget list in
 # `rebuildOwned` (the per-item bound in `listsOf` is always the smaller whenever that term is not 0), the BSON `readBytes` text arm

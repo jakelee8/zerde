@@ -390,6 +390,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         .{ "tests/compile_fail/packed_union.zig", "the bits may name no value of one of them: packed_union.Bad.view" },
         .{ "tests/compile_fail/packed_target_sized.zig", "so no field is usize, isize or a C integer type: packed_target_sized.Bad.size" },
+        .{ "tests/compile_fail/packed_enum_target_sized.zig", "no field is an enum of usize, isize or a C integer type: packed_enum_target_sized.Bad.w" },
         .{ "tests/compile_fail/packed_nested.zig", "so no field is usize, isize or a C integer type: packed_nested.Inner.c" },
         .{ "tests/compile_fail/packed_bounds.zig", "bounds do not apply to a packed struct, which is one integer: packed_bounds.Flags" },
         .{ "tests/compile_fail/packed_serde.zig", "and a packed struct is one integer: packed_serde.Renamed" },
