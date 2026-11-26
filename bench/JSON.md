@@ -31,7 +31,7 @@ Runs before `8a3a0a9` used the older simpler payload, so they are not directly c
 
 ## 2026-11-26 - f785b34
 
-Changes since previous run: diagnostics carry a detail (expected and found kind, bounds, range, field names), and in a diagnostic parse the field path is recorded as an error unwinds instead of pushed and popped around every field and element. The `parse zerde diag` row (`parseSliceWithDiagnostics`, borrowed strings) is new in this run; the base has it too.
+Changes since previous run: diagnostics carry a detail (expected and found kind, bounds, range, field names), and in a diagnostic parse the field path is recorded as an error unwinds instead of pushed and popped around every field and element. The `parse zerde diag` row (`parseSliceWithDiagnostics`, borrowed strings) first appears in this log here; the base `2d9901b` already times it, so both sides have the row.
 
 Base is `2d9901b` (the commit that adds the `parse zerde diag` row); tip is `f785b34`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `zig build bench-json -Doptimize=ReleaseFast`, three rounds, each running base then tip, load 1.5 to 3.6. The `std.json` rows are the control. The last column is tip over base, run by run.
 
