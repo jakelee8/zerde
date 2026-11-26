@@ -2,11 +2,10 @@
 
 ## State
 
-- `feat/deterministic-cbor` is at `5342c17`.
-  - `5342c17` merges `feat/detailed-diagnostics` (tip `2b56b2f`), which builds detailed parse diagnostics (JSON and CBOR first; the typed-layer details reach every format). Commits: `2d9901b` bench rows for the diagnostic parse path; `7fd2ee1` path recorded on unwind; `f785b34` `Diagnostic.detail`, format hooks, tests and mutants; `2b56b2f` bench log entries.
-  - `zig build test` (724 tests), examples, transcode, bench-build and `mutants.py --check` pass on `2b56b2f`.
-  - The 16 changed or new mutants (indices 35 125 294 521 619 807-817) were all killed. The full mutant run was not made; the run was scoped to those.
-  - `2e4e4c9` merged the wire plan `plans/wire.md`. `9170ead` and `d3b15b8` add the `code 1` out-of-line result from `bench/BULK.md` (`2026-11-25 - 4542079`) to `plans/json-scan.md` F4. Whether to keep them is open.
+- `feat/deterministic-cbor` is at `9dfbf1b`.
+  - `9dfbf1b` fixes the wording about where the `parse zerde diag` row first appears in `bench/JSON.md` and `bench/CBOR.md`. `zig build test` passes (724 tests). It is a fast-forward on top of `19f812f`.
+  - `5342c17` merges `feat/detailed-diagnostics` (tip `2b56b2f`), which builds detailed parse diagnostics. Its commits are `2d9901b`, `7fd2ee1`, `f785b34` and `2b56b2f`. The full mutant run was not made. The 16 mutants that were changed or added (indices 35, 125, 294, 521, 619 and 807 to 817) were all killed.
+  - `9170ead` and `d3b15b8` add the `code 1` out-of-line result from `bench/BULK.md` (`2026-11-25 - 4542079`) to `plans/json-scan.md` F4. Whether to keep them is open.
 
 ## Open
 
@@ -22,4 +21,4 @@
    - Add `bench/*.md` entries only if a change moves a benchmark.
 3. Keep or revert `9170ead` and `d3b15b8` (the F4 addition to `plans/json-scan.md`).
 4. The big-endian branch of `vectorStep` in `src/bulk.zig` compiles for `s390x-linux-gnu` but has not run.
-5. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change. A downstream prototype can now use the wire fixes and the new `Diagnostic.detail`.
+5. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change. A downstream prototype can now use the wire fixes and `Diagnostic.detail`.
