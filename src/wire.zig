@@ -1093,7 +1093,7 @@ fn rebuildOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: an
             }
             const items = bound("max_items", limits.max_items, "the items of the input");
             own.lists.pool = listPerItem(items, @sizeOf(Elem), @alignOf(Elem), true) + element.lists.fixed;
-            break :blk own.plus(.{ .lists = .{ .pool = element.lists.pool } });
+            break :blk own.plus(.{ .lists = .{ .pool = element.lists.pool }, .list_size = element.list_size, .list_align = element.list_align });
         },
         .array => rebuildOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),
         .optional => rebuildOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
@@ -1266,6 +1266,10 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
                 .lists = .{ .pool = element.lists.pool },
                 .text = .{ .pool = element.text.pool },
                 .scratch = element.scratch,
+                // The lists nested below are charged against the same budget, at their own element sizes and not at this one's.
+                .validate = element.validate,
+                .list_size = element.list_size,
+                .list_align = element.list_align,
             });
         },
         .array => typedOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),

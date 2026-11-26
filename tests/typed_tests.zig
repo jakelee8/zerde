@@ -10022,3 +10022,94 @@ test "the stream check walk stops at max_depth in a type that recurses" {
     const Stream = wire.StreamResumable(Tree, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8, .max_depth = 4 });
     try std.testing.expect(@sizeOf(Stream) > 0);
 }
+
+// ---- a list that draws on the shared budget holds lists of a larger element --------------------------------------
+
+const BudgetBig = struct {
+    x: [512]u8,
+    id: u64 = 0,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+const BudgetSmall = struct {
+    big: []const BudgetBig,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .big = .{ .max_len = 1 } } };
+};
+const BudgetTop = struct {
+    rows: []const BudgetSmall,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+
+fn budgetRows(arena: std.mem.Allocator, count: usize) ![]BudgetSmall {
+    const rows = try arena.alloc(BudgetSmall, count);
+    for (rows) |*row| {
+        const big = try arena.alloc(BudgetBig, 1);
+        big[0] = .{ .x = @splat('a'), .id = 5 };
+        row.* = .{ .big = big };
+    }
+    return rows;
+}
+
+test "the lists below a list with no bound of its own are charged at their own element size, for encode" {
+    // Two rows of one 512-byte element each, in a budget of 8 items.
+    const read = .{ .max_string_len = 8, .max_items = 8 };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const value: BudgetTop = .{ .rows = try budgetRows(arena_state.allocator(), 2) };
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..8192]);
+    const w = try wire.toWire(BudgetTop, build.allocator(), region.base(), value);
+    // encode: the rebuild takes the array of two rows and the two arrays of 512 bytes.
+    const bound = comptime wire.encodeArenaSize(zerde.json, BudgetTop, .{}, read);
+    const peak = try rebuildPeak(BudgetTop, zerde.json, read, region.memory(), w);
+    try std.testing.expect(peak >= 2 * 520);
+    try std.testing.expect(peak <= bound);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var spare = std.heap.FixedBufferAllocator.init(region.bytes[8192..][0..bound]);
+    try wire.encode(zerde.json, BudgetTop, &spare, region.memory(), w, &out.writer, .{}, .{}, read);
+}
+
+test "the lists below a list with no bound of its own are charged at their own element size, for decode" {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const value: BudgetTop = .{ .rows = try budgetRows(arena_state.allocator(), 2) };
+    var region: Region = .{};
+    // decode: the value as JSON, in a region of regionSizes. A read also counts the keys and the arrays, so its budget is larger.
+    const read_all = .{ .max_string_len = 600, .max_items = 24 };
+    const sizes = comptime wire.regionSizes(zerde.json, BudgetTop, .{}, read_all);
+    try std.testing.expect(sizes.output >= 2 * 520);
+    var input: std.Io.Writer.Allocating = .init(allocator);
+    defer input.deinit();
+    try zerde.serializeWith(zerde.json, &input.writer, value, .{}, .{});
+    @memcpy(region.bytes[0..input.written().len], input.written());
+    const output = region.bytes[std.mem.alignForward(usize, input.written().len, 16)..][0..sizes.output];
+    var scratch: [64]u8 = undefined;
+    const decoded = try wire.decodeInto(zerde.json, BudgetTop, output, scratch[0..sizes.scratch], region.base(), region.bytes[0..input.written().len], .{}, read_all);
+    try std.testing.expect(decoded.used <= sizes.output);
+    try std.testing.expect(decoded.used >= 2 * 520);
+}
+
+test "a validator below a list with no bound of its own is counted in the scratch" {
+    const Holder = struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 } } };
+    };
+    const Top = struct {
+        rows: []const Holder,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const lone = comptime wire.regionSizes(zerde.cbor, struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = Holder.serde;
+    }, .{}, .{ .max_string_len = 8, .max_items = 20 });
+    try std.testing.expectEqual(lone.scratch, (comptime wire.regionSizes(zerde.cbor, Top, .{}, .{ .max_string_len = 8, .max_items = 20 })).scratch);
+}
+
+test "the shared budget of a list is charged at the size and alignment of the largest list below it" {
+    // Each budget item is at most one 520-byte element plus its 8-byte alignment, not the 8-byte row that holds the list.
+    inline for (.{ 4, 16, 100 }) |n| {
+        try std.testing.expectEqual(@as(usize, (520 + 8) * n), comptime wire.encodeArenaSize(zerde.json, BudgetTop, .{}, .{ .max_items = n }));
+        // And a decode, whose lists are charged the same, with the slack of the output on top.
+        try std.testing.expectEqual(@as(usize, 528 * n + 256), (comptime wire.regionSizes(zerde.cbor, BudgetTop, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 600, .max_items = n })).output);
+    }
+}

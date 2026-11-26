@@ -830,9 +830,12 @@ MUTANTS = [
     ("wire.zig", "if (!field.extras) assertStreamChecks(field.type, cfg, limits, depth + 1);", "_ = field;"),
     ("wire.zig", "if (variant.type != void) assertStreamChecks(variant.type, cfg, limits, depth + 1);", "_ = variant;"),
     ("wire.zig", "    if (depth > limits.max_depth) return;\n    switch (comptime reflect.kindOf(T)) {\n        .list => assertStreamChecks", "    switch (comptime reflect.kindOf(T)) {\n        .list => assertStreamChecks"),
+    ("wire.zig", "break :blk own.plus(.{ .lists = .{ .pool = element.lists.pool }, .list_size = element.list_size, .list_align = element.list_align });", "break :blk own.plus(.{ .lists = .{ .pool = element.lists.pool } });"),
+    ("wire.zig", "                .validate = element.validate,\n                .list_size = element.list_size,\n                .list_align = element.list_align,\n", ""),
+    ("wire.zig", "                .validate = element.validate,\n                .list_size = element.list_size,", "                .list_size = element.list_size,"),
+    ("wire.zig", "                .list_size = element.list_size,\n                .list_align = element.list_align,\n            });", "                .list_size = element.list_size,\n            });"),
 ]
-# Not reproducible by a source mutation (equivalent or structural): the `+ element.lists.fixed` of the shared-budget list in
-# `rebuildOwned` (the per-item bound in `listsOf` is always the smaller whenever that term is not 0), the BSON `readBytes` text arm
+# Not reproducible by a source mutation (equivalent or structural): the BSON `readBytes` text arm
 # (covered by typed.readByteToken), the `supports_unions` and `supports_integer_keys` compile gates,
 # the unreachable else branch of JSON parseStringToken, the compile-time UTF-8 check of a name
 # (`writeName` in cbor.zig, `quotedName` in json.zig), the reset of `high` after an escape in the
