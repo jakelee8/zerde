@@ -764,6 +764,7 @@ const ScenarioResult = struct {
     zerde_write_bytes: usize,
     std_write_bytes: usize,
     parse_zerde: BenchStats,
+    parse_zerde_diag: BenchStats,
     parse_std: BenchStats,
     value_zerde: BenchStats,
     value_std: BenchStats,
@@ -790,6 +791,7 @@ const CborScenarioResult = struct {
     zerde_write_bytes: usize,
     zbor_write_bytes: usize,
     parse_zerde: BenchStats,
+    parse_zerde_diag: BenchStats,
     parse_zbor: BenchStats,
     write_zerde: BenchStats,
     write_zbor: BenchStats,
@@ -915,6 +917,29 @@ fn runScenario(io: std.Io, allocator: Allocator, bench_case: *BenchCase) !Scenar
         pub fn run(self: *@This(), _: Allocator) void {
             _ = self.arena.reset(.retain_capacity);
             const value = zerde.parseSliceAliased(zerde.json, Payload, self.arena.allocator(), self.input) catch @panic("zerde JSON parse failed");
+            consumePayload(value);
+        }
+    };
+
+    const JsonZerdeDiagParse = struct {
+        input: []const u8,
+        arena: std.heap.ArenaAllocator,
+        diagnostic: zerde.Diagnostic = .{},
+
+        fn init(input: []const u8) @This() {
+            return .{
+                .input = input,
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+
+        pub fn run(self: *@This(), _: Allocator) void {
+            _ = self.arena.reset(.retain_capacity);
+            const value = zerde.parseSliceWithDiagnostics(zerde.json, Payload, self.arena.allocator(), self.input, &self.diagnostic, .{}, .{ .borrow_strings = true }) catch @panic("zerde JSON diagnostic parse failed");
             consumePayload(value);
         }
     };
@@ -1106,6 +1131,8 @@ fn runScenario(io: std.Io, allocator: Allocator, bench_case: *BenchCase) !Scenar
 
     var parse_zerde = JsonZerdeParse.init(bench_case.json());
     defer parse_zerde.deinit();
+    var parse_diag = JsonZerdeDiagParse.init(bench_case.json());
+    defer parse_diag.deinit();
     var parse_std = JsonStdParse.init(bench_case.json());
     defer parse_std.deinit();
     var value_zerde = JsonZerdeValueParse.init(bench_case.json());
@@ -1126,6 +1153,7 @@ fn runScenario(io: std.Io, allocator: Allocator, bench_case: *BenchCase) !Scenar
         .zerde_write_bytes = bench_case.json().len,
         .std_write_bytes = bench_case.stdJson().len,
         .parse_zerde = try runZbenchParam(io, allocator, "json parse zerde", &parse_zerde, bench_case.scenario.parse_iterations),
+        .parse_zerde_diag = try runZbenchParam(io, allocator, "json parse zerde diag", &parse_diag, bench_case.scenario.parse_iterations),
         .parse_std = try runZbenchParam(io, allocator, "json parse std", &parse_std, bench_case.scenario.parse_iterations),
         .value_zerde = try runZbenchParam(io, allocator, "json value parse zerde", &value_zerde, bench_case.scenario.parse_iterations),
         .value_std = try runZbenchParam(io, allocator, "json value parse std", &value_std, bench_case.scenario.parse_iterations),
@@ -1265,6 +1293,10 @@ fn printScenarioResult(scenario: Scenario, result: ScenarioResult) void {
     std.debug.print("  parse  zerde: {d:.2} ns/op, {d:.2} MiB/s\n", .{
         result.parse_zerde.nsPerOp(),
         result.parse_zerde.mibPerSec(result.parse_bytes),
+    });
+    std.debug.print("  parse  zerde diag: {d:.2} ns/op, {d:.2} MiB/s\n", .{
+        result.parse_zerde_diag.nsPerOp(),
+        result.parse_zerde_diag.mibPerSec(result.parse_bytes),
     });
     std.debug.print("  parse std.json: {d:.2} ns/op, {d:.2} MiB/s\n", .{
         result.parse_std.nsPerOp(),
@@ -2317,6 +2349,29 @@ fn runCborScenario(io: std.Io, allocator: Allocator, scenario: Scenario) !CborSc
         }
     };
 
+    const CborZerdeDiagParse = struct {
+        input: []const u8,
+        arena: std.heap.ArenaAllocator,
+        diagnostic: zerde.Diagnostic = .{},
+
+        fn init(input: []const u8) @This() {
+            return .{
+                .input = input,
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+
+        pub fn run(self: *@This(), _: Allocator) void {
+            _ = self.arena.reset(.retain_capacity);
+            const value = zerde.parseSliceWithDiagnostics(zerde.cbor, Payload, self.arena.allocator(), self.input, &self.diagnostic, .{}, .{ .borrow_strings = true }) catch @panic("zerde CBOR diagnostic parse failed");
+            consumePayload(value);
+        }
+    };
+
     const ZborParse = struct {
         input: []const u8,
         arena: std.heap.ArenaAllocator,
@@ -2471,6 +2526,8 @@ fn runCborScenario(io: std.Io, allocator: Allocator, scenario: Scenario) !CborSc
 
     var parse_zerde = CborZerdeParse.init(parse_input);
     defer parse_zerde.deinit();
+    var parse_diag = CborZerdeDiagParse.init(parse_input);
+    defer parse_diag.deinit();
     var parse_zbor = ZborParse.init(parse_input);
     defer parse_zbor.deinit();
     var write_zerde = CborZerdeSerialize.init(zerde_value);
@@ -2487,6 +2544,7 @@ fn runCborScenario(io: std.Io, allocator: Allocator, scenario: Scenario) !CborSc
         .zerde_write_bytes = zerde_out.written().len,
         .zbor_write_bytes = zbor_out.written().len,
         .parse_zerde = try runZbenchParam(io, allocator, "cbor parse zerde", &parse_zerde, scenario.parse_iterations),
+        .parse_zerde_diag = try runZbenchParam(io, allocator, "cbor parse zerde diag", &parse_diag, scenario.parse_iterations),
         .parse_zbor = try runZbenchParam(io, allocator, "cbor parse zbor", &parse_zbor, scenario.parse_iterations),
         .write_zerde = try runZbenchParam(io, allocator, "cbor write zerde", &write_zerde, scenario.write_iterations),
         .write_zbor = try runZbenchParam(io, allocator, "cbor write zbor", &write_zbor, scenario.write_iterations),
@@ -2619,6 +2677,10 @@ fn printCborScenarioResult(scenario: Scenario, result: CborScenarioResult) void 
     std.debug.print("  parse  zerde: {d:.2} ns/op, {d:.2} MiB/s\n", .{
         result.parse_zerde.nsPerOp(),
         result.parse_zerde.mibPerSec(result.parse_bytes),
+    });
+    std.debug.print("  parse  zerde diag: {d:.2} ns/op, {d:.2} MiB/s\n", .{
+        result.parse_zerde_diag.nsPerOp(),
+        result.parse_zerde_diag.mibPerSec(result.parse_bytes),
     });
     std.debug.print("  parse   zbor: {d:.2} ns/op, {d:.2} MiB/s\n", .{
         result.parse_zbor.nsPerOp(),
