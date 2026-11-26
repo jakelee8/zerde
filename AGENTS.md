@@ -1,25 +1,29 @@
-# Agents
+# zerde
 
-Project conventions for automated changes:
+## Checks for a change
 
-- use conventional commits
-- run `zig build test` after code changes
-- when touching benchmarked code, run the relevant `zig build bench-* -Doptimize=ReleaseFast` command
-- keep `.github/workflows/ci.yml` and `.github/workflows/bench.yml` aligned with the documented Zig version and repo workflow
-- keep `.github/workflows/ci.yml` validating native lib, wasm lib, tests, the mutant patterns (`tests/mutants.py --check`), examples, the transcoder CLI, and `zig build bench-build`
-- keep `.github/workflows/release.yml` aligned with the documented release process and tag conventions
-- benchmark workflow lives in `bench/README.md`
-- benchmark history lives in `bench/BIN.md`, `bench/BSON.md`, `bench/BULK.md`, `bench/CBOR.md`, `bench/JSON.md`, `bench/MEMORY.md`, `bench/MSGPACK.md`, `bench/TOML.md`, `bench/WASM.md`, `bench/WIRE.md`, `bench/YAML.md`, and `bench/ZON.md`
-- benchmark timing is implemented with `zBench`; keep the scenario workloads and fairness policy stable unless you are intentionally changing benchmark behavior
-- add benchmark log entries only for real benchmark-affecting changes, newest first, with sections named `## YYYY-MM-DD - <hash>`
-- corpus roundtrip fixtures live in `tests/corpus/<format>` and should stay in canonical output form
-- invalid corpus fixtures live in `tests/corpus_invalid/<format>` and should stay minimal, format-specific, and clearly named by failure shape
-- prefer feature-first corpus names such as `null.json`, `empty.toml`, `array_float.yaml`, `object_single.cbor`, `object_nested.bson`, `enum_field.msgpack`, `object_single.zon`, and `object_single.bin`
-- corpus tests are generated from `tests/corpus/bin`, `tests/corpus/bson`, `tests/corpus/cbor`, `tests/corpus/json`, `tests/corpus/msgpack`, `tests/corpus/toml`, `tests/corpus/yaml`, and `tests/corpus/zon`
-- `zig build test` also covers property-style roundtrip fuzzing, parser hardening fuzzing, and invalid-input leak tests
-- wasm examples live in `examples/` and should keep building with `zig build examples`
-- the transcoder CLI lives in `bin/` and should keep building with `zig build transcode`
-- keep `README.md`, `bench/README.md`, and `CONTRIBUTING.md` aligned with the current workflow
-- `tests/mutants.py` lists the mutants (a removed or weakened guard) the tests must kill; add one for each new guard, and run it before committing, never while committing
-- keep this file updated when repo conventions change
-- the package is `b.addModule("zerde")` over `src/root.zig`; `build.zig` returns right after it for a consumer (`!b.isRoot()`), and `toml`, `zbor` and `zbench` stay `.lazy = true`, so a consumer fetches no third-party code; keep `src/` free of third-party imports and of paths outside `src/`, and keep `.paths` in `build.zig.zon` to what the package needs
+- Every code change: `zig build test`. It also runs the property-style roundtrip fuzzing, the parser hardening fuzzing and the invalid-input leak tests.
+- A new guard: add its mutant (the guard removed or weakened) to `tests/mutants.py`, and run `python3 tests/mutants.py` on a clean tree before you commit. Do not commit while it runs: it edits `src/`.
+- Benchmarked code: the matching `zig build bench-<format> -Doptimize=ReleaseFast`. `bench/README.md` describes the benchmark workflow.
+- `examples/`: `zig build examples`. `bin/`, the transcoder CLI: `zig build transcode`.
+
+## The package
+
+- `build.zig` exports one module, `b.addModule("zerde")` over `src/root.zig`, and returns right after it when a consumer builds it (`!b.isRoot()`), so a consumer fetches no third-party code.
+- `toml`, `zbor` and `zbench` stay `.lazy = true` in `build.zig.zon`, and its `.paths` lists only what the package needs.
+- `src/` imports no third-party module and no path outside `src/`.
+
+## Benchmarks
+
+- Timing uses `zBench`. Keep the scenario workloads and the fairness policy stable; change them only when the change is about benchmark behavior.
+- Each format's history is in `bench/<FORMAT>.md` (`BIN`, `BSON`, `BULK`, `CBOR`, `JSON`, `MEMORY`, `MSGPACK`, `TOML`, `WASM`, `WIRE`, `YAML`, `ZON`). Add an entry only for a change that moves a benchmark, newest first, under a heading `## YYYY-MM-DD - <hash>`.
+
+## Corpus
+
+- Round-trip fixtures live in `tests/corpus/<format>/` in canonical output form; the corpus tests are generated from them.
+- Invalid-input fixtures live in `tests/corpus_invalid/<format>/`. Keep each minimal, specific to its format, and named by the failure it shows.
+- Name a fixture by the feature it covers, such as `null.json`, `array_float.yaml` or `object_nested.bson`.
+
+## Workflows and docs
+
+`.github/workflows/ci.yml` builds the native and wasm libraries and runs the tests, `python3 tests/mutants.py --check`, the examples, the transcoder and `zig build bench-build`. `bench.yml` runs the benchmarks, and `release.yml` follows the release process and its tag conventions. When the Zig version, a build step or the release process changes, change the workflow that runs it, and `README.md`, `bench/README.md` and `CONTRIBUTING.md`, in the same commit.
