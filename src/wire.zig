@@ -8,7 +8,8 @@
 //! (`typed.deserializeInto`) with `WireSink` assembling `Wire(T)` as it reads, with no `T` between,
 //! so this module has no second set of rules.
 //!
-//!   - an integer and a float are themselves; a bool is a `u8` that must be 0 or 1; an enum is an integer;
+//!   - an integer and a float are themselves; a bool is a `u8` that must be 0 or 1; an enum is an integer; a `packed struct` is its
+//!     backing integer, widened to 8, 16, 32 or 64 bits with its signedness kept;
 //!   - text, a `ByteString`, a `Raw` and a slice are a `Span`: `extern struct { offset: u32, len: u32 }`,
 //!     pointing at the bytes (`len` counts bytes), or at the contiguous `Wire(element)` array the
 //!     decode wrote (`len` counts elements);
@@ -47,12 +48,16 @@ const root = @import("root.zig");
 const cbor = @import("cbor.zig");
 const json = @import("json.zig");
 const resumable = @import("resumable.zig");
+const sizing = @import("sizing.zig");
+const growth = sizing.growth;
 
 pub const Error = error{
     /// A span's offset or end does not fit `u32`, or lies before the base address.
     OffsetOutOfRange,
     /// A union tag or an enum value in a wire value names no variant or value.
     InvalidTag,
+    /// The integer of a packed struct in a wire value is outside its backing integer, or its bits name a value the type does not define.
+    InvalidValue,
     /// The input is longer than the config's `max_input_bytes`, which `maxArenaSize` relies on.
     InputTooLarge,
 };
@@ -80,9 +85,7 @@ pub fn Wire(comptime T: type) type {
             // A layout that is the same on every target has no usize, no C type, and no width that
             // an extern struct refuses.
             const bits = @typeInfo(T).int.bits;
-            const target_sized = T == usize or T == isize or T == c_short or T == c_ushort or T == c_int or T == c_uint or
-                T == c_long or T == c_ulong or T == c_longlong or T == c_ulonglong or T == c_char;
-            if (target_sized or (bits != 8 and bits != 16 and bits != 32 and bits != 64)) {
+            if (meta.isTargetSized(T) or (bits != 8 and bits != 16 and bits != 32 and bits != 64)) {
                 @compileError("a wire integer is u8, u16, u32, u64 or the signed kind, never usize or a C type: " ++ @typeName(T));
             }
             break :blk T;
@@ -100,6 +103,7 @@ pub fn Wire(comptime T: type) type {
         },
         .pointer => @compileError("a pointer has no wire layout (it would be by value, and a recursive type has no size): use a slice, or an optional: " ++ @typeName(T)),
         .@"enum" => EnumInt(T),
+        .@"packed" => PackedWire(T),
         .@"struct" => StructWire(T),
         .@"union" => UnionWire(T),
         .hook, .none => @compileError(@typeName(T) ++ " has no wire layout"),
@@ -122,6 +126,19 @@ fn EnumInt(comptime T: type) type {
             if (low >= std.math.minInt(Candidate) and high <= std.math.maxInt(Candidate)) return Candidate;
         }
         @compileError("an enum value does not fit 64 bits: " ++ @typeName(T));
+    }
+}
+
+/// The integer a packed struct is on the wire: its backing integer widened, keeping its signedness, to the smallest of 8, 16, 32
+/// and 64 bits that holds it (as `EnumInt` does for an enum), since an extern struct refuses `u3`.
+fn PackedWire(comptime T: type) type {
+    comptime {
+        meta.checkPacked(T);
+        const backing = @typeInfo(meta.PackedInt(T)).int;
+        for ([_]u16{ 8, 16, 32, 64 }) |bits| {
+            if (backing.bits <= bits) return @Int(backing.signedness, bits);
+        }
+        @compileError("a packed struct on the wire has a backing integer of at most 64 bits: " ++ @typeName(T));
     }
 }
 
@@ -263,6 +280,7 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
             break :blk out;
         },
         .@"enum" => @intCast(@backingInt(value)),
+        .@"packed" => @intCast(meta.packedToInt(T, value)),
         .@"struct" => blk: {
             var out: Wire(T) = undefined;
             inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FieldType| {
@@ -286,11 +304,70 @@ pub fn toWire(comptime T: type, allocator: Allocator, base: usize, value: T) (Al
     };
 }
 
+/// The limits a rebuild holds to for `encode`: the ones a read of the same type under `read_cfg` applies to what it builds, so the arena
+/// has a bound (`encodeArenaSize`) whatever the wire value is. It refuses a list longer than the `max_len` of its field or element
+/// (`error.LengthOutOfBounds`), more than `max_items` rebuilt elements in all (`error.TooManyItems`, which bounds spans that alias),
+/// and containers nested deeper than `max_depth` (the format's own error, `error.CborNestingTooDeep` or `error.JsonNestingTooDeep`, which
+/// bounds the recursion of a span that names its own container). It does not apply `min_len`, `min`, `max`, a struct's `check` or a
+/// `Raw` validator, so the output is not made readable under `read_cfg`.
+pub fn Limited(comptime Format: type, comptime serde_cfg: anytype, comptime read_cfg: anytype) type {
+    return struct {
+        pub const format = Format;
+        pub const serde = serde_cfg;
+        pub const limits = limitsOf(Format, read_cfg);
+    };
+}
+
+/// What a rebuild has counted so far, for `Limited`.
+const Counts = struct { depth: u64 = 0, items: u64 = 0 };
+
+/// Whether `T` is the entry of a sorted map, which is not a container of its own: the map is one.
+fn isSortedEntry(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "zerde_sorted_entry");
+}
+
+/// Opens a container of the wire form: one level more than the limit is refused.
+fn enter(comptime limited: ?type, counts: *Counts) !void {
+    const L = limited orelse return;
+    counts.depth += 1;
+    if (counts.depth > L.limits.max_depth) return if (comptime L.format == cbor) error.CborNestingTooDeep else error.JsonNestingTooDeep;
+}
+
+fn leave(comptime limited: ?type, counts: *Counts) void {
+    if (limited != null) counts.depth -= 1;
+}
+
 /// The typed value of a wire value, the inverse of `toWire`. Arrays are allocated in `allocator`;
 /// text, byte strings, raw items and the elements of a scalar list point at the memory the spans
 /// name. Every span is checked against `memory` (`error.OffsetOutOfRange`), and an enum value, a
-/// union tag or a presence byte that means nothing is `error.InvalidTag`.
-pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error)!T {
+/// union tag or a presence byte that means nothing is `error.InvalidTag`. `limited` is null, or
+/// `Limited(Format, serde_cfg, read_cfg)` to hold the rebuild to a read's limits, as `encode` does.
+pub fn fromWire(comptime T: type, comptime limited: ?type, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error || LimitError)!T {
+    var counts: Counts = .{};
+    return rebuild(T, limited, .{}, &counts, allocator, memory, wire);
+}
+
+/// The errors of a rebuild that holds to limits.
+pub const LimitError = error{ LengthOutOfBounds, TooManyItems, CborNestingTooDeep, JsonNestingTooDeep };
+
+/// The list of `Elem` that `wire` names, rebuilt in `allocator` unless it is scalar; `bounds` and `counts` are `fromWire`'s.
+fn rebuildList(comptime Elem: type, comptime limited: ?type, comptime bounds: meta.Bounds, counts: *Counts, allocator: Allocator, memory: Memory, wire: Span) (Allocator.Error || Error || LimitError)![]const Elem {
+    const source = try memory.listOf(Wire(Elem), wire);
+    if (limited) |L| {
+        if (source.len > bounds.max_len) return error.LengthOutOfBounds;
+        if (comptime !isScalarList(Elem)) {
+            counts.items += source.len;
+            if (L.limits.max_items) |budget| if (counts.items > budget) return error.TooManyItems;
+        }
+    }
+    if (comptime isScalarList(Elem)) return source;
+    const items = try allocator.alloc(Elem, source.len);
+    const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
+    for (source, items) |item, *slot| slot.* = try rebuild(Elem, limited, elem_bounds, counts, allocator, memory, item);
+    return items;
+}
+
+fn rebuild(comptime T: type, comptime limited: ?type, comptime bounds: meta.Bounds, counts: *Counts, allocator: Allocator, memory: Memory, wire: Wire(T)) (Allocator.Error || Error || LimitError)!T {
     @setEvalBranchQuota(1_000_000);
     return switch (comptime reflect.kindOf(T)) {
         .bool => switch (wire) {
@@ -303,23 +380,22 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
         .byte_string => .{ .bytes = try memory.bytesOf(wire) },
         .raw => .{ .bytes = try memory.bytesOf(wire) },
         .list => blk: {
-            const Elem = @typeInfo(T).pointer.child;
-            const source = try memory.listOf(Wire(Elem), wire);
-            if (comptime isScalarList(Elem)) break :blk source;
-            const items = try allocator.alloc(Elem, source.len);
-            for (source, items) |item, *slot| slot.* = try fromWire(Elem, allocator, memory, item);
-            break :blk items;
+            try enter(limited, counts);
+            defer leave(limited, counts);
+            break :blk try rebuildList(@typeInfo(T).pointer.child, limited, bounds, counts, allocator, memory, wire);
         },
         .array => blk: {
+            try enter(limited, counts);
+            defer leave(limited, counts);
             var out: T = undefined;
-            for (wire, &out) |item, *slot| slot.* = try fromWire(@typeInfo(T).array.child, allocator, memory, item);
+            for (wire, &out) |item, *slot| slot.* = try rebuild(@typeInfo(T).array.child, limited, .{}, counts, allocator, memory, item);
             break :blk out;
         },
         .optional => blk: {
             const Child = @typeInfo(T).optional.child;
             break :blk switch (wire.present) {
                 0 => null,
-                1 => try fromWire(Child, allocator, memory, wire.value),
+                1 => try rebuild(Child, limited, bounds, counts, allocator, memory, wire.value),
                 else => error.InvalidTag,
             };
         },
@@ -327,10 +403,28 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
             const tag = std.math.cast(@typeInfo(T).@"enum".tag_type, wire) orelse break :blk error.InvalidTag;
             break :blk std.enums.fromInt(T, tag) orelse error.InvalidTag;
         },
+        // The wire integer is the backing integer's own value, widened: a value outside its range is no bit pattern of the type.
+        .@"packed" => blk: {
+            const bits = std.math.cast(meta.PackedInt(T), wire) orelse break :blk error.InvalidValue;
+            break :blk try meta.packedFromInt(T, bits);
+        },
         .@"struct" => blk: {
+            // A sorted map is one container, and its entries are not containers of their own.
+            if (comptime typed.isSortedMap(T)) {
+                try enter(limited, counts);
+                defer leave(limited, counts);
+                break :blk .{ .entries = try rebuildList(T.Entry, limited, bounds, counts, allocator, memory, wire.entries) };
+            }
+            const counted = comptime !isSortedEntry(T);
+            if (counted) try enter(limited, counts);
+            defer if (counted) leave(limited, counts);
             var out: T = undefined;
             inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FieldType| {
-                @field(out, name) = try fromWire(FieldType, allocator, memory, @field(wire, name));
+                // The bounds of a sorted map's elements are those of the field that holds the map: they reach the value.
+                const field_bounds: meta.Bounds = comptime if (isSortedEntry(T))
+                    (if (std.mem.eql(u8, name, "value")) bounds else .{})
+                else if (limited) |L| meta.effectiveBounds(T, name, L.serde) else .{};
+                @field(out, name) = try rebuild(FieldType, limited, field_bounds, counts, allocator, memory, @field(wire, name));
             }
             break :blk out;
         },
@@ -338,7 +432,10 @@ pub fn fromWire(comptime T: type, allocator: Allocator, memory: Memory, wire: Wi
             inline for (@typeInfo(T).@"union".field_names, @typeInfo(T).@"union".field_types, 0..) |name, PayloadType, index| {
                 if (wire.tag == index) {
                     if (PayloadType == void) break :blk @unionInit(T, name, {});
-                    break :blk @unionInit(T, name, try fromWire(PayloadType, allocator, memory, @field(wire.payload, name)));
+                    try enter(limited, counts);
+                    defer leave(limited, counts);
+                    const payload_bounds: meta.Bounds = comptime if (limited) |L| meta.effectiveBounds(T, name, L.serde) else .{};
+                    break :blk @unionInit(T, name, try rebuild(PayloadType, limited, payload_bounds, counts, allocator, memory, @field(wire.payload, name)));
                 }
             }
             break :blk error.InvalidTag;
@@ -377,8 +474,9 @@ pub fn Decoded(comptime T: type) type {
 /// `regionSizes(...).output` bytes) takes the arrays and rewritten strings the wire value points at, and
 /// stays; `scratch` (at least `regionSizes(...).scratch` bytes, a size known at compile time) takes what the
 /// reader keeps while it reads (the key records of a `Raw`: lenient CBOR's, and JSON's for the repeated-key
-/// check), is free for reuse as soon as the call returns, and is empty for a strict CBOR read and for a JSON
-/// read without a `Raw`. A region too small is
+/// check and the strings it decodes) and the block that a `Raw` field's validator runs on (`Bounds.validate_bytes`, which a validator
+/// must state here), is free for reuse as soon as the call returns, and is empty for a strict CBOR read and for a JSON
+/// read without a `Raw`, if there is no validator. A region too small is
 /// `error.OutOfMemory`. `base` is the address spans are relative to, and the input and `output` must be
 /// memory it reaches. Everything else is `decode`.
 pub fn decodeInto(
@@ -428,12 +526,19 @@ pub const WireSink = struct {
     memory: Memory,
     arena: *std.heap.FixedBufferAllocator,
 
+    /// The typed walk reads into regions that a size function reserves: a validator of a `Raw` states its bound (`Bounds.validate_bytes`).
+    pub const fixed_regions = true;
+
     pub fn Of(comptime T: type) type {
         return Wire(T);
     }
 
     pub fn scalar(_: WireSink, comptime T: type, value: T) !Wire(T) {
-        return if (comptime reflect.kindOf(T) == .bool) @intFromBool(value) else value;
+        return switch (comptime reflect.kindOf(T)) {
+            .bool => @intFromBool(value),
+            .@"packed" => @intCast(meta.packedToInt(T, value)),
+            else => value,
+        };
     }
 
     pub fn text(self: WireSink, comptime _: type, bytes: []const u8) !Span {
@@ -506,7 +611,7 @@ pub const WireSink = struct {
         if (comptime !@hasDecl(T, "check")) return;
         const mark = self.arena.end_index;
         defer self.arena.end_index = mark;
-        const view = try fromWire(T, allocator, self.memory, result.*);
+        const view = try fromWire(T, null, allocator, self.memory, result.*);
         try view.check();
     }
 
@@ -519,6 +624,13 @@ pub const WireSink = struct {
 /// first (the arrays of structs, unions, optionals, enums and arrays; text and scalar lists point at
 /// the memory the spans name), because the writers stream and keep no memory of their own. Every
 /// span is checked against `memory`; `arena` is put back as it was when the write is done.
+///
+/// A wire value that the caller built is bound by no limit, so the rebuild holds to the limits of `read_cfg`, the read config that a
+/// decode of the same type uses (`Limited`): a list longer than its `max_len`, more than `max_items` rebuilt elements (spans may
+/// alias, so one array can be rebuilt many times) and nesting past `max_depth` (a span may name its own container) are refused.
+/// `encodeArenaSize` is then the size of `arena` that is enough for any wire value `encode` accepts, and every list must have a bound
+/// for it (a compile error where one has none). These limits bound the arena; they do not make the output readable under `read_cfg`:
+/// `min_len`, `min`, `max`, a struct's `check` and a `Raw` validator are not applied, and `format_cfg` may differ from what a read expects.
 pub fn encode(
     comptime Format: type,
     comptime T: type,
@@ -528,11 +640,24 @@ pub fn encode(
     writer: *std.Io.Writer,
     comptime serde_cfg: anytype,
     comptime format_cfg: anytype,
+    comptime read_cfg: anytype,
 ) !void {
+    _ = comptime encodeArenaSize(Format, T, serde_cfg, read_cfg);
     const mark = arena.end_index;
     defer arena.end_index = mark;
-    const value = try fromWire(T, arena.allocator(), memory, wire);
+    const value = try fromWire(T, Limited(Format, serde_cfg, read_cfg), arena.allocator(), memory, wire);
     try root.serializeWith(Format, writer, value, serde_cfg, format_cfg);
+}
+
+/// The bytes of the arena that `encode(Format, T, ...)` needs for any wire value it accepts: the rebuild of the whole of `T`
+/// (`rebuildOwned`, with `max_len` and `.elem` of each field and `max_items` and `max_depth` of `read_cfg`). A list without a `max_len`
+/// draws on `max_items`, and with neither it is a compile error.
+pub fn encodeArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg: anytype, comptime read_cfg: anytype) usize {
+    @setEvalBranchQuota(1_000_000);
+    const limits = comptime limitsOf(Format, read_cfg);
+    const size = comptime listsOf(rebuildOwned(T, .{}, serde_cfg, limits, 0), limits, true);
+    if (size > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
+    return @intCast(size);
 }
 
 /// A wire value as a typed-layer field: reads a `T` through the decode hook, so a message that holds
@@ -712,6 +837,8 @@ const Cost = struct {
     lists: Amount = .{},
     text: Amount = .{},
     scratch: u64 = 0,
+    /// The most any validator of a `Raw` allocates for one item (`Bounds.validate_bytes`): in `scratch`, or in `output` for a resumable read.
+    validate: u64 = 0,
     list_size: u64 = 0,
     list_align: u64 = 0,
 
@@ -720,6 +847,7 @@ const Cost = struct {
             .lists = a.lists.plus(b.lists),
             .text = a.text.plus(b.text),
             .scratch = @max(a.scratch, b.scratch),
+            .validate = @max(a.validate, b.validate),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
         };
@@ -737,26 +865,12 @@ const Cost = struct {
             .lists = a.lists.most(b.lists),
             .text = a.text.most(b.text),
             .scratch = @max(a.scratch, b.scratch),
+            .validate = @max(a.validate, b.validate),
             .list_size = @max(a.list_size, b.list_size),
             .list_align = @max(a.list_align, b.list_align),
         };
     }
 };
-
-/// The bytes a list of `n` items of `size` and `alignment` takes in a fixed buffer, worst case: an
-/// array list grows from nothing through the capacities the standard library gives it, each a new
-/// allocation (the buffer reuses only the last one), and is copied to its exact size at the end.
-fn growth(n: u64, size: u64, alignment: u64) u64 {
-    if (n == 0) return 0;
-    const init = @max(1, 128 / size);
-    var capacity: u64 = 0;
-    var total: u64 = 0;
-    while (capacity < n) {
-        capacity = (capacity + 1) + ((capacity + 1) / 2 + init);
-        total += capacity * size + alignment - 1;
-    }
-    return total + n * size + alignment - 1;
-}
 
 /// The most `growth` costs for one item of the shared budget: a list of `k` items uses `k + 1` of
 /// it (its own place and its elements), and costs most per item just after it grew, so the ratio is
@@ -793,7 +907,9 @@ fn bound(comptime name: []const u8, comptime limit: ?u64, comptime what: []const
 /// An upper bound, in bytes, of what the arena of `decode(Format, T, ...)` allocates, computed from
 /// the bounds of `T` (`max_len` and `.elem` of each field) and from `format_cfg`: `max_items` (the
 /// items of the whole input, which bounds every list that has no `max_len`, and all lists together),
-/// `max_string_len`, `max_depth`, and `max_input_bytes`, which `decode` enforces.
+/// `max_string_len`, `max_depth`, and `max_input_bytes`, which `decode` enforces. A struct with a `check` is checked on a typed
+/// copy of itself, rebuilt in the arena from the wire layout (`WireSink.check`) once the read has filled the arena for it, so the
+/// bound adds the largest such rebuild.
 ///
 /// A string that is borrowed from the input (a definite CBOR string, a JSON string without an escape)
 /// and a `Raw` item cost nothing: their span points into the input. Only what is rewritten costs.
@@ -817,8 +933,10 @@ pub fn maxArenaSize(comptime Format: type, comptime T: type, comptime serde_cfg:
 }
 
 /// The two regions of `decodeInto`, in bytes: `output` holds the arrays and rewritten strings the wire value
-/// points at, `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
-/// a lenient CBOR `Raw` and the recorded names of a JSON `Raw` (`json.RecordedKey`) otherwise), and
+/// points at, and the rebuild of a struct's `check` (the typed form of the struct's lists, made from the wire layout for the
+/// call and given back; the largest rebuild over every struct with a `check`), `scratch` what the reader keeps while it reads (empty for a strict CBOR read and for JSON without a `Raw`; the key records of
+/// a lenient CBOR `Raw` (`cbor.itemScratch`), the recorded names of a JSON `Raw` and the strings it decodes (`json.itemScratch`) otherwise)
+/// and the largest `validate_bytes` of any `Raw` validator, the block a validator runs on (`typed.runValidate`), and
 /// together they are `maxArenaSize`. Each is an upper bound under the same rules, so a region of exactly its
 /// size is enough for any input the config allows.
 pub const Sizes = struct { output: usize, scratch: usize };
@@ -830,7 +948,9 @@ pub fn regionSizes(comptime Format: type, comptime T: type, comptime serde_cfg: 
 /// `regionSizes` for a resumable decode (`Resumable`) of strict CBOR: every string, byte string and `Raw` is copied into `output`
 /// as it arrives, each in an allocation of exactly its length (a `Raw`'s grows in place to at most its bound and is cut to its
 /// length), so they are charged where a whole-input strict read charges nothing; the arrays are charged as it charges them, and
-/// `scratch` is empty, since the reader's state is in the `Resumable`. Every string must have a bound (`max_len`, or
+/// `scratch` is empty, since the reader's state is in the `Resumable`, and `output` includes the rebuild of a `check` as `regionSizes` does
+/// and the largest `validate_bytes` of a `Raw` validator, whose block comes off the end of the output for the length of the call.
+/// Every string must have a bound (`max_len`, or
 /// `max_string_len`), a `Raw` as well, and a `SortedMap`'s keys the config's `max_string_len`. `cbor_cfg` must say `mode = .strict`.
 pub fn resumableRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
     return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true, false);
@@ -844,7 +964,9 @@ pub fn maxResumableArenaSize(comptime T: type, comptime serde_cfg: anytype, comp
 
 /// `resumableRegionSizes` for `StreamResumable`: a text and a byte string are left in the stream, so they cost nothing; the arrays, the
 /// `Raw` items and a sorted map's keys are charged as `resumableRegionSizes` charges them. A type with none of the latter is bounded
-/// by its arrays alone, however long its strings are.
+/// by its arrays alone, however long its strings are. A struct with a `check` must hold no text or byte string, since the check
+/// rebuilds the struct from the output and could not see one that is still in the stream (a compile error); a `Raw` and a sorted map's keys
+/// are in the output, and a check reads them.
 pub fn streamRegionSizes(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype) Sizes {
     return comptime computeSizes(cbor, T, serde_cfg, cbor_cfg, true, true);
 }
@@ -873,6 +995,7 @@ pub fn StreamResumable(comptime T: type, comptime serde_cfg: anytype, comptime c
 }
 
 fn ResumableIn(comptime T: type, comptime serde_cfg: anytype, comptime cbor_cfg: anytype, comptime in_stream: bool) type {
+    if (in_stream) comptime assertStreamChecks(T, serde_cfg, limitsOf(cbor, cbor_cfg), 0);
     const Reading = resumable.Reading(WireSink, T, serde_cfg, cbor_cfg, in_stream);
 
     return struct {
@@ -919,11 +1042,7 @@ fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: any
     const items = limits.max_items;
 
     // Arrays of lists: from the fields, and, where the items are bounded, from the budget alone.
-    var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", items, "the items of the input"));
-    if (items) |budget| if (cost.list_size != 0) {
-        const per_item = listPerItem(budget, cost.list_size, cost.list_align, limits.strict);
-        lists = @min(lists, per_item * budget);
-    };
+    const lists = listsOf(cost, limits, limits.strict);
 
     // Text that is rewritten: from the fields, and, where the input and the items are bounded, from the input.
     var text = if (cost.text.pool == 0) cost.text.fixed else cost.text.total(bound("max_items", items, "the items of the input"));
@@ -932,9 +1051,158 @@ fn computeSizes(comptime Format: type, comptime T: type, comptime serde_cfg: any
         // input for one, chunks only add heads, and base64 decodes to three quarters.
         text = @min(text, input);
     }
-    const output = lists + text + slack;
-    if (output + cost.scratch > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
-    return .{ .output = @intCast(output), .scratch = @intCast(cost.scratch) };
+
+    // A `check` rebuilds the struct it checks from the wire layout, after the read has filled the output for that subtree.
+    if (in_stream) comptime assertStreamChecks(T, serde_cfg, limits, 0);
+    const check = comptime checkBytes(T, serde_cfg, limits, 0);
+    // A validator's block is taken from the reader's memory, which is `scratch`; a resumable read has none, and takes it from the end of `output`.
+    const scratch = cost.scratch + if (limits.copy) 0 else cost.validate;
+    const output = lists + text + check + (if (limits.copy) cost.validate else 0) + slack;
+    if (output + scratch > std.math.maxInt(usize)) @compileError("the arena bound does not fit this target's usize: " ++ @typeName(T));
+    return .{ .output = @intCast(output), .scratch = @intCast(scratch) };
+}
+
+/// The bytes the lists of `cost` take: from the fields, and, where the items are bounded, from the budget alone. `strict` says that
+/// each list is allocated once, at its exact size.
+fn listsOf(comptime cost: Cost, comptime limits: Limits, comptime strict: bool) u64 {
+    var lists = if (cost.lists.pool == 0) cost.lists.fixed else cost.lists.total(bound("max_items", limits.max_items, "the items of the input"));
+    if (limits.max_items) |budget| if (cost.list_size != 0) {
+        const per_item = listPerItem(budget, cost.list_size, cost.list_align, strict);
+        lists = @min(lists, per_item * budget);
+    };
+    return lists;
+}
+
+/// What `fromWire` allocates to rebuild one value of `T` from its wire layout (`WireSink.check` does it for a struct with a
+/// `check`): `typedOwned`'s list algebra over the typed element sizes. A list of non-scalar elements is allocated once, at the exact
+/// size of its elements as the typed layer holds them, which can be twice their wire size; text, bytes, `Raw` and a scalar list
+/// alias the memory the spans name and cost nothing. A list of packed structs is not a scalar list, so it costs its elements.
+fn rebuildOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) Cost {
+    if (depth > limits.max_depth) return .{};
+    return switch (comptime reflect.kindOf(T)) {
+        .bool, .int, .float, .byte_array, .@"enum", .@"packed", .text, .byte_string, .raw, .hook, .none => .{},
+        .list => blk: {
+            const Elem = @typeInfo(T).pointer.child;
+            if (comptime isScalarList(Elem)) break :blk .{};
+            const elem_bounds: meta.Bounds = if (bounds.elem) |elem| elem.* else .{};
+            const element = rebuildOwned(Elem, elem_bounds, cfg, limits, depth + 1);
+            var own: Cost = .{ .list_size = @sizeOf(Elem), .list_align = @alignOf(Elem) };
+            if (ownBound(bounds)) |n| {
+                own.lists.fixed = listBytes(n, @sizeOf(Elem), @alignOf(Elem), true);
+                break :blk own.plus(element.times(n));
+            }
+            const items = bound("max_items", limits.max_items, "the items of the input");
+            own.lists.pool = listPerItem(items, @sizeOf(Elem), @alignOf(Elem), true) + element.lists.fixed;
+            break :blk own.plus(.{ .lists = .{ .pool = element.lists.pool }, .list_size = element.list_size, .list_align = element.list_align });
+        },
+        .array => rebuildOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),
+        .optional => rebuildOwned(@typeInfo(T).optional.child, bounds, cfg, limits, depth),
+        .pointer => @compileError("a pointer has no wire layout: " ++ @typeName(T)),
+        .@"struct" => blk: {
+            // A sorted map is one container, and the value of an entry is in it, not in an entry: one level below the map.
+            if (comptime typed.isSortedMap(T)) break :blk rebuildOwned([]const T.Entry, bounds, cfg, limits, depth -| 1);
+            var total: Cost = .{};
+            for (reflect.fields(T, cfg)) |field| {
+                if (field.extras) continue;
+                // The `elem` bounds of the field that holds a sorted map reach the value of each entry, as they do in a read.
+                const field_bounds = if (comptime isSortedEntry(T) and std.mem.eql(u8, field.name, "value")) bounds else field.bounds;
+                total = total.plus(rebuildOwned(field.type, field_bounds, cfg, limits, depth + 1));
+            }
+            break :blk total;
+        },
+        .@"union" => blk: {
+            var most: Cost = .{};
+            for (reflect.variants(T, cfg)) |variant| {
+                if (variant.type != void) most = most.most(rebuildOwned(variant.type, variant.bounds, cfg, limits, depth + 1));
+            }
+            break :blk most;
+        },
+    };
+}
+
+/// The most `fromWire` allocates for the `check` of any struct that `T` reaches and that declares one (0 for none, and for a packed
+/// struct, which holds no list). The rebuild runs after the read has filled the output for its subtree and is given back at once, so
+/// the largest one is what a region must hold beyond the read's own bytes. The checked struct's own bounds and the limits that reach it
+/// apply, and nothing above it does: what it costs is the same wherever it is.
+fn checkBytes(comptime T: type, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) u64 {
+    if (depth > limits.max_depth) return 0;
+    return switch (comptime reflect.kindOf(T)) {
+        .list => checkBytes(@typeInfo(T).pointer.child, cfg, limits, depth + 1),
+        .array => checkBytes(@typeInfo(T).array.child, cfg, limits, depth + 1),
+        .optional => checkBytes(@typeInfo(T).optional.child, cfg, limits, depth),
+        .@"struct" => blk: {
+            if (comptime typed.isSortedMap(T)) break :blk checkBytes([]const T.Entry, cfg, limits, depth -| 1);
+            var most: u64 = 0;
+            if (comptime @hasDecl(T, "check")) {
+                most = listsOf(rebuildOwned(T, .{}, cfg, limits, depth), limits, true);
+            }
+            for (reflect.fields(T, cfg)) |field| {
+                if (!field.extras) most = @max(most, checkBytes(field.type, cfg, limits, depth + 1));
+            }
+            break :blk most;
+        },
+        .@"union" => blk: {
+            var most: u64 = 0;
+            for (reflect.variants(T, cfg)) |variant| {
+                if (variant.type != void) most = @max(most, checkBytes(variant.type, cfg, limits, depth + 1));
+            }
+            break :blk most;
+        },
+        else => 0,
+    };
+}
+
+/// The compile error of `StreamResumable`: a struct that declares `check` and holds a text or byte string that stays in the stream. Its check
+/// rebuilds the struct from the output region, which has no such bytes (a span holds a stream offset), so it would read other bytes.
+/// Walks the types reachable from `T`; a `Raw` and a sorted map's key are in the output and are no fault.
+fn assertStreamChecks(comptime T: type, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) void {
+    if (depth > limits.max_depth) return;
+    switch (comptime reflect.kindOf(T)) {
+        .list => assertStreamChecks(@typeInfo(T).pointer.child, cfg, limits, depth + 1),
+        .array => assertStreamChecks(@typeInfo(T).array.child, cfg, limits, depth + 1),
+        .optional => assertStreamChecks(@typeInfo(T).optional.child, cfg, limits, depth),
+        .@"struct" => {
+            if (comptime typed.isSortedMap(T)) return assertStreamChecks([]const T.Entry, cfg, limits, depth -| 1);
+            if (comptime @hasDecl(T, "check") and holdsStreamText(T, cfg, limits, depth)) {
+                @compileError("a check cannot read text or bytes that stay in the stream (`StreamResumable`), and this one's struct holds some: " ++ @typeName(T));
+            }
+            for (reflect.fields(T, cfg)) |field| {
+                if (!field.extras) assertStreamChecks(field.type, cfg, limits, depth + 1);
+            }
+        },
+        .@"union" => for (reflect.variants(T, cfg)) |variant| {
+            if (variant.type != void) assertStreamChecks(variant.type, cfg, limits, depth + 1);
+        },
+        else => {},
+    }
+}
+
+/// Whether the value of `T` holds a text or a byte string that `StreamResumable` leaves in the stream: any but a sorted map's key,
+/// which is copied into the output to be compared with the next. A `Raw` is copied too.
+fn holdsStreamText(comptime T: type, comptime cfg: anytype, comptime limits: Limits, comptime depth: u64) bool {
+    if (depth > limits.max_depth) return false;
+    return switch (comptime reflect.kindOf(T)) {
+        .text, .byte_string => true,
+        .list => holdsStreamText(@typeInfo(T).pointer.child, cfg, limits, depth + 1),
+        .array => holdsStreamText(@typeInfo(T).array.child, cfg, limits, depth + 1),
+        .optional => holdsStreamText(@typeInfo(T).optional.child, cfg, limits, depth),
+        .@"struct" => blk: {
+            if (comptime typed.isSortedMap(T)) break :blk holdsStreamText([]const T.Entry, cfg, limits, depth -| 1);
+            for (reflect.fields(T, cfg)) |field| {
+                if (field.extras) continue;
+                if (@hasDecl(T, "zerde_sorted_entry") and std.mem.eql(u8, field.name, "key")) continue;
+                if (holdsStreamText(field.type, cfg, limits, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .@"union" => blk: {
+            for (reflect.variants(T, cfg)) |variant| {
+                if (variant.type != void and holdsStreamText(variant.type, cfg, limits, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 /// The list bound of a field, if it has one of its own: a field's `max_len` is a number of items the
@@ -949,7 +1217,7 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
     // charged down to it and no further.
     if (depth > limits.max_depth) return .{};
     return switch (comptime reflect.kindOf(T)) {
-        .bool, .int, .float, .byte_array, .@"enum", .hook, .none => .{},
+        .bool, .int, .float, .byte_array, .@"enum", .@"packed", .hook, .none => .{},
         .text => blk: {
             // A strict read has only definite strings, which it never rewrites: they are spans of the input.
             if (limits.strict and (!limits.copy or limits.in_stream)) break :blk .{};
@@ -964,23 +1232,21 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
             break :blk .{ .text = .{ .fixed = n } };
         },
         .raw => blk: {
+            // The validator runs on a block of the bytes it states, which no size function can derive from a function pointer.
+            const validate: u64 = if (bounds.validate != null) bounds.validate_bytes orelse 0 else 0;
             // A strict read keeps no record of a key (it compares neighbours, and refuses a composite key that
             // holds a float zero), so a raw item of CBOR costs nothing.
             if (limits.strict) {
                 // A resumable read copies it, whole, into the output.
-                if (!limits.copy) break :blk .{};
-                break :blk .{ .text = .{ .fixed = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item") } };
+                if (!limits.copy) break :blk .{ .validate = validate };
+                break :blk .{ .text = .{ .fixed = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item") }, .validate = validate };
             }
-            // Checking a raw item records its map keys: at most `n / 2` records of 24 bytes, and
-            // for a key that is itself an array or map its canonical bytes, once more at each level of
-            // nesting that holds it (a level takes at least four bytes). They share the `n` bytes, so
-            // the most of the two. JSON records each member's name as it reads it (`json.RecordedKey`, a slice of the input
-            // and a flag) and a member takes four bytes at least, so `n / 4 + 1` of them; the bound is for either format.
+            // Checking a raw item records its map keys (`cbor.itemScratch`), and JSON records each member's name and decodes the
+            // strings it checks into the reader's memory (`json.itemScratch`); the bound is for either format.
             const n: u64 = bound(@typeName(T), fieldLimit(bounds.max_len, limits.max_string_len), "a raw item");
             // The item is itself a container, below the `depth` that hold it.
             const levels = @min(limits.max_depth -| (depth + 1), n / 4 + 1);
-            const json_spans = growth(n / 4 + 1, @sizeOf(json.RecordedKey), @alignOf(json.RecordedKey));
-            break :blk .{ .scratch = @max(growth(n / 2 + 8, 24, 8), growth(n * levels, 1, 1), json_spans) };
+            break :blk .{ .scratch = @max(cbor.itemScratch(n, levels), json.itemScratch(n)), .validate = validate };
         },
         .list => blk: {
             const Elem = @typeInfo(T).pointer.child;
@@ -1000,6 +1266,10 @@ fn typedOwned(comptime T: type, comptime bounds: meta.Bounds, comptime cfg: anyt
                 .lists = .{ .pool = element.lists.pool },
                 .text = .{ .pool = element.text.pool },
                 .scratch = element.scratch,
+                // The lists nested below are charged against the same budget, at their own element sizes and not at this one's.
+                .validate = element.validate,
+                .list_size = element.list_size,
+                .list_align = element.list_align,
             });
         },
         .array => typedOwned(@typeInfo(T).array.child, .{}, cfg, limits, depth + 1).times(@typeInfo(T).array.len),

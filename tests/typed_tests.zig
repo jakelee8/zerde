@@ -4233,20 +4233,20 @@ test "an enum is an integer of a width an extern struct accepts, whatever its ta
     const w = try wire.toWire(Holder, arena.allocator(), mem.base, .{ .s = .c, .n = .down, .w = .big, .count = 1 });
     try std.testing.expectEqual(@as(u8, 2), w.s);
     try std.testing.expectEqual(@as(i8, -3), w.n);
-    const back = try wire.fromWire(Holder, arena.allocator(), mem, w);
+    const back = try wire.fromWire(Holder, null, arena.allocator(), mem, w);
     try std.testing.expectEqual(Small.c, back.s);
     try std.testing.expectEqual(Neg.down, back.n);
     // A value that is no variant, including one that does not fit the tag type.
     var bad = w;
     bad.s = 3;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, arena.allocator(), mem, bad));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, null, arena.allocator(), mem, bad));
     // 4 does not fit the two bits of Small's tag type, though its low bits name a variant.
     bad = w;
     bad.s = 4;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, arena.allocator(), mem, bad));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, null, arena.allocator(), mem, bad));
     bad = w;
     bad.n = 100;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, arena.allocator(), mem, bad));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Holder, null, arena.allocator(), mem, bad));
 }
 
 fn expectSampleDecoded(mem: wire.Memory, w: wire.Wire(WireMsg)) !void {
@@ -4304,7 +4304,7 @@ test "a message decodes into its wire layout, in CBOR and in JSON, and encodes b
         defer again.deinit();
         var scratch: [4096]u8 = undefined;
         var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
-        try wire.encode(Format, WireMsg, &scratch_arena, mem, w, &again.writer, .{}, write_cfg);
+        try wire.encode(Format, WireMsg, &scratch_arena, mem, w, &again.writer, .{}, write_cfg, read_cfg);
         try std.testing.expectEqualSlices(u8, out.written(), again.written());
         // The scratch arena is put back.
         try std.testing.expectEqual(@as(usize, 0), scratch_arena.end_index);
@@ -4377,7 +4377,7 @@ test "a list of scalars is not copied into the wire layout" {
     var none = std.heap.FixedBufferAllocator.init(&scratch);
     const span = try wire.toWire([]const u32, none.allocator(), @intFromPtr(&values), &values);
     try std.testing.expectEqual(wire.Span{ .offset = 0, .len = 3 }, span);
-    const back = try wire.fromWire([]const u32, none.allocator(), .{ .base = @intFromPtr(&values), .regions = &.{std.mem.sliceAsBytes(&values)} }, span);
+    const back = try wire.fromWire([]const u32, null, none.allocator(), .{ .base = @intFromPtr(&values), .regions = &.{std.mem.sliceAsBytes(&values)} }, span);
     try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(back.ptr));
     try std.testing.expectEqual(@as(usize, 0), none.end_index);
     // And the arena bound counts only the typed array: the capacities an array list grows through (33, 83 and 158 items
@@ -5505,7 +5505,7 @@ test "a sorted map decodes into the wire layout with its keys in the input, and 
     defer again.deinit();
     var scratch: [1024]u8 = undefined;
     var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
-    try wire.encode(zerde.cbor, Maps, &scratch_arena, mem, w, &again.writer, .{}, .{ .deterministic = true });
+    try wire.encode(zerde.cbor, Maps, &scratch_arena, mem, w, &again.writer, .{}, .{ .deterministic = true }, cfg);
     try std.testing.expectEqualSlices(u8, out.written(), again.written());
 }
 
@@ -5522,45 +5522,45 @@ test "a wire value from outside is not trusted: spans outside the memory or misa
     @memcpy(region.bytes[0..4], &[4]u8{ 1, 0, 0, 0 });
     var w = std.mem.zeroes(HolderWire);
     w.xs = .{ .offset = 0, .len = 1 };
-    try std.testing.expectEqualSlices(u32, &.{1}, (try wire.fromWire(Holder, arena.allocator(), mem, w)).xs);
+    try std.testing.expectEqualSlices(u32, &.{1}, (try wire.fromWire(Holder, null, arena.allocator(), mem, w)).xs);
     // Past the end, before the start, misaligned, and a sum that overflows.
     w.xs = .{ .offset = region.bytes.len - 2, .len = 1 };
-    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, null, arena.allocator(), mem, w));
     w.xs = .{ .offset = 2, .len = 1 };
-    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, null, arena.allocator(), mem, w));
     w.xs = .{ .offset = std.math.maxInt(u32), .len = std.math.maxInt(u32) };
-    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, null, arena.allocator(), mem, w));
     const low_mem: wire.Memory = .{ .base = mem.base -% 1, .regions = mem.regions };
     w.xs = .{ .offset = 0, .len = 1 };
-    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), low_mem, w));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, null, arena.allocator(), low_mem, w));
     // Before the start of the region is refused for bytes too, which have no alignment to refuse it.
     try std.testing.expectError(error.OffsetOutOfRange, low_mem.bytesOf(.{ .offset = 0, .len = 1 }));
     try std.testing.expectEqual(@as(usize, 1), (try mem.bytesOf(.{ .offset = 0, .len = 1 })).len);
     // Memory the caller did not name is refused even when it is real.
     const outside: wire.Memory = .{ .base = @intFromPtr(&other), .regions = mem.regions };
-    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), outside, w));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, null, arena.allocator(), outside, w));
     // A text span is checked the same way, and so is the span of an inner list.
     var names = std.mem.zeroes(Effect);
     _ = &names;
     w.xs = .{ .offset = 0, .len = 0 };
     w.names = .{ .offset = 4, .len = 1 };
     @memset(region.bytes[4..12], 0);
-    try std.testing.expectEqual(@as(usize, 0), (try wire.fromWire(Holder, arena.allocator(), mem, w)).names[0].len);
+    try std.testing.expectEqual(@as(usize, 0), (try wire.fromWire(Holder, null, arena.allocator(), mem, w)).names[0].len);
     @memset(region.bytes[4..12], 0xff);
-    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, arena.allocator(), mem, w));
+    try std.testing.expectError(error.OffsetOutOfRange, wire.fromWire(Holder, null, arena.allocator(), mem, w));
     // A tag that names nothing, an enum value and a presence byte that mean nothing.
     var bad = std.mem.zeroes(Effect);
     bad.tag = 9;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireEffect, arena.allocator(), mem, bad));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireEffect, null, arena.allocator(), mem, bad));
     var level = std.mem.zeroes(wire.Wire(WireRecord));
     level.level = 99;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireRecord, arena.allocator(), mem, level));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(WireRecord, null, arena.allocator(), mem, level));
     var presence = std.mem.zeroes(wire.Wire(?u32));
     presence.present = 2;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(?u32, arena.allocator(), mem, presence));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(?u32, null, arena.allocator(), mem, presence));
     presence.present = 1;
     presence.value = 5;
-    try std.testing.expectEqual(@as(?u32, 5), try wire.fromWire(?u32, arena.allocator(), mem, presence));
+    try std.testing.expectEqual(@as(?u32, 5), try wire.fromWire(?u32, null, arena.allocator(), mem, presence));
     // A zero length is no memory: it needs no region and makes no pointer.
     const none: wire.Memory = .{ .base = 0, .regions = &.{} };
     try std.testing.expectEqual(@as(usize, 0), (try none.bytesOf(.{ .offset = 0, .len = 0 })).len);
@@ -5758,7 +5758,7 @@ test "a wire type of a wide schema needs no comptime branch quota from the calle
     try std.testing.expectEqual(@as(u16, 9), w.payload.failed.code);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try wire.encode(zerde.json, QuotaResponse, &arena, region.memory(), w, &out.writer, .{}, .{});
+    try wire.encode(zerde.json, QuotaResponse, &arena, region.memory(), w, &out.writer, .{}, .{}, .{ .max_items = 64 });
     try std.testing.expectEqualStrings(input, out.written());
 }
 
@@ -5953,24 +5953,24 @@ test "a bool on the wire is 0 or 1, and anything else is refused, alone or in a 
     const good = try wire.toWire(Flags, arena.allocator(), mem.base, .{ .flag = true, .flags = &.{ true, false, true }, .pair = .{ false, true } });
     try std.testing.expectEqual(@as(u8, 1), good.flag);
     try std.testing.expectEqual(@as([2]u8, .{ 0, 1 }), good.pair);
-    const back = try wire.fromWire(Flags, arena.allocator(), mem, good);
+    const back = try wire.fromWire(Flags, null, arena.allocator(), mem, good);
     try std.testing.expectEqualSlices(bool, &.{ true, false, true }, back.flags);
     // A byte that is neither, in each place a bool can be.
     var bad = good;
     bad.flag = 2;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, arena.allocator(), mem, bad));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, null, arena.allocator(), mem, bad));
     bad = good;
     bad.pair[1] = 7;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, arena.allocator(), mem, bad));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, null, arena.allocator(), mem, bad));
     const list = try wire.Memory.resolve(mem, good.flags, 1, 1);
     @constCast(list)[1] = 2;
-    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, arena.allocator(), mem, good));
+    try std.testing.expectError(error.InvalidTag, wire.fromWire(Flags, null, arena.allocator(), mem, good));
     // And through encode: nothing is written for it that a reader would take for a bool.
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var scratch: [512]u8 = undefined;
     var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
-    try std.testing.expectError(error.InvalidTag, wire.encode(zerde.json, Flags, &scratch_arena, mem, good, &out.writer, .{}, .{}));
+    try std.testing.expectError(error.InvalidTag, wire.encode(zerde.json, Flags, &scratch_arena, mem, good, &out.writer, .{}, .{}, .{ .max_items = 16 }));
 }
 
 // ---- the arena bound is within a small factor of the worst the input can cost ------------------------------------
@@ -7240,7 +7240,7 @@ fn expectWireChunks(comptime T: type, comptime serde_cfg: anytype, comptime read
         used = decoded.used;
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
-        const back = try wire.fromWire(T, arena_state.allocator(), region.memory(), decoded.value);
+        const back = try wire.fromWire(T, null, arena_state.allocator(), region.memory(), decoded.value);
         try std.testing.expectEqualDeep(expected, back);
     }
     return used;
@@ -8745,4 +8745,1406 @@ test "a resumable write normalizes -0.0 and refuses a Raw that holds it, for any
     const holds = Boxed{ .raw = .{ .bytes = &.{ 0x82, 0x01, 0xf9, 0x80, 0x00 } } };
     const raw_min = zerde.resumable.Writer(zerde.cbor, Boxed, .{}, cfg).min_window;
     try std.testing.expectError(error.NegativeZero, writeInWindows(zerde.cbor, Boxed, holds, .{}, cfg, raw_min + 8));
+}
+
+// ---- a packed struct is one integer ---------------------------------------------------------------------------
+
+const Access = enum(u2) { none, read, write };
+const PackedFlags = packed struct(u8) { read: bool = false, write: bool = false, level: u3 = 0, _: u3 = 0 };
+const PackedMode = packed struct(u8) { mode: Access = .none, _: u6 = 0 };
+const PackedInner = packed struct(u4) { mode: Access = .none, _: u2 = 0 };
+const PackedOuter = packed struct(u8) { inner: PackedInner = .{}, extra: u4 = 0 };
+const PackedSigned = packed struct(i32) { low: u16 = 0, high: i16 = 0 };
+const PackedSmall = packed struct(u3) { a: u1 = 0, b: u2 = 0 };
+const PackedNegative = packed struct(i3) { a: i3 = 0 };
+
+fn PackedHolder(comptime P: type) type {
+    return struct { id: u8, held: P, many: []const P };
+}
+
+/// `value` is written and read back as itself in every format, through the typed read, a list of the type included.
+fn expectPackedRoundTrips(comptime P: type, value: P, other: P) !void {
+    const H = PackedHolder(P);
+    const many = [_]P{ value, other, value };
+    const holder: H = .{ .id = 7, .held = value, .many = &many };
+    inline for (.{ zerde.bin, zerde.bson, zerde.cbor, zerde.json, zerde.msgpack, zerde.toml, zerde.yaml, zerde.zon }) |Format| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try zerde.serializeWith(Format, &out.writer, holder, .{}, .{});
+        const back = try Format.parseSlice(H, allocator, out.written());
+        defer zerde.free(allocator, back);
+        try std.testing.expectEqual(holder.id, back.id);
+        try std.testing.expectEqual(value, back.held);
+        try std.testing.expectEqualSlices(P, holder.many, back.many);
+    }
+}
+
+test "a packed struct field round trips in every format, as its backing integer" {
+    try expectPackedRoundTrips(PackedFlags, .{ .read = true, .level = 5 }, .{ .write = true, .level = 7 });
+    try expectPackedRoundTrips(PackedMode, .{ .mode = .write }, .{});
+    try expectPackedRoundTrips(PackedOuter, .{ .inner = .{ .mode = .read }, .extra = 9 }, .{ .extra = 15 });
+    try expectPackedRoundTrips(PackedSmall, .{ .a = 1, .b = 3 }, .{});
+    // A negative backing value keeps its sign.
+    try expectPackedRoundTrips(PackedSigned, .{ .low = 0xffff, .high = -3 }, .{ .high = -32768 });
+    try expectPackedRoundTrips(PackedNegative, .{ .a = -4 }, .{ .a = 3 });
+}
+
+test "a packed struct is written as the integer it holds, and nothing else" {
+    const Packed = struct { flags: PackedFlags, signed: PackedSigned, many: []const PackedSigned, maybe: ?PackedFlags };
+    const Plain = struct { flags: u8, signed: i32, many: []const i32, maybe: ?u8 };
+    const value: PackedFlags = .{ .read = true, .write = true, .level = 5 };
+    const bits: u8 = @backingInt(value);
+    try std.testing.expectEqual(@as(u8, 0b10111), bits);
+    const signed: PackedSigned = .{ .low = 4, .high = -1 };
+    const list = [_]PackedSigned{ signed, .{}, .{ .low = 9 } };
+    const ints = [_]i32{ @backingInt(list[0]), 0, 9 };
+    try std.testing.expect(ints[0] < 0);
+    inline for (.{ zerde.bin, zerde.bson, zerde.cbor, zerde.json, zerde.msgpack, zerde.toml, zerde.yaml, zerde.zon }) |Format| {
+        var packed_out: std.Io.Writer.Allocating = .init(allocator);
+        defer packed_out.deinit();
+        var plain_out: std.Io.Writer.Allocating = .init(allocator);
+        defer plain_out.deinit();
+        // TOML has no null, so its optional is present.
+        try zerde.serializeWith(Format, &packed_out.writer, Packed{ .flags = value, .signed = signed, .many = &list, .maybe = value }, .{}, .{});
+        try zerde.serializeWith(Format, &plain_out.writer, Plain{ .flags = bits, .signed = ints[0], .many = &ints, .maybe = bits }, .{}, .{});
+        try std.testing.expectEqualSlices(u8, plain_out.written(), packed_out.written());
+    }
+    // rename_all renames the field that holds it, and there is no `_` member left to rename.
+    try expectJsonText("{\"Flags\":23}", struct { flags: PackedFlags }{ .flags = value }, .{ .rename_all = .PascalCase }, .{});
+}
+
+test "a packed struct that names a pattern the type does not define is refused, in each place it is read" {
+    const Flag = struct { flags: PackedFlags };
+    const Moded = struct { m: PackedMode };
+    const Outer = struct { o: PackedOuter };
+    const Small = struct { s: PackedSmall };
+    // A set padding bit; a number too wide for the backing integer is an overflow, not an undefined pattern.
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Flag, allocator, "{\"flags\":32}"));
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Flag, allocator, "{\"flags\":128}"));
+    try std.testing.expectError(error.IntegerOverflow, zerde.json.parseSlice(Flag, allocator, "{\"flags\":256}"));
+    try std.testing.expectError(error.IntegerOverflow, zerde.json.parseSlice(Small, allocator, "{\"s\":32}"));
+    try std.testing.expectEqual(@as(u8, 3), (try zerde.json.parseSlice(Flag, allocator, "{\"flags\":13}")).flags.level);
+    // An exhaustive enum field whose bits name no tag, alone and inside a nested packed struct (field by field).
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Moded, allocator, "{\"m\":3}"));
+    try std.testing.expectEqual(Access.write, (try zerde.json.parseSlice(Moded, allocator, "{\"m\":2}")).m.mode);
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Outer, allocator, "{\"o\":3}"));
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Outer, allocator, "{\"o\":4}"));
+    try std.testing.expectEqual(@as(u4, 15), (try zerde.json.parseSlice(Outer, allocator, "{\"o\":242}")).o.extra);
+    // An object where the integer is due.
+    try std.testing.expectError(error.InvalidNumber, zerde.json.parseSlice(Flag, allocator, "{\"flags\":{\"read\":true}}"));
+    try std.testing.expectError(error.InvalidNumber, zerde.json.parseSlice(struct { flags: u8 }, allocator, "{\"flags\":{\"read\":true}}"));
+    try std.testing.expectError(error.UnexpectedType, zerde.cbor.parseSlice(Flag, allocator, &.{ 0xa1, 0x65, 'f', 'l', 'a', 'g', 's', 0xa0 }));
+    // The same in CBOR, MessagePack and BSON, which read the integer by their own rules.
+    try std.testing.expectError(error.InvalidValue, zerde.cbor.parseSlice(Flag, allocator, &.{ 0xa1, 0x65, 'f', 'l', 'a', 'g', 's', 0x18, 0x20 }));
+    try std.testing.expectError(error.InvalidValue, zerde.msgpack.parseSlice(Flag, allocator, &.{ 0x81, 0xa5, 'f', 'l', 'a', 'g', 's', 0x20 }));
+}
+
+test "a packed struct is refused in a resumable read, and a resumable write is the whole write" {
+    const Flag = struct {
+        flags: PackedFlags,
+        mode: PackedMode,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict };
+    try expectChunked(Flag, .{}, strict_read, .{ .flags = .{ .write = true, .level = 6 }, .mode = .{ .mode = .read } });
+    try expectWindows(zerde.cbor, Flag, .{ .flags = .{ .write = true, .level = 6 }, .mode = .{ .mode = .read } }, .{}, .{ .deterministic = true });
+    try expectWindows(zerde.json, Flag, .{ .flags = .{ .write = true, .level = 6 }, .mode = .{ .mode = .read } }, .{}, .{});
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const bad_padding = [_]u8{ 0xa2, 0x64, 'm', 'o', 'd', 'e', 0x00, 0x65, 'f', 'l', 'a', 'g', 's', 0x18, 0x20 };
+    const bad_tag = [_]u8{ 0xa2, 0x64, 'm', 'o', 'd', 'e', 0x03, 0x65, 'f', 'l', 'a', 'g', 's', 0x00 };
+    try std.testing.expectError(error.InvalidValue, readInChunks(Flag, .{}, strict_read, arena_state.allocator(), &bad_padding, &.{ 9, 14 }));
+    try std.testing.expectError(error.InvalidValue, readInChunks(Flag, .{}, strict_read, arena_state.allocator(), &bad_tag, &.{ 3, 8 }));
+}
+
+const PackedChecked = packed struct(u8) {
+    low: u4,
+    high: u4,
+    pub fn check(self: PackedChecked) !void {
+        if (self.low > self.high) return error.LowAboveHigh;
+    }
+};
+
+const PackedHooked = packed struct(u8) {
+    value: u8,
+
+    /// Written as `[value]`, so the integer form cannot be what is on the wire.
+    pub fn zerdeEncode(self: PackedHooked, encoder: anytype) anyerror!void {
+        try encoder.beginArray(1);
+        try encoder.writeInt(self.value);
+        try encoder.endArray();
+    }
+
+    pub fn zerdeDecode(_: std.mem.Allocator, reader: anytype) anyerror!PackedHooked {
+        if (((try reader.next()) orelse return error.UnexpectedEndOfInput) != .array_begin) return error.UnexpectedType;
+        const value: u8 = switch ((try reader.next()) orelse return error.UnexpectedEndOfInput) {
+            .integer => |n| std.math.cast(u8, n) orelse return error.IntegerOverflow,
+            else => return error.UnexpectedType,
+        };
+        if (((try reader.next()) orelse return error.UnexpectedEndOfInput) != .array_end) return error.LengthMismatch;
+        return .{ .value = value };
+    }
+};
+
+test "a packed struct with a check is checked on every read, and one with hooks keeps them" {
+    const Doc = struct {
+        range: PackedChecked,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const ok = try zerde.json.parseSlice(Doc, allocator, "{\"range\":33}");
+    try std.testing.expectEqual(@as(u4, 2), ok.range.high);
+    try std.testing.expectError(error.LowAboveHigh, zerde.json.parseSlice(Doc, allocator, "{\"range\":18}"));
+    // Resumable.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict };
+    try std.testing.expectError(error.LowAboveHigh, readInChunks(Doc, .{}, strict_read, arena_state.allocator(), &.{ 0xa1, 0x65, 'r', 'a', 'n', 'g', 'e', 0x12 }, &.{}));
+    // Wire: the decode, and the check of a value that came from outside.
+    var region: Region = .{};
+    var arena = std.heap.FixedBufferAllocator.init(&region.bytes);
+    try std.testing.expectError(error.LowAboveHigh, wire.decode(zerde.json, Doc, &arena, region.base(), "{\"range\":18}", .{}, .{}));
+    const sink: wire.WireSink = .{ .base = 0, .memory = region.memory(), .arena = &arena };
+    try std.testing.expectError(error.LowAboveHigh, sink.check(PackedChecked, arena.allocator(), &@as(u8, 0x12)));
+    try sink.check(PackedChecked, arena.allocator(), &@as(u8, 0x21));
+    // A hook wins over the integer form.
+    const Hooks = struct { h: PackedHooked };
+    try expectJsonText("{\"h\":[1]}", Hooks{ .h = .{ .value = 1 } }, .{}, .{});
+    const back = try zerde.json.parseSlice(Hooks, allocator, "{\"h\":[3]}");
+    try std.testing.expectEqual(@as(u8, 3), back.h.value);
+    try std.testing.expectError(error.UnexpectedType, zerde.json.parseSlice(Hooks, allocator, "{\"h\":3}"));
+}
+
+test "a packed struct on the wire is its backing integer, widened, and fromWire refuses what the type does not define" {
+    try std.testing.expect(wire.Wire(PackedFlags) == u8);
+    try std.testing.expect(wire.Wire(PackedSmall) == u8);
+    try std.testing.expect(wire.Wire(PackedSigned) == i32);
+    try std.testing.expect(wire.Wire(PackedNegative) == i8);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var region: Region = .{};
+    const memory = region.memory();
+    const flags: PackedFlags = .{ .read = true, .level = 6 };
+    const as_wire = try wire.toWire(PackedFlags, arena_state.allocator(), region.base(), flags);
+    try std.testing.expectEqual(@as(u8, @backingInt(flags)), as_wire);
+    try std.testing.expectEqual(flags, try wire.fromWire(PackedFlags, null, arena_state.allocator(), memory, as_wire));
+    // A set padding bit, an exhaustive enum's unnamed pattern, the same one nested.
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedFlags, null, arena_state.allocator(), memory, 0x20));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedMode, null, arena_state.allocator(), memory, 3));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedOuter, null, arena_state.allocator(), memory, 3));
+    // A wire integer outside the backing integer: u3 with a bit above bit 2, and i3 with -5.
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedSmall, null, arena_state.allocator(), memory, 0x20));
+    try std.testing.expectEqual(PackedSmall{ .a = 1, .b = 3 }, try wire.fromWire(PackedSmall, null, arena_state.allocator(), memory, 7));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedNegative, null, arena_state.allocator(), memory, -5));
+    try std.testing.expectEqual(PackedNegative{ .a = -4 }, try wire.fromWire(PackedNegative, null, arena_state.allocator(), memory, -4));
+    // A negative backing value through the wire and back.
+    const negative: PackedSigned = .{ .low = 1, .high = -2 };
+    const negative_wire = try wire.toWire(PackedSigned, arena_state.allocator(), region.base(), negative);
+    try std.testing.expect(negative_wire < 0);
+    try std.testing.expectEqual(negative, try wire.fromWire(PackedSigned, null, arena_state.allocator(), memory, negative_wire));
+}
+
+test "a packed struct decodes into the wire layout in every wire format and in a resumable decode" {
+    const Doc = struct {
+        flags: PackedFlags,
+        signed: PackedSigned,
+        many: []const PackedFlags,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 16, .max_items = 16 };
+    const value: Doc = .{ .flags = .{ .write = true, .level = 3 }, .signed = .{ .high = -9 }, .many = &.{ .{ .read = true }, .{ .level = 7 } } };
+    _ = try expectWireChunks(Doc, .{}, read, value);
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const write_cfg = if (Format == zerde.cbor) .{ .deterministic = true } else .{};
+        try zerde.serializeWith(Format, &out.writer, value, .{}, write_cfg);
+        var region: Region = .{};
+        const len = out.written().len;
+        @memcpy(region.bytes[0..len], out.written());
+        var arena = std.heap.FixedBufferAllocator.init(region.bytes[len..]);
+        const cfg = if (Format == zerde.cbor) read else .{ .max_string_len = 16, .max_items = 16 };
+        const decoded = try wire.decode(Format, Doc, &arena, region.base(), region.bytes[0..len], .{}, cfg);
+        try std.testing.expectEqual(@as(u8, @backingInt(value.flags)), decoded.flags);
+        try std.testing.expectEqual(@as(i32, @backingInt(value.signed)), decoded.signed);
+        var back_arena = std.heap.ArenaAllocator.init(allocator);
+        defer back_arena.deinit();
+        const back = try wire.fromWire(Doc, null, back_arena.allocator(), region.memory(), decoded);
+        try std.testing.expectEqualDeep(value, back);
+        // And written again from the wire layout: the same bytes.
+        var again: std.Io.Writer.Allocating = .init(allocator);
+        defer again.deinit();
+        var scratch: [1024]u8 = undefined;
+        var scratch_arena = std.heap.FixedBufferAllocator.init(&scratch);
+        try wire.encode(Format, Doc, &scratch_arena, region.memory(), decoded, &again.writer, .{}, write_cfg, cfg);
+        try std.testing.expectEqualSlices(u8, out.written(), again.written());
+    }
+}
+
+test "a packed struct has its own reflection kind and no members, and a region the size of the integer's" {
+    try std.testing.expectEqual(zerde.reflect.Kind.@"packed", zerde.reflect.kindOf(PackedFlags));
+    try std.testing.expect(zerde.reflect.backing(PackedFlags) == u8);
+    try std.testing.expect(zerde.reflect.backing(PackedSigned) == i32);
+    const info = comptime zerde.reflect.fields(struct { f: PackedFlags }, .{});
+    try std.testing.expectEqual(zerde.reflect.Kind.@"packed", info[0].kind);
+    const node = comptime wire.describe(struct { f: PackedFlags, g: PackedSigned }, .{});
+    try std.testing.expectEqual(zerde.reflect.Kind.@"packed", node.members[0].node.kind);
+    try std.testing.expectEqual(@as(usize, 1), node.members[0].node.size);
+    try std.testing.expectEqual(@as(usize, 4), node.members[1].node.size);
+    // A type that holds a packed struct costs what the same type with an integer costs.
+    const limits = .{ .deny_unknown_fields = true, .fields = .{ .list = .{ .max_len = 4 } } };
+    const WithPacked = struct {
+        f: PackedFlags,
+        list: []const PackedSigned,
+        pub const serde = limits;
+    };
+    const WithInt = struct {
+        f: u8,
+        list: []const i32,
+        pub const serde = limits;
+    };
+    const read = .{ .max_string_len = 8, .max_items = 32 };
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        const packed_sizes = comptime wire.regionSizes(Format, WithPacked, .{}, read);
+        const int_sizes = comptime wire.regionSizes(Format, WithInt, .{}, read);
+        try std.testing.expectEqual(int_sizes, packed_sizes);
+    }
+    try std.testing.expectEqual(@sizeOf(wire.Wire(WithInt)), @sizeOf(wire.Wire(WithPacked)));
+}
+
+test "a packed struct costs a resumable read and write what an integer costs: no frames, no key length" {
+    const Long = packed struct(u8) { a_field_with_a_rather_long_name: u4 = 0, another_long_field_name: u4 = 0 };
+    const WithPacked = struct {
+        one: Long,
+        many: []const PackedSigned,
+        maybe: ?Long = null,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const WithInt = struct {
+        one: u8,
+        many: []const i32,
+        maybe: ?u8 = null,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8 };
+    try std.testing.expectEqual(@sizeOf(zerde.resumable.Decoder(WithInt, .{}, read)), @sizeOf(zerde.resumable.Decoder(WithPacked, .{}, read)));
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        try std.testing.expectEqual(
+            zerde.resumable.Writer(Format, WithInt, .{}, .{}).min_window,
+            zerde.resumable.Writer(Format, WithPacked, .{}, .{}).min_window,
+        );
+    }
+}
+
+// ---- the arena a `check` needs --------------------------------------------------------------------------------
+
+const CheckedLine = struct {
+    name: []const u8,
+    n: u32,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .name = .{ .max_len = 8 } } };
+};
+
+/// A list whose typed element (24 bytes) is twice its wire element (12), so the rebuild of a `check` is the larger part of the arena.
+const CheckedRows = struct {
+    rows: []const CheckedLine,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 64 } } };
+    pub fn check(self: CheckedRows) !void {
+        for (self.rows) |row| if (row.n == 0) return error.EmptyRow;
+    }
+};
+
+fn checkedRows(count: usize) [64]CheckedLine {
+    var rows: [64]CheckedLine = undefined;
+    for (&rows, 0..) |*row, index| row.* = .{ .name = "row", .n = if (index < count) @intCast(index + 1) else 0 };
+    return rows;
+}
+
+/// The bytes a region must hold for a read that used `used` of it and then rebuilt `rows` typed elements for its `check`.
+fn checkPeak(used: usize, rows: usize) usize {
+    return std.mem.alignForward(usize, used, @alignOf(CheckedLine)) + rows * @sizeOf(CheckedLine);
+}
+
+test "the output region holds the rebuild a check needs, and no less than the read and the rebuild take" {
+    try std.testing.expect(@sizeOf(wire.Wire(CheckedLine)) * 2 == @sizeOf(CheckedLine));
+    const rows = checkedRows(64);
+    const value: CheckedRows = .{ .rows = &rows };
+    const cbor_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    const json_read = .{ .max_string_len = 8, .max_items = 500 };
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        const read = if (Format == zerde.cbor) cbor_read else json_read;
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try zerde.serializeWith(Format, &out.writer, value, .{}, if (Format == zerde.cbor) .{ .deterministic = true } else .{});
+        const sizes = comptime wire.regionSizes(Format, CheckedRows, .{}, read);
+        // The input first, then the output region at an aligned address: every span is an offset into this one buffer.
+        var region: Region = .{};
+        const input = region.bytes[0..out.written().len];
+        @memcpy(input, out.written());
+        const output = region.bytes[std.mem.alignForward(usize, input.len, 16)..];
+        var scratch: [1024]u8 = undefined;
+        const decoded = try wire.decodeInto(Format, CheckedRows, output[0..sizes.output], scratch[0..sizes.scratch], region.base(), input, .{}, read);
+        // The rebuild of all 64 rows follows the read, in the same region.
+        const peak = checkPeak(decoded.used, 64);
+        try std.testing.expect(peak <= sizes.output);
+        // Without the rebuild's term the region is smaller than the peak: the read's own bytes and the slack are not enough.
+        try std.testing.expect(decoded.used + 256 < peak);
+        _ = try wire.decodeInto(Format, CheckedRows, output[0..peak], scratch[0..sizes.scratch], region.base(), input, .{}, read);
+        try std.testing.expectError(error.OutOfMemory, wire.decodeInto(Format, CheckedRows, output[0 .. peak - 1], scratch[0..sizes.scratch], region.base(), input, .{}, read));
+        // `decode` into one arena: the sum of the two regions is enough.
+        const total = comptime wire.maxArenaSize(Format, CheckedRows, .{}, read);
+        try std.testing.expectEqual(sizes.output + sizes.scratch, total);
+        var arena = std.heap.FixedBufferAllocator.init(output[0..total]);
+        _ = try wire.decode(Format, CheckedRows, &arena, region.base(), input, .{}, read);
+        // A check that fails is refused.
+        const rejecting = checkedRows(63);
+        out.clearRetainingCapacity();
+        try zerde.serializeWith(Format, &out.writer, CheckedRows{ .rows = &rejecting }, .{}, if (Format == zerde.cbor) .{ .deterministic = true } else .{});
+        const bad_input = region.bytes[0..out.written().len];
+        const bad_output = region.bytes[std.mem.alignForward(usize, bad_input.len, 16)..];
+        @memcpy(bad_input, out.written());
+        try std.testing.expectError(error.EmptyRow, wire.decodeInto(Format, CheckedRows, bad_output[0..sizes.output], scratch[0..sizes.scratch], region.base(), bad_input, .{}, read));
+    }
+}
+
+test "the resumable regions hold the rebuild a check needs, at every cut of the input" {
+    const rows = checkedRows(64);
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    const sizes = comptime wire.resumableRegionSizes(CheckedRows, .{}, read);
+    const input = try deterministicBytes(CheckedRows, .{}, .{ .rows = &rows });
+    defer allocator.free(input);
+    var region: Region = .{};
+    var peak: usize = 0;
+    for (0..input.len + 1) |cut| {
+        var decoder: wire.Resumable(CheckedRows, .{}, read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        _ = try decoder.feed(input[0..cut]);
+        _ = try decoder.feed(input[cut..]);
+        const decoded = try decoder.finish();
+        peak = checkPeak(decoded.used, 64);
+        try std.testing.expect(peak <= sizes.output);
+    }
+    try std.testing.expect(sizes.output < peak + 256 + 12 * 64);
+    // In a region of the peak the decode succeeds, and one byte less is refused, at any cut.
+    var decoder: wire.Resumable(CheckedRows, .{}, read) = undefined;
+    decoder.init(region.bytes[0..peak], region.base());
+    _ = try decoder.feed(input);
+    _ = try decoder.finish();
+    decoder.init(region.bytes[0 .. peak - 1], region.base());
+    try std.testing.expectError(error.OutOfMemory, decoder.feed(input));
+    // And the stream form, where the strings stay in the stream: its struct holds text, so it has no check here, but the sizes of a
+    // type without one are the lists, as before.
+    const bare = comptime wire.streamRegionSizes(struct {
+        rows: []const u32,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 64 } } };
+    }, .{}, read);
+    try std.testing.expect(bare.output < 64 * 4 + 3 + 256 + 1);
+}
+
+const CheckedRaw = struct {
+    raw: zerde.cbor.Raw,
+    labels: zerde.SortedMap(u8),
+    count: u32,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 16 }, .labels = .{ .max_len = 4 } } };
+    pub fn check(self: CheckedRaw) !void {
+        // The item's own bytes, and the keys, which are copied into the output.
+        if (!std.mem.eql(u8, self.raw.bytes, &.{ 0x82, 0x01, 0x02 })) return error.RawNotSeen;
+        if (self.labels.entries.len != 2) return error.KeysNotSeen;
+        if (!std.mem.eql(u8, self.labels.entries[0].key, "a") or !std.mem.eql(u8, self.labels.entries[1].key, "bb")) return error.KeysNotSeen;
+    }
+};
+
+test "a check that reads only a Raw and a sorted map's keys works where the strings stay in the stream" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 50, .max_input_bytes = 200 };
+    const entries = [_]zerde.SortedMap(u8).Entry{ .{ .key = "a", .value = 1 }, .{ .key = "bb", .value = 2 } };
+    const input = try deterministicBytes(CheckedRaw, .{}, .{ .raw = .{ .bytes = &.{ 0x82, 0x01, 0x02 } }, .labels = .{ .entries = &entries }, .count = 3 });
+    defer allocator.free(input);
+    const sizes = comptime wire.streamRegionSizes(CheckedRaw, .{}, read);
+    var region: Region = .{};
+    for (0..input.len + 1) |cut| {
+        var decoder: wire.StreamResumable(CheckedRaw, .{}, read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        _ = try decoder.feed(input[0..cut]);
+        _ = try decoder.feed(input[cut..]);
+        const decoded = try decoder.finish();
+        try std.testing.expectEqual(@as(u32, 3), decoded.value.count);
+    }
+    // The same bytes with a key the check does not expect: the check does see them.
+    var wrong = try allocator.dupe(u8, input);
+    defer allocator.free(wrong);
+    const at = std.mem.indexOf(u8, wrong, "bb").?;
+    wrong[at + 1] = 'c';
+    var decoder: wire.StreamResumable(CheckedRaw, .{}, read) = undefined;
+    decoder.init(region.bytes[0..sizes.output], region.base());
+    try std.testing.expectError(error.KeysNotSeen, decoder.feed(wrong));
+}
+
+const CheckedPlain = struct {
+    rows: []const CheckedLine,
+    pub const serde = CheckedRows.serde;
+};
+
+/// `C` in each place a struct can be below the root of a type: a field, a list element, an optional, an array element, a union
+/// payload and a sorted map's value.
+fn CheckedBelow(comptime C: type) [6]type {
+    const base = .{ .deny_unknown_fields = true };
+    const Choice = union(enum) { a: C, b: u8 };
+    return .{
+        struct {
+            held: C,
+            pub const serde = base;
+        },
+        struct {
+            held: []const C,
+            pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .held = .{ .max_len = 2 } } };
+        },
+        struct {
+            held: ?C,
+            pub const serde = base;
+        },
+        struct {
+            held: [2]C,
+            pub const serde = base;
+        },
+        struct {
+            held: Choice,
+            pub const serde = base;
+        },
+        struct {
+            held: zerde.SortedMap(C),
+            pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .held = .{ .max_len = 2 } } };
+        },
+    };
+}
+
+test "the rebuild of a check is counted wherever the struct that declares it is" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    // 64 typed rows of 24 bytes, in an allocation that may need up to 7 bytes of padding.
+    const rebuild = 64 * @sizeOf(CheckedLine) + @alignOf(CheckedLine) - 1;
+    const checked = comptime CheckedBelow(CheckedRows);
+    const plain = comptime CheckedBelow(CheckedPlain);
+    inline for (checked, plain) |With, Without| {
+        const with = comptime wire.regionSizes(zerde.cbor, With, .{}, read);
+        const without = comptime wire.regionSizes(zerde.cbor, Without, .{}, read);
+        try std.testing.expectEqual(without.output + rebuild, with.output);
+        try std.testing.expectEqual(without.scratch, with.scratch);
+        const resumable_with = comptime wire.resumableRegionSizes(With, .{}, read);
+        const resumable_without = comptime wire.resumableRegionSizes(Without, .{}, read);
+        try std.testing.expectEqual(resumable_without.output + rebuild, resumable_with.output);
+    }
+    // The largest rebuild bounds them all: two checks in one type cost the larger, not the sum.
+    const Two = struct {
+        first: CheckedRows,
+        second: CheckedRows,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const TwoPlain = struct {
+        first: CheckedPlain,
+        second: CheckedPlain,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    try std.testing.expectEqual(
+        comptime wire.regionSizes(zerde.cbor, TwoPlain, .{}, read).output + rebuild,
+        comptime wire.regionSizes(zerde.cbor, Two, .{}, read).output,
+    );
+}
+
+const RebuildTags = struct {
+    tags: []const []const u8,
+    nums: []const u32,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .tags = .{ .max_len = 3, .elem = .{ .max_len = 8 } }, .nums = .{ .max_len = 4 } } };
+};
+
+const rebuild_serde = .{ .deny_unknown_fields = true, .fields = .{ .groups = .{ .max_len = 4 }, .labels = .{ .max_len = 2 } } };
+const RebuildChoice = union(enum) { a: RebuildTags, b: RebuildTags, c: u8 };
+
+const RebuildChecked = struct {
+    groups: []const RebuildTags,
+    opt: ?RebuildTags,
+    pair: [2]RebuildTags,
+    choice: RebuildChoice,
+    labels: zerde.SortedMap(RebuildTags),
+    pub const serde = rebuild_serde;
+    pub fn check(self: RebuildChecked) !void {
+        _ = self;
+    }
+};
+
+const RebuildPlain = struct {
+    groups: []const RebuildTags,
+    opt: ?RebuildTags,
+    pair: [2]RebuildTags,
+    choice: RebuildChoice,
+    labels: zerde.SortedMap(RebuildTags),
+    pub const serde = rebuild_serde;
+};
+
+test "the rebuild of a check follows the typed layout of everything below the struct: lists in lists, arrays, optionals, unions and maps" {
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 500 };
+    const with = comptime wire.regionSizes(zerde.cbor, RebuildChecked, .{}, read);
+    const without = comptime wire.regionSizes(zerde.cbor, RebuildPlain, .{}, read);
+    // A list of text is a list of 16-byte slices that is rebuilt (3 of them); a list of u32 is not (it aliases).
+    const tags = 3 * @sizeOf([]const u8) + @alignOf([]const u8) - 1;
+    const groups = 4 * @sizeOf(RebuildTags) + @alignOf(RebuildTags) - 1 + 4 * tags;
+    const entry = 2 * @sizeOf(zerde.SortedMap(RebuildTags).Entry) + @alignOf(zerde.SortedMap(RebuildTags).Entry) - 1 + 2 * tags;
+    // The groups, the optional, the two array elements, the union's payload (the most of its variants) and the map.
+    try std.testing.expectEqual(groups + tags + 2 * tags + tags + entry, with.output - without.output);
+    // A list that draws on the shared budget: each item takes its element and its padding.
+    const Unbounded = struct {
+        rows: []const CheckedLine,
+        pub const serde = .{ .deny_unknown_fields = true };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const UnboundedPlain = struct {
+        rows: []const CheckedLine,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const small = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 10 };
+    try std.testing.expectEqual(
+        10 * (@sizeOf(CheckedLine) + @alignOf(CheckedLine)),
+        comptime wire.regionSizes(zerde.cbor, Unbounded, .{}, small).output - wire.regionSizes(zerde.cbor, UnboundedPlain, .{}, small).output,
+    );
+    // A type that recurses through a list is charged down to `max_depth`, a list at depth 1, 3 and 5 here: the innermost is 2 rows
+    // of 16 bytes, and each list above holds two of the rows below it.
+    const Tree = struct {
+        kids: []const @This(),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .kids = .{ .max_len = 2 } } };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const TreePlain = struct {
+        kids: []const @This(),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .kids = .{ .max_len = 2 } } };
+    };
+    const shallow = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 100, .max_depth = 5 };
+    const level = 2 * @sizeOf(Tree) + @alignOf(Tree) - 1;
+    try std.testing.expectEqual(
+        level + 2 * (level + 2 * level),
+        comptime wire.regionSizes(zerde.cbor, Tree, .{}, shallow).output - wire.regionSizes(zerde.cbor, TreePlain, .{}, shallow).output,
+    );
+}
+
+// ---- the arena of `encode` -------------------------------------------------------------------------------------
+
+const EncPair = struct { a: u8, b: u8 };
+
+/// Lists of lists of non-scalar elements, each list with a bound of its own.
+const EncSet = struct {
+    rows: []const []const EncPair,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .rows = .{ .max_len = 4, .elem = .{ .max_len = 4 } } } };
+};
+
+const enc_read = .{ .max_string_len = 8, .max_items = 100 };
+
+/// A wire value of `EncSet` built in `region`: `rows` spans, each naming one array of `per_row` pairs (the same array, so they alias).
+fn aliasedSet(region: *Region, arena: *std.heap.FixedBufferAllocator, rows: u32, per_row: u32) !wire.Wire(EncSet) {
+    const pairs = try arena.allocator().alloc(wire.Wire(EncPair), per_row);
+    for (pairs, 0..) |*pair, index| pair.* = .{ .a = @intCast(index), .b = 9 };
+    const inner = try wire.spanOf(region.base(), std.mem.sliceAsBytes(pairs));
+    const spans = try arena.allocator().alloc(wire.Span, rows);
+    for (spans) |*span| span.* = .{ .offset = inner.offset, .len = per_row };
+    const outer = try wire.spanOf(region.base(), std.mem.sliceAsBytes(spans));
+    return .{ .rows = .{ .offset = outer.offset, .len = rows } };
+}
+
+/// What `fromWire` takes of an arena to rebuild `w` under the limits of `read`: its peak.
+fn rebuildPeak(comptime T: type, comptime Format: type, comptime read: anytype, memory: wire.Memory, w: wire.Wire(T)) !usize {
+    var bytes: [8192]u8 align(16) = undefined;
+    var arena = std.heap.FixedBufferAllocator.init(&bytes);
+    _ = try wire.fromWire(T, wire.Limited(Format, .{}, read), arena.allocator(), memory, w);
+    return arena.end_index;
+}
+
+test "encode takes no more of its arena than encodeArenaSize, and fails one byte short of what it takes" {
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..4096]);
+    // Four rows of four pairs, as the bounds allow, built from typed values.
+    const row = [_]EncPair{ .{ .a = 1, .b = 2 }, .{ .a = 3, .b = 4 }, .{ .a = 5, .b = 6 }, .{ .a = 7, .b = 8 } };
+    const value: EncSet = .{ .rows = &.{ &row, &row, &row, &row } };
+    const w = try wire.toWire(EncSet, build.allocator(), region.base(), value);
+    const mem = region.memory();
+    var expected: std.Io.Writer.Allocating = .init(allocator);
+    defer expected.deinit();
+    inline for (.{ zerde.cbor, zerde.json }) |Format| {
+        expected.clearRetainingCapacity();
+        try zerde.serializeWith(Format, &expected.writer, value, .{}, .{});
+        const bound = comptime wire.encodeArenaSize(Format, EncSet, .{}, enc_read);
+        // The array of four slices (16 bytes each, 8-aligned), and the four arrays of four pairs of 2 bytes.
+        const slices = 4 * @sizeOf([]const EncPair);
+        const pairs = 4 * (4 * @sizeOf(EncPair));
+        try std.testing.expectEqual(slices + @alignOf([]const EncPair) - 1 + pairs, bound);
+        const peak = try rebuildPeak(EncSet, Format, enc_read, mem, w);
+        try std.testing.expectEqual(slices + pairs, peak);
+        const spare = region.bytes[4096..][0..8192];
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var exact = std.heap.FixedBufferAllocator.init(spare[0..peak]);
+        try wire.encode(Format, EncSet, &exact, mem, w, &out.writer, .{}, .{}, enc_read);
+        try std.testing.expectEqualSlices(u8, expected.written(), out.written());
+        try std.testing.expectEqual(@as(usize, 0), exact.end_index);
+        var short = std.heap.FixedBufferAllocator.init(spare[0 .. peak - 1]);
+        out.clearRetainingCapacity();
+        try std.testing.expectError(error.OutOfMemory, wire.encode(Format, EncSet, &short, mem, w, &out.writer, .{}, .{}, enc_read));
+        // Nothing is written before the rebuild is whole.
+        try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    }
+}
+
+test "encode refuses a wire value that the limits of the read would not build" {
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..4096]);
+    const mem = region.memory();
+    var spare = std.heap.FixedBufferAllocator.init(region.bytes[4096..][0..8192]);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    // A list longer than its max_len, the outer one and an inner one.
+    const long_inner = try aliasedSet(&region, &build, 1, 5);
+    try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, EncSet, &spare, mem, long_inner, &out.writer, .{}, .{}, enc_read));
+    const long_outer = try aliasedSet(&region, &build, 5, 1);
+    try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, EncSet, &spare, mem, long_outer, &out.writer, .{}, .{}, enc_read));
+    // A rebuild without the limits takes them, as a read of an unbounded type would.
+    var plain: [8192]u8 = undefined;
+    var plain_arena = std.heap.FixedBufferAllocator.init(&plain);
+    try std.testing.expectEqual(@as(usize, 5), (try wire.fromWire(EncSet, null, plain_arena.allocator(), mem, long_outer)).rows.len);
+    // Spans that alias: 4 rows naming one array of 4 pairs rebuild 4 + 16 elements, though the wire value holds 4 stored.
+    const aliased = try aliasedSet(&region, &build, 4, 4);
+    const tight = .{ .max_string_len = 8, .max_items = 19 };
+    try std.testing.expectError(error.TooManyItems, wire.encode(zerde.json, EncSet, &spare, mem, aliased, &out.writer, .{}, .{}, tight));
+    try wire.encode(zerde.json, EncSet, &spare, mem, aliased, &out.writer, .{}, .{}, enc_read);
+    out.clearRetainingCapacity();
+    const exactly = .{ .max_string_len = 8, .max_items = 20 };
+    try wire.encode(zerde.json, EncSet, &spare, mem, aliased, &out.writer, .{}, .{}, exactly);
+    // The depth is given back as each container closes: 4 rows of 4 pairs are 4 levels, whatever their number.
+    out.clearRetainingCapacity();
+    try wire.encode(zerde.json, EncSet, &spare, mem, aliased, &out.writer, .{}, .{}, .{ .max_items = 100, .max_depth = 4 });
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.encode(zerde.json, EncSet, &spare, mem, aliased, &out.writer, .{}, .{}, .{ .max_items = 100, .max_depth = 3 }));
+    // The arena is put back after a refusal.
+    try std.testing.expectEqual(@as(usize, 0), spare.end_index);
+}
+
+const EncNode = struct {
+    kids: []const EncNode,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .kids = .{ .max_len = 1 } } };
+};
+
+/// A chain of `count` nodes in `region`, the last with no kids.
+fn nodeChain(region: *Region, arena: *std.heap.FixedBufferAllocator, count: usize) !wire.Wire(EncNode) {
+    var next: wire.Wire(EncNode) = .{ .kids = .{ .offset = 0, .len = 0 } };
+    for (1..count) |_| {
+        const node = try arena.allocator().alloc(wire.Wire(EncNode), 1);
+        node[0] = next;
+        const span = try wire.spanOf(region.base(), std.mem.sliceAsBytes(node));
+        next = .{ .kids = .{ .offset = span.offset, .len = 1 } };
+    }
+    return next;
+}
+
+test "encode refuses nesting past max_depth with the format's own error, also for a span that names its own container" {
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..4096]);
+    const mem = region.memory();
+    var spare = std.heap.FixedBufferAllocator.init(region.bytes[4096..][0..16384]);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    // A node is a struct and its list of kids: two containers. Four nodes fit 8 levels, five do not; the root counts as the first.
+    const four = try nodeChain(&region, &build, 4);
+    const five = try nodeChain(&region, &build, 5);
+    const eight = .{ .max_depth = 8 };
+    try wire.encode(zerde.json, EncNode, &spare, mem, four, &out.writer, .{}, .{}, eight);
+    try std.testing.expectEqualStrings("{\"kids\":[{\"kids\":[{\"kids\":[{\"kids\":[]}]}]}]}", out.written());
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.encode(zerde.json, EncNode, &spare, mem, five, &out.writer, .{}, .{}, eight));
+    try std.testing.expectError(error.CborNestingTooDeep, wire.encode(zerde.cbor, EncNode, &spare, mem, five, &out.writer, .{}, .{}, eight));
+    try std.testing.expectEqual(@as(usize, 0), spare.end_index);
+    // The same nesting is where a read stops: four nodes of JSON read at 8 levels, five do not.
+    var json: std.Io.Writer.Allocating = .init(allocator);
+    defer json.deinit();
+    try json.writer.writeAll("{\"kids\":[{\"kids\":[{\"kids\":[{\"kids\":[]}]}]}]}");
+    const text = json.written();
+    @memcpy(region.bytes[8192..][0..text.len], text);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[16384..][0..8192]);
+    _ = try wire.decode(zerde.json, EncNode, &arena, region.base(), region.bytes[8192..][0..text.len], .{}, .{ .max_depth = 8 });
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.decode(zerde.json, EncNode, &arena, region.base(), region.bytes[8192..][0..text.len], .{}, .{ .max_depth = 7 }));
+    // A node whose kids are the array that holds it: the recursion ends at the limit, at the default and at a small one.
+    const self_array = try build.allocator().alloc(wire.Wire(EncNode), 1);
+    const self_span = try wire.spanOf(region.base(), std.mem.sliceAsBytes(self_array));
+    self_array[0] = .{ .kids = .{ .offset = self_span.offset, .len = 1 } };
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.encode(zerde.json, EncNode, &spare, mem, self_array[0], &out.writer, .{}, .{}, .{}));
+    try std.testing.expectError(error.CborNestingTooDeep, wire.encode(zerde.cbor, EncNode, &spare, mem, self_array[0], &out.writer, .{}, .{}, .{ .max_depth = 3 }));
+    // A sorted map is one container, and its entries are not: the struct, the map and the inner map are 3 levels, as a read counts them.
+    const Nested = struct {
+        m: zerde.SortedMap(zerde.SortedMap(u8)),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .m = .{ .max_len = 2, .elem = .{ .max_len = 2 } } } };
+    };
+    const maps = "{\"m\":{\"a\":{\"x\":1}}}";
+    @memcpy(region.bytes[8192..][0..maps.len], maps);
+    arena.reset();
+    const decoded = try wire.decode(zerde.json, Nested, &arena, region.base(), region.bytes[8192..][0..maps.len], .{}, .{ .max_depth = 3, .max_items = 20 });
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.decode(zerde.json, Nested, &arena, region.base(), region.bytes[8192..][0..maps.len], .{}, .{ .max_depth = 2, .max_items = 20 }));
+    out.clearRetainingCapacity();
+    try wire.encode(zerde.json, Nested, &spare, mem, decoded, &out.writer, .{}, .{}, .{ .max_depth = 3, .max_items = 20 });
+    try std.testing.expectEqualStrings(maps, out.written());
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.encode(zerde.json, Nested, &spare, mem, decoded, &out.writer, .{}, .{}, .{ .max_depth = 2, .max_items = 20 }));
+}
+
+test "a scalar list needs no bound for encode, and is held to its max_len" {
+    const Scalars = struct {
+        xs: []const u32,
+        names: []const []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .names = .{ .max_len = 2 } } };
+    };
+    // The scalar list aliases and costs nothing; the list of text is rebuilt (two slices of 16 bytes) and has a bound.
+    try std.testing.expectEqual(@as(usize, 2 * @sizeOf([]const u8) + @alignOf([]const u8) - 1), comptime wire.encodeArenaSize(zerde.json, Scalars, .{}, .{}));
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..4096]);
+    // Everything a span names is in the region.
+    const xs = try build.allocator().dupe(u32, &.{ 1, 2, 3 });
+    const names = [_][]const u8{ try build.allocator().dupe(u8, "a"), try build.allocator().dupe(u8, "b") };
+    const w = try wire.toWire(Scalars, build.allocator(), region.base(), .{ .xs = xs, .names = &names });
+    var spare = std.heap.FixedBufferAllocator.init(region.bytes[4096..][0..1024]);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try wire.encode(zerde.json, Scalars, &spare, region.memory(), w, &out.writer, .{}, .{}, .{});
+    try std.testing.expectEqualStrings("{\"xs\":[1,2,3],\"names\":[\"a\",\"b\"]}", out.written());
+    // The scalar list is not rebuilt, so it is not counted: the two names fill a budget of two.
+    try wire.encode(zerde.json, Scalars, &spare, region.memory(), w, &out.writer, .{}, .{}, .{ .max_items = 2 });
+    try std.testing.expectError(error.TooManyItems, wire.encode(zerde.json, Scalars, &spare, region.memory(), w, &out.writer, .{}, .{}, .{ .max_items = 1 }));
+    var long = w;
+    long.names.len = 3;
+    try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, Scalars, &spare, region.memory(), long, &out.writer, .{}, .{}, .{}));
+    // A scalar list is held to its max_len as well.
+    const Capped = struct {
+        xs: []const u32,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .xs = .{ .max_len = 2 } } };
+    };
+    const capped = try wire.toWire(Capped, build.allocator(), region.base(), .{ .xs = xs });
+    try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, Capped, &spare, region.memory(), capped, &out.writer, .{}, .{}, .{}));
+}
+
+const DepthLeaf = struct {
+    names: []const []const u8,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .names = .{ .max_len = 3 } } };
+};
+
+const DepthLeafChecked = struct {
+    names: []const []const u8,
+    pub const serde = DepthLeaf.serde;
+    pub fn check(self: DepthLeafChecked) !void {
+        _ = self;
+    }
+};
+
+test "a sorted map is one level for the sizes too: what is below it within max_depth is counted" {
+    // The root, the map, the checked struct: three levels. The list of text in it is not a container.
+    const Checked = struct {
+        m: zerde.SortedMap(DepthLeafChecked),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .m = .{ .max_len = 1 } } };
+    };
+    const Plain = struct {
+        m: zerde.SortedMap(DepthLeaf),
+        pub const serde = Checked.serde;
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 100, .max_depth = 3 };
+    try std.testing.expectEqual(
+        3 * @sizeOf([]const u8) + @alignOf([]const u8) - 1,
+        comptime wire.regionSizes(zerde.cbor, Checked, .{}, read).output - wire.regionSizes(zerde.cbor, Plain, .{}, read).output,
+    );
+    // The arena of encode holds the list of text below two maps, at the fifth level: the root, two maps, the struct and its list.
+    const Deep = struct {
+        m: zerde.SortedMap(zerde.SortedMap(DepthLeaf)),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .m = .{ .max_len = 1, .elem = .{ .max_len = 1 } } } };
+    };
+    const text = "{\"m\":{\"a\":{\"b\":{\"names\":[\"x\",\"y\",\"z\"]}}}}";
+    var region: Region = .{};
+    @memcpy(region.bytes[0..text.len], text);
+    var arena = std.heap.FixedBufferAllocator.init(region.bytes[256..][0..4096]);
+    const cfg = .{ .max_string_len = 8, .max_items = 40, .max_depth = 5 };
+    const decoded = try wire.decode(zerde.json, Deep, &arena, region.base(), region.bytes[0..text.len], .{}, cfg);
+    const peak = try rebuildPeak(Deep, zerde.json, cfg, region.memory(), decoded);
+    try std.testing.expect(peak >= 3 * @sizeOf([]const u8));
+    // One entry in each map, and the bounds of the field reach the entries of the map inside (its `elem`): all of it is counted.
+    const outer = @sizeOf(zerde.SortedMap(zerde.SortedMap(DepthLeaf)).Entry) + @alignOf(zerde.SortedMap(zerde.SortedMap(DepthLeaf)).Entry) - 1;
+    const inner = @sizeOf(zerde.SortedMap(DepthLeaf).Entry) + @alignOf(zerde.SortedMap(DepthLeaf).Entry) - 1;
+    const names = 3 * @sizeOf([]const u8) + @alignOf([]const u8) - 1;
+    try std.testing.expectEqual(outer + inner + names, comptime wire.encodeArenaSize(zerde.json, Deep, .{}, cfg));
+    try std.testing.expect(peak <= outer + inner + names);
+}
+
+const EncChoice = union(enum) {
+    pairs: []const EncPair,
+    none,
+    pub const serde = .{ .fields = .{ .pairs = .{ .max_len = 2 } } };
+};
+
+test "encode counts an array and a union as containers, and holds a union's payload and a sorted map's elements to their bounds" {
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..4096]);
+    const mem = region.memory();
+    var spare = std.heap.FixedBufferAllocator.init(region.bytes[4096..][0..8192]);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    // The struct, the array and its element struct: three levels. The same levels a read counts.
+    const Arrayed = struct { pair: [1]EncPair };
+    const arrayed: wire.Wire(Arrayed) = .{ .pair = .{.{ .a = 1, .b = 2 }} };
+    try wire.encode(zerde.json, Arrayed, &spare, mem, arrayed, &out.writer, .{}, .{}, .{ .max_depth = 3 });
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.encode(zerde.json, Arrayed, &spare, mem, arrayed, &out.writer, .{}, .{}, .{ .max_depth = 2 }));
+    try std.testing.expectError(error.JsonNestingTooDeep, zerde.json.parseSliceWith(Arrayed, allocator, "{\"pair\":[{\"a\":1,\"b\":2}]}", .{}, .{ .max_depth = 2 }));
+    // The struct, the union's one-entry map and its payload: three levels.
+    const Chosen = struct { choice: EncChoice };
+    const pairs = try build.allocator().dupe(wire.Wire(EncPair), &.{ .{ .a = 1, .b = 2 }, .{ .a = 3, .b = 4 }, .{ .a = 5, .b = 6 } });
+    const span = try wire.spanOf(region.base(), std.mem.sliceAsBytes(pairs));
+    var chosen: wire.Wire(Chosen) = std.mem.zeroes(wire.Wire(Chosen));
+    chosen.choice.tag = 0;
+    chosen.choice.payload.pairs = .{ .offset = span.offset, .len = 2 };
+    try wire.encode(zerde.json, Chosen, &spare, mem, chosen, &out.writer, .{}, .{}, .{ .max_depth = 4 });
+    try std.testing.expectError(error.JsonNestingTooDeep, wire.encode(zerde.json, Chosen, &spare, mem, chosen, &out.writer, .{}, .{}, .{ .max_depth = 3 }));
+    // The payload is a list of its variant's bound.
+    chosen.choice.payload.pairs.len = 3;
+    try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, Chosen, &spare, mem, chosen, &out.writer, .{}, .{}, .{ .max_depth = 4, .max_items = 10 }));
+    // A sorted map's entries are held to the bound of the field that holds the map, and its values to the `elem` bound.
+    const Nested = struct {
+        m: zerde.SortedMap(zerde.SortedMap(u8)),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .m = .{ .max_len = 2, .elem = .{ .max_len = 2 } } } };
+    };
+    const SmallEntry = zerde.SortedMap(u8).Entry;
+    const LargeEntry = zerde.SortedMap(zerde.SortedMap(u8)).Entry;
+    const keys = try build.allocator().dupe(u8, "abc");
+    const small_entries = try build.allocator().alloc(wire.Wire(SmallEntry), 3);
+    for (small_entries, 0..) |*entry, index| entry.* = .{ .key = try wire.spanOf(region.base(), keys[index..][0..1]), .value = 1 };
+    const small_span = try wire.spanOf(region.base(), std.mem.sliceAsBytes(small_entries));
+    const large_entries = try build.allocator().alloc(wire.Wire(LargeEntry), 3);
+    for (large_entries, 0..) |*entry, index| entry.* = .{ .key = try wire.spanOf(region.base(), keys[index..][0..1]), .value = .{ .entries = .{ .offset = small_span.offset, .len = 1 } } };
+    const large_span = try wire.spanOf(region.base(), std.mem.sliceAsBytes(large_entries));
+    const limits = .{ .max_depth = 8, .max_items = 100 };
+    var maps: wire.Wire(Nested) = .{ .m = .{ .entries = .{ .offset = large_span.offset, .len = 2 } } };
+    try wire.encode(zerde.json, Nested, &spare, mem, maps, &out.writer, .{}, .{}, limits);
+    maps.m.entries.len = 3;
+    try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, Nested, &spare, mem, maps, &out.writer, .{}, .{}, limits));
+    maps.m.entries.len = 2;
+    for (large_entries) |*entry| entry.value.entries.len = 3;
+    try std.testing.expectError(error.LengthOutOfBounds, wire.encode(zerde.json, Nested, &spare, mem, maps, &out.writer, .{}, .{}, limits));
+}
+
+// ---- a Raw validator under a wire read ------------------------------------------------------------------------
+
+/// A validator that allocates `100` bytes and gives them back.
+fn hungry(gpa: std.mem.Allocator, bytes: []const u8) anyerror!void {
+    _ = bytes;
+    const block = try gpa.alloc(u8, 100);
+    gpa.free(block);
+}
+
+fn RawItems(comptime Raw: type, comptime item: anytype) type {
+    return struct {
+        items: []const Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .items = .{ .max_len = 3, .elem = item } } };
+    };
+}
+
+const cbor_pull_bytes = zerde.cbor.pullReaderScratch(.{}, 64);
+const json_pull_bytes = zerde.json.pullReaderScratch(.{}, 64);
+const ProfiledRaws = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = checkMetaCbor, .validate_bytes = cbor_pull_bytes });
+const ValidatedRaws = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = zerde.cbor.validate, .validate_bytes = zerde.cbor.validateScratch(64) });
+const PlainRaws = RawItems(zerde.cbor.Raw, .{ .max_len = 64 });
+const ProfiledJsonRaws = RawItems(zerde.json.Raw, .{ .max_len = 64, .validate = checkMetaJson, .validate_bytes = json_pull_bytes });
+const PlainJsonRaws = RawItems(zerde.json.Raw, .{ .max_len = 64 });
+
+/// A CBOR map of `count` pairs of a one-byte text key and a small integer, in key order.
+fn cborPairs(out: *std.ArrayList(u8), count: u8, comptime chunked: bool) !void {
+    try out.append(allocator, 0xa0 + count);
+    for (0..count) |index| {
+        if (chunked) try out.appendSlice(allocator, &.{ 0x7f, 0x61, 'a' + @as(u8, @intCast(index)), 0xff }) else try out.appendSlice(allocator, &.{ 0x61, 'a' + @as(u8, @intCast(index)) });
+        try out.append(allocator, 0x00);
+    }
+}
+
+/// `{"items": [<each item>]}` as lenient CBOR.
+fn cborItems(items: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, &.{ 0xa1, 0x65, 'i', 't', 'e', 'm', 's', 0x80 + @as(u8, @intCast(items.len)) });
+    for (items) |item| try out.appendSlice(allocator, item);
+    return out.toOwnedSlice(allocator);
+}
+
+/// The least `scratch` in which `decodeInto` of `input` (at the start of `region`) succeeds; every smaller one is `OutOfMemory`.
+fn leastScratch(comptime Format: type, comptime T: type, comptime read: anytype, region: *Region, input_len: usize, output: []u8, scratch: []u8) !usize {
+    var low: usize = 0;
+    var high: usize = scratch.len;
+    while (low < high) {
+        const middle = (low + high) / 2;
+        if (wire.decodeInto(Format, T, output, scratch[0..middle], region.base(), region.bytes[0..input_len], .{}, read)) |_| {
+            high = middle;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            low = middle + 1;
+        }
+    }
+    return low;
+}
+
+/// The least `output` in which `decodeInto` of `input` succeeds, which is what the read takes of it at its peak.
+fn leastOutput(comptime Format: type, comptime T: type, comptime read: anytype, region: *Region, input_len: usize, output: []u8, scratch: []u8) !usize {
+    var low: usize = 0;
+    var high: usize = output.len;
+    while (low < high) {
+        const middle = (low + high) / 2;
+        if (wire.decodeInto(Format, T, output[0..middle], scratch, region.base(), region.bytes[0..input_len], .{}, read)) |_| {
+            high = middle;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            low = middle + 1;
+        }
+    }
+    return low;
+}
+
+/// `input` decodes into `T` in the regions of `regionSizes`, uses of `output` what the same type without a validator uses, and takes of
+/// `scratch` no more than `regionSizes` gives and one byte more than a region one byte smaller fails with.
+fn expectValidatedScratch(comptime Format: type, comptime T: type, comptime Plain: type, comptime read: anytype, input: []const u8) !void {
+    const sizes = comptime wire.regionSizes(Format, T, .{}, read);
+    const plain_sizes = comptime wire.regionSizes(Format, Plain, .{}, read);
+    var region: Region = .{};
+    @memcpy(region.bytes[0..input.len], input);
+    const output = region.bytes[std.mem.alignForward(usize, input.len, 16)..][0..sizes.output];
+    var scratch: [32768]u8 = undefined;
+    const decoded = try wire.decodeInto(Format, T, output, scratch[0..sizes.scratch], region.base(), region.bytes[0..input.len], .{}, read);
+    // The validator took nothing of the output: what the output holds is what it holds without one.
+    const plain = try wire.decodeInto(Format, Plain, output, scratch[0..plain_sizes.scratch], region.base(), region.bytes[0..input.len], .{}, read);
+    try std.testing.expectEqual(plain.used, decoded.used);
+    try std.testing.expect(decoded.used <= sizes.output);
+    // The scratch is at least what the decode takes of it, and no smaller region will do.
+    const peak = try leastScratch(Format, T, read, &region, input.len, output, &scratch);
+    try std.testing.expect(peak <= sizes.scratch);
+    try std.testing.expect(peak > 0);
+    try std.testing.expectError(error.OutOfMemory, wire.decodeInto(Format, T, output, scratch[0 .. peak - 1], region.base(), region.bytes[0..input.len], .{}, read));
+    // And the output needs none of it, not even for the length of a call: the least output that will do is the plain type's.
+    try std.testing.expectEqual(
+        try leastOutput(Format, Plain, read, &region, input.len, output, scratch[0..plain_sizes.scratch]),
+        try leastOutput(Format, T, read, &region, input.len, output, scratch[0..sizes.scratch]),
+    );
+}
+
+test "a validator under decodeInto runs in the scratch region that regionSizes reserves, and the output is as it is without one" {
+    const read = .{ .max_string_len = 64, .max_items = 200 };
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(allocator);
+    try cborPairs(&many, 20, false);
+    var chunked: std.ArrayList(u8) = .empty;
+    defer chunked.deinit(allocator);
+    try cborPairs(&chunked, 12, true);
+    var long_text: std.ArrayList(u8) = .empty;
+    defer long_text.deinit(allocator);
+    try long_text.appendSlice(allocator, &.{ 0xa1, 0x61, 'k', 0x7f });
+    for (0..14) |_| try long_text.appendSlice(allocator, &.{ 0x63, 'a', 'b', 'c' });
+    try long_text.append(allocator, 0xff);
+    const profiled = try cborItems(&.{ many.items, chunked.items, long_text.items });
+    defer allocator.free(profiled);
+    // The README's validator, which reads the item with a pull reader (an object of some 8 KB), and `cbor.validate`.
+    try expectValidatedScratch(zerde.cbor, ProfiledRaws, PlainRaws, read, profiled);
+    try expectValidatedScratch(zerde.cbor, ValidatedRaws, PlainRaws, read, profiled);
+    // Nested maps and a composite key, which `cbor.validate` takes and the pull reader would not.
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(allocator);
+    for (0..20) |_| try nested.appendSlice(allocator, &.{ 0xa1, 0x61, 'x' });
+    try nested.append(allocator, 0x00);
+    var composite: std.ArrayList(u8) = .empty;
+    defer composite.deinit(allocator);
+    try composite.append(allocator, 0xa0 + 15);
+    for (0..15) |index| try composite.appendSlice(allocator, &.{ 0x82, 0x01, @as(u8, @intCast(index)), 0x00 });
+    const adversarial = try cborItems(&.{ nested.items, composite.items, many.items });
+    defer allocator.free(adversarial);
+    try expectValidatedScratch(zerde.cbor, ValidatedRaws, PlainRaws, read, adversarial);
+}
+
+test "a validator under a JSON decodeInto, and the strings a json.Raw decodes, take the scratch region and nothing of the output" {
+    const read = .{ .max_string_len = 64, .max_items = 200 };
+    // Names that need an escape, as many as the 64 bytes hold, in a profile the README validator accepts.
+    const names = "{\"\\n\":1,\"\\t\":2,\"\\r\":3,\"\\b\":4,\"\\f\":5,\"\\\"\":6,\"\\\\\":7,\"\\/\":8,\"a\":9}";
+    try std.testing.expect(names.len <= 64);
+    const escaped_array = comptime blk: {
+        var text: [64]u8 = undefined;
+        text[0] = '"';
+        for (0..30) |index| {
+            text[1 + 2 * index] = '\\';
+            text[2 + 2 * index] = 'n';
+        }
+        text[61] = 'x';
+        text[62] = 'x';
+        text[63] = '"';
+        break :blk text;
+    };
+    const escaped_string: []const u8 = &escaped_array;
+    const unicode_names = "{\"\\u0061\":\"\\n\",\"\\u0062\":\"\\n\",\"\\u0063\":\"\\n\",\"\\u0064\":\"\\n\"}";
+    try std.testing.expect(unicode_names.len <= 64);
+    const input = "{\"items\":[" ++ names ++ "," ++ unicode_names ++ "]}";
+    try expectValidatedScratch(zerde.json, ProfiledJsonRaws, PlainJsonRaws, read, input);
+    // A Raw item with no validator: one escaped string as long as its bound, and one object whose escaped names fill it.
+    try expectValidatedScratch(zerde.json, PlainJsonRaws, PlainJsonRaws, read, "{\"items\":[" ++ escaped_string ++ "]}");
+    try expectValidatedScratch(zerde.json, PlainJsonRaws, PlainJsonRaws, read, "{\"items\":[" ++ names ++ "]}");
+}
+
+test "a validator that allocates more than its validate_bytes fails with OutOfMemory, in every read" {
+    const Hungry = struct {
+        fn Of(comptime Raw: type, comptime bytes: usize) type {
+            return RawItems(Raw, .{ .max_len = 64, .validate = hungry, .validate_bytes = bytes });
+        }
+    };
+    const cbor_input = try cborItems(&.{&.{ 0xa1, 0x61, 'a', 0x00 }});
+    defer allocator.free(cbor_input);
+    const json_input = "{\"items\":[{\"a\":0}]}";
+    const read = .{ .max_string_len = 64, .max_items = 20 };
+    // The typed read takes the block from its allocator and gives it back: the testing allocator checks it.
+    inline for (.{ .{ zerde.cbor, cbor_input }, .{ zerde.json, json_input } }) |case| {
+        const Format = case[0];
+        const Raw = if (Format == zerde.cbor) zerde.cbor.Raw else zerde.json.Raw;
+        const short = Hungry.Of(Raw, 99);
+        const enough = Hungry.Of(Raw, 100);
+        try std.testing.expectError(error.OutOfMemory, Format.parseSlice(short, allocator, case[1]));
+        zerde.free(allocator, try Format.parseSlice(enough, allocator, case[1]));
+        // The wire read runs it in the scratch region that the size reserves, and never writes past it.
+        var region: Region = .{};
+        @memcpy(region.bytes[0..case[1].len], case[1]);
+        const input = region.bytes[0..case[1].len];
+        const output = region.bytes[std.mem.alignForward(usize, input.len, 16)..];
+        var scratch: [16384]u8 = undefined;
+        const enough_sizes = comptime wire.regionSizes(Format, enough, .{}, read);
+        const short_sizes = comptime wire.regionSizes(Format, short, .{}, read);
+        try std.testing.expectEqual(short_sizes.scratch + 1, enough_sizes.scratch);
+        _ = try wire.decodeInto(Format, enough, output[0..enough_sizes.output], scratch[0..enough_sizes.scratch], region.base(), input, .{}, read);
+        try std.testing.expectError(error.OutOfMemory, wire.decodeInto(Format, short, output[0..short_sizes.output], scratch[0..short_sizes.scratch], region.base(), input, .{}, read));
+        // And `decode`, whose one arena is the sum of the two regions.
+        const enough_total = comptime wire.maxArenaSize(Format, enough, .{}, read);
+        const short_total = comptime wire.maxArenaSize(Format, short, .{}, read);
+        var enough_arena = std.heap.FixedBufferAllocator.init(output[0..enough_total]);
+        _ = try wire.decode(Format, enough, &enough_arena, region.base(), input, .{}, read);
+        var short_arena = std.heap.FixedBufferAllocator.init(output[0..short_total]);
+        try std.testing.expectError(error.OutOfMemory, wire.decode(Format, short, &short_arena, region.base(), input, .{}, read));
+    }
+}
+
+test "a validator under a resumable read takes its block from the end of the output, and the output size counts it" {
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 100 };
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(allocator);
+    try cborPairs(&many, 20, false);
+    const input = try cborItems(&.{many.items});
+    defer allocator.free(input);
+    inline for (.{ .{ ProfiledRaws, cbor_pull_bytes }, .{ ValidatedRaws, zerde.cbor.validateScratch(64) } }) |case| {
+        const T = case[0];
+        const sizes = comptime wire.resumableRegionSizes(T, .{}, strict_read);
+        const plain = comptime wire.resumableRegionSizes(PlainRaws, .{}, strict_read);
+        try std.testing.expectEqual(@as(usize, 0), sizes.scratch);
+        var region: Region = .{};
+        // The least output in which the whole decode succeeds, and one byte less is refused.
+        var low: usize = 0;
+        var high: usize = sizes.output;
+        while (low < high) {
+            const middle = (low + high) / 2;
+            var decoder: wire.Resumable(T, .{}, strict_read) = undefined;
+            decoder.init(region.bytes[0..middle], region.base());
+            if (decoder.feed(input)) |_| {
+                high = middle;
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                low = middle + 1;
+            }
+        }
+        // What it takes is the Raw copies and the array, and the validator's block on top of them for the length of one call.
+        var decoder: wire.Resumable(T, .{}, strict_read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        _ = try decoder.feed(input);
+        const used = (try decoder.finish()).used;
+        // The block is exactly what the field states, and the size counts exactly that more than a read without a validator.
+        try std.testing.expectEqual(used + case[1], low);
+        try std.testing.expectEqual(plain.output + case[1], sizes.output);
+        // The block is given back: the output holds what a read without a validator holds.
+        var bare: wire.Resumable(PlainRaws, .{}, strict_read) = undefined;
+        bare.init(region.bytes[0..plain.output], region.base());
+        _ = try bare.feed(input);
+        try std.testing.expectEqual((try bare.finish()).used, used);
+    }
+}
+
+test "a validator that allocates more than its validate_bytes fails with OutOfMemory in a resumable read" {
+    const strict_read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 64, .max_items = 100 };
+    const input = try cborItems(&.{&.{ 0xa1, 0x61, 'a', 0x00 }});
+    defer allocator.free(input);
+    var region: Region = .{};
+    inline for (.{ 99, 100 }) |bytes| {
+        const T = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = hungry, .validate_bytes = bytes });
+        const sizes = comptime wire.resumableRegionSizes(T, .{}, strict_read);
+        var decoder: wire.Resumable(T, .{}, strict_read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        if (bytes == 100) {
+            _ = try decoder.feed(input);
+        } else {
+            try std.testing.expectError(error.OutOfMemory, decoder.feed(input));
+        }
+    }
+    // The same where a text stays in the stream.
+    inline for (.{ 99, 100 }) |bytes| {
+        const T = RawItems(zerde.cbor.Raw, .{ .max_len = 64, .validate = hungry, .validate_bytes = bytes });
+        const sizes = comptime wire.streamRegionSizes(T, .{}, strict_read);
+        var decoder: wire.StreamResumable(T, .{}, strict_read) = undefined;
+        decoder.init(region.bytes[0..sizes.output], region.base());
+        if (bytes == 100) {
+            _ = try decoder.feed(input);
+        } else {
+            try std.testing.expectError(error.OutOfMemory, decoder.feed(input));
+        }
+    }
+}
+
+test "the scratch a validator needs is the growth rule of the arena bounds, and the largest of the validators is counted" {
+    // `growth(n / 2 + 8, 24, 8)` for the key records and `growth(n * levels, 1, 1)` for the canonical bytes of composite keys, the most of
+    // the two; the bytes win once an item can nest: 4 levels of 8 bytes do not, 65 levels of 256 do.
+    try std.testing.expectEqual(@as(usize, 813), zerde.cbor.validateScratch(8));
+    try std.testing.expectEqual(@as(usize, 4908), zerde.cbor.validateScratch(64));
+    try std.testing.expectEqual(@as(usize, 80086), zerde.cbor.validateScratch(256));
+    // A pull reader's own object is the same for every item, and a strict reader keeps nothing else.
+    const object = zerde.cbor.pullReaderScratch(.{}, 64) - zerde.cbor.validateScratch(64) - 64;
+    try std.testing.expect(object > 4096);
+    try std.testing.expectEqual(object, zerde.cbor.pullReaderScratch(.{}, 256) - zerde.cbor.validateScratch(256) - 256);
+    try std.testing.expectEqual(object, zerde.cbor.pullReaderScratch(.{ .mode = zerde.cbor.Mode.strict }, 256));
+    // A shallower reader keeps fewer levels of a composite key.
+    try std.testing.expect(zerde.cbor.pullReaderScratch(.{ .max_depth = 4 }, 256) < zerde.cbor.pullReaderScratch(.{}, 256));
+    // JSON: the names it records (a member takes four bytes) and the strings it decodes, together at most the item.
+    try std.testing.expectEqual(@as(usize, 1700), zerde.json.itemScratch(64));
+    try std.testing.expectEqual(@as(usize, 6202), zerde.json.itemScratch(256));
+    const json_object = zerde.json.pullReaderScratch(.{}, 64) - zerde.json.itemScratch(64);
+    try std.testing.expect(json_object > 1024);
+    try std.testing.expectEqual(json_object, zerde.json.pullReaderScratch(.{}, 256) - zerde.json.itemScratch(256));
+    // The sizes count the largest validator of the type, whichever field or variant it is in.
+    const A = struct {
+        small: zerde.cbor.Raw,
+        large: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+            .small = .{ .max_len = 8, .validate = hungry, .validate_bytes = 10 },
+            .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 },
+        } };
+    };
+    const B = struct {
+        large: zerde.cbor.Raw,
+        small: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{
+            .small = .{ .max_len = 8, .validate = hungry, .validate_bytes = 10 },
+            .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 },
+        } };
+    };
+    const Choice = union(enum) {
+        small: zerde.cbor.Raw,
+        large: zerde.cbor.Raw,
+        pub const serde = .{ .fields = .{
+            .small = .{ .max_len = 8, .validate = hungry, .validate_bytes = 10 },
+            .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 },
+        } };
+    };
+    const Flipped = union(enum) {
+        large: zerde.cbor.Raw,
+        small: zerde.cbor.Raw,
+        pub const serde = Choice.serde;
+    };
+    const Lone = struct {
+        large: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .large = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 } } };
+    };
+    const read = .{ .max_string_len = 8, .max_items = 20 };
+    const lone = comptime wire.regionSizes(zerde.cbor, Lone, .{}, read);
+    inline for (.{ A, B, Choice, Flipped }) |T| {
+        try std.testing.expectEqual(lone.scratch, comptime wire.regionSizes(zerde.cbor, T, .{}, read).scratch);
+    }
+    // A validator that states 0 takes nothing, so a wire read of it needs no more than one without.
+    const Nothing = struct {
+        item: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .item = .{ .max_len = 8, .validate = zerde.cbor.validate, .validate_bytes = 0 } } };
+    };
+    const Bare = struct {
+        item: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .item = .{ .max_len = 8 } } };
+    };
+    try std.testing.expectEqual(comptime wire.regionSizes(zerde.cbor, Bare, .{}, read), comptime wire.regionSizes(zerde.cbor, Nothing, .{}, read));
+}
+
+// ---- a packed struct whose backing integer is inferred ----------------------------------------------------------
+
+const PackedInferred = packed struct { a: u4 = 0, b: u4 = 0 };
+const PackedInferredPadded = packed struct { flag: bool = false, _: u3 = 0, mode: Access = .none, rest: u2 = 0 };
+
+test "a packed struct with an inferred backing integer round trips and is refused as one with a declared one" {
+    try std.testing.expect(wire.Wire(PackedInferred) == u8);
+    try expectPackedRoundTrips(PackedInferred, .{ .a = 5, .b = 9 }, .{ .b = 15 });
+    try expectPackedRoundTrips(PackedInferredPadded, .{ .flag = true, .mode = .write, .rest = 3 }, .{});
+    const Doc = struct { p: PackedInferredPadded };
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Doc, allocator, "{\"p\":2}"));
+    try std.testing.expectError(error.InvalidValue, zerde.json.parseSlice(Doc, allocator, "{\"p\":48}"));
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var region: Region = .{};
+    const memory = region.memory();
+    const good: PackedInferred = .{ .a = 1, .b = 2 };
+    const as_wire = try wire.toWire(PackedInferred, arena_state.allocator(), region.base(), good);
+    try std.testing.expectEqual(@as(u8, 0x21), as_wire);
+    try std.testing.expectEqual(good, try wire.fromWire(PackedInferred, null, arena_state.allocator(), memory, as_wire));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedInferredPadded, null, arena_state.allocator(), memory, 2));
+    try std.testing.expectError(error.InvalidValue, wire.fromWire(PackedInferredPadded, null, arena_state.allocator(), memory, 0x30));
+}
+
+test "a checked struct that holds a text is no fault in a stream read where max_depth does not reach it" {
+    const Checked = struct {
+        name: []const u8,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .name = .{ .max_len = 8 } } };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const Middle = struct {
+        held: Checked,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const Root = struct {
+        middle: Middle,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // The root, the middle and the checked struct are three levels; a read at two never gets to it.
+    const Stream = wire.StreamResumable(Root, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8, .max_depth = 2 });
+    try std.testing.expect(@sizeOf(Stream) > 0);
+}
+
+test "the stream check walk stops at max_depth in a type that recurses" {
+    const Tree = struct {
+        kids: []const @This(),
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .kids = .{ .max_len = 2 } } };
+        pub fn check(self: @This()) !void {
+            _ = self;
+        }
+    };
+    const Stream = wire.StreamResumable(Tree, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 8, .max_depth = 4 });
+    try std.testing.expect(@sizeOf(Stream) > 0);
+}
+
+// ---- a list that draws on the shared budget holds lists of a larger element --------------------------------------
+
+const BudgetBig = struct {
+    x: [512]u8,
+    id: u64 = 0,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+const BudgetSmall = struct {
+    big: []const BudgetBig,
+    pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .big = .{ .max_len = 1 } } };
+};
+const BudgetTop = struct {
+    rows: []const BudgetSmall,
+    pub const serde = .{ .deny_unknown_fields = true };
+};
+
+fn budgetRows(arena: std.mem.Allocator, count: usize) ![]BudgetSmall {
+    const rows = try arena.alloc(BudgetSmall, count);
+    for (rows) |*row| {
+        const big = try arena.alloc(BudgetBig, 1);
+        big[0] = .{ .x = @splat('a'), .id = 5 };
+        row.* = .{ .big = big };
+    }
+    return rows;
+}
+
+test "the lists below a list with no bound of its own are charged at their own element size, for encode" {
+    // Two rows of one 512-byte element each, in a budget of 8 items.
+    const read = .{ .max_string_len = 8, .max_items = 8 };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const value: BudgetTop = .{ .rows = try budgetRows(arena_state.allocator(), 2) };
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..8192]);
+    const w = try wire.toWire(BudgetTop, build.allocator(), region.base(), value);
+    // encode: the rebuild takes the array of two rows and the two arrays of 512 bytes.
+    const bound = comptime wire.encodeArenaSize(zerde.json, BudgetTop, .{}, read);
+    const peak = try rebuildPeak(BudgetTop, zerde.json, read, region.memory(), w);
+    try std.testing.expect(peak >= 2 * 520);
+    try std.testing.expect(peak <= bound);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var spare = std.heap.FixedBufferAllocator.init(region.bytes[8192..][0..bound]);
+    try wire.encode(zerde.json, BudgetTop, &spare, region.memory(), w, &out.writer, .{}, .{}, read);
+}
+
+test "the lists below a list with no bound of its own are charged at their own element size, for decode" {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const value: BudgetTop = .{ .rows = try budgetRows(arena_state.allocator(), 2) };
+    var region: Region = .{};
+    // decode: the value as JSON, in a region of regionSizes. A read also counts the keys and the arrays, so its budget is larger.
+    const read_all = .{ .max_string_len = 600, .max_items = 24 };
+    const sizes = comptime wire.regionSizes(zerde.json, BudgetTop, .{}, read_all);
+    try std.testing.expect(sizes.output >= 2 * 520);
+    var input: std.Io.Writer.Allocating = .init(allocator);
+    defer input.deinit();
+    try zerde.serializeWith(zerde.json, &input.writer, value, .{}, .{});
+    @memcpy(region.bytes[0..input.written().len], input.written());
+    const output = region.bytes[std.mem.alignForward(usize, input.written().len, 16)..][0..sizes.output];
+    var scratch: [64]u8 = undefined;
+    const decoded = try wire.decodeInto(zerde.json, BudgetTop, output, scratch[0..sizes.scratch], region.base(), region.bytes[0..input.written().len], .{}, read_all);
+    try std.testing.expect(decoded.used <= sizes.output);
+    try std.testing.expect(decoded.used >= 2 * 520);
+}
+
+test "a validator below a list with no bound of its own is counted in the scratch" {
+    const Holder = struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .raw = .{ .max_len = 8, .validate = hungry, .validate_bytes = 100 } } };
+    };
+    const Top = struct {
+        rows: []const Holder,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    const lone = comptime wire.regionSizes(zerde.cbor, struct {
+        raw: zerde.cbor.Raw,
+        pub const serde = Holder.serde;
+    }, .{}, .{ .max_string_len = 8, .max_items = 20 });
+    try std.testing.expectEqual(lone.scratch, (comptime wire.regionSizes(zerde.cbor, Top, .{}, .{ .max_string_len = 8, .max_items = 20 })).scratch);
+}
+
+test "the shared budget of a list is charged at the size and alignment of the largest list below it" {
+    // Each budget item is at most one 520-byte element plus its 8-byte alignment, not the 8-byte row that holds the list.
+    inline for (.{ 4, 16, 100 }) |n| {
+        try std.testing.expectEqual(@as(usize, (520 + 8) * n), comptime wire.encodeArenaSize(zerde.json, BudgetTop, .{}, .{ .max_items = n }));
+        // And a decode, whose lists are charged the same, with the slack of the output on top.
+        try std.testing.expectEqual(@as(usize, 528 * n + 256), (comptime wire.regionSizes(zerde.cbor, BudgetTop, .{}, .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 600, .max_items = n })).output);
+    }
+}
+
+test "toWire writes the presence byte 1 and the index of the variant as its tag" {
+    var region: Region = .{};
+    var build = std.heap.FixedBufferAllocator.init(region.bytes[0..1024]);
+    const some = try wire.toWire(?u32, build.allocator(), region.base(), 7);
+    try std.testing.expectEqual(@as(u8, 1), some.present);
+    try std.testing.expectEqual(@as(u32, 7), some.value);
+    try std.testing.expectEqual(@as(u8, 0), (try wire.toWire(?u32, build.allocator(), region.base(), null)).present);
+    const Choice = union(enum) { a: u8, b: u16, c: u32, d };
+    const c = try wire.toWire(Choice, build.allocator(), region.base(), .{ .c = 9 });
+    try std.testing.expectEqual(@as(u8, 2), c.tag);
+    try std.testing.expectEqual(@as(u32, 9), c.payload.c);
+    try std.testing.expectEqual(@as(u8, 3), (try wire.toWire(Choice, build.allocator(), region.base(), .d)).tag);
+}
+
+test "lists that share the budget are charged by the most, not the sum, of what one item of it can cost" {
+    const Big = struct {
+        x: [512]u8,
+        pub const serde = .{ .deny_unknown_fields = true };
+    };
+    // The large bounded list makes the cap generous, so the shared lists are charged by their own figure.
+    const One = struct {
+        a: []const u16,
+        big: []const Big,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .big = .{ .max_len = 1 } } };
+    };
+    const Two = struct {
+        a: []const u16,
+        b: []const u16,
+        big: []const Big,
+        pub const serde = .{ .deny_unknown_fields = true, .fields = .{ .big = .{ .max_len = 1 } } };
+    };
+    const read = .{ .mode = zerde.cbor.Mode.strict, .max_string_len = 8, .max_items = 100 };
+    try std.testing.expectEqual(comptime wire.regionSizes(zerde.cbor, One, .{}, read), comptime wire.regionSizes(zerde.cbor, Two, .{}, read));
 }

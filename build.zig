@@ -385,6 +385,44 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(module_tests).step);
     }
 
+    // A source that must not compile, and the end of the error line that names the rule (the compiler's check is that a line ends
+    // with it, so it ends in the type the message names): `zig build test` fails when the source compiles, or fails for another reason.
+    inline for (.{
+        .{ "tests/compile_fail/packed_union.zig", "the bits may name no value of one of them: packed_union.Bad.view" },
+        .{ "tests/compile_fail/packed_target_sized.zig", "so no field is usize, isize or a C integer type: packed_target_sized.Bad.size" },
+        .{ "tests/compile_fail/packed_enum_target_sized.zig", "no field is an enum of usize, isize or a C integer type: packed_enum_target_sized.Bad.w" },
+        .{ "tests/compile_fail/packed_nested.zig", "so no field is usize, isize or a C integer type: packed_nested.Inner.c" },
+        .{ "tests/compile_fail/packed_bounds.zig", "bounds do not apply to a packed struct, which is one integer: packed_bounds.Flags" },
+        .{ "tests/compile_fail/packed_serde.zig", "and a packed struct is one integer: packed_serde.Renamed" },
+        .{ "tests/compile_fail/packed_wide.zig", "a backing integer of at most 64 bits: packed_wide.Wide" },
+        .{ "tests/compile_fail/stream_check_text.zig", "and this one's struct holds some: stream_check_text.Checked" },
+        .{ "tests/compile_fail/stream_check_list.zig", "and this one's struct holds some: stream_check_list.Checked" },
+        .{ "tests/compile_fail/stream_check_optional.zig", "and this one's struct holds some: stream_check_optional.Checked" },
+        .{ "tests/compile_fail/stream_check_sizes.zig", "and this one's struct holds some: stream_check_sizes.Checked" },
+        .{ "tests/compile_fail/stream_below_array.zig", "and this one's struct holds some: stream_below_array.Checked" },
+        .{ "tests/compile_fail/stream_below_optional.zig", "and this one's struct holds some: stream_below_optional.Checked" },
+        .{ "tests/compile_fail/stream_below_union.zig", "and this one's struct holds some: stream_below_union.Checked" },
+        .{ "tests/compile_fail/stream_check_array.zig", "and this one's struct holds some: stream_check_array.Checked" },
+        .{ "tests/compile_fail/stream_check_union.zig", "and this one's struct holds some: stream_check_union.Checked" },
+        .{ "tests/compile_fail/stream_check_map.zig", "and this one's struct holds some: stream_check_map.Checked" },
+        .{ "tests/compile_fail/stream_check_depth.zig", "and this one's struct holds some: stream_check_depth.Inner" },
+        .{ "tests/compile_fail/stream_check_depth_in.zig", "and this one's struct holds some: stream_check_depth_in.Checked" },
+        .{ "tests/compile_fail/wire_validate_bytes.zig", "so it states how much: set `validate_bytes`, the most bytes it allocates for one item (0 for none)" },
+        .{ "tests/compile_fail/encode_unbounded.zig", "has no bound a decode can rely on: max_items" },
+        .{ "tests/compile_fail/encode_arena_size_unbounded.zig", "has no bound a decode can rely on: max_items" },
+    }) |case| {
+        const compile_fail = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(case[0]),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zerde", .module = tests_root_mod }},
+            }),
+        });
+        compile_fail.expect_errors = .{ .contains = case[1] };
+        test_step.dependOn(&compile_fail.step);
+    }
+
     // The arena bound is computed at comptime in the target's own `usize`, so it is compiled for wasm32 too.
     const wasm_bound = b.addObject(.{
         .name = "wasm-bound",

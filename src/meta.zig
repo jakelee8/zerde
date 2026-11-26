@@ -82,11 +82,104 @@ pub const Bounds = struct {
     /// For a `Raw` field: a function that checks the item (`fn (allocator, bytes) !void`), run after
     /// the read has checked it and its length, with the item's own bytes. Its error is the read's.
     validate: ?*const fn (std.mem.Allocator, []const u8) anyerror!void = null,
+    /// For a `Raw` field with a `validate`: the most bytes the validator allocates for one item. A read runs the validator on a block of
+    /// this size (so one that needs more fails with `error.OutOfMemory`) and gives the block back after the call. A wire read
+    /// (`wire.decodeInto`, `wire.decode`, `wire.Resumable`) must state it, for any validator: `0` for one that allocates nothing.
+    validate_bytes: ?usize = null,
 
     pub fn isDefault(comptime self: Bounds) bool {
         return self.min_len == 0 and self.max_len == std.math.maxInt(usize) and self.min == null and self.max == null and self.elem == null and self.validate == null;
     }
 };
+
+// ---- packed structs -----------------------------------------------------------------------------------------------
+
+/// A `packed struct` is a scalar on the wire of every format: its backing integer (`PackedInt`), as an enum is its number
+/// under `enum_repr = .integer`. Hooks win: a walk tests its hook before it asks this.
+pub fn isPacked(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| info.layout == .@"packed",
+        else => false,
+    };
+}
+
+/// Whether the width of `T` depends on the target: `usize`, `isize` and the C integer types. A wire integer never is, and
+/// neither is the backing integer of a packed struct that goes on the wire.
+pub fn isTargetSized(comptime T: type) bool {
+    return T == usize or T == isize or T == c_short or T == c_ushort or T == c_int or T == c_uint or
+        T == c_long or T == c_ulong or T == c_longlong or T == c_ulonglong or T == c_char;
+}
+
+/// The backing integer of packed struct `T`.
+pub fn PackedInt(comptime T: type) type {
+    return @typeInfo(T).@"struct".backing_integer.?;
+}
+
+/// The serde options that mean something for a struct's members only, which a packed struct does not have.
+const struct_only_options = [_][]const u8{ "rename_all", "fields", "extras", "omit_null_fields", "deny_unknown_fields", "field_order", "declared_in_order" };
+
+/// The compile errors of a packed struct, over each field of it and of each packed struct nested in it.
+pub fn checkPacked(comptime T: type) void {
+    const info = @typeInfo(T).@"struct";
+    if (comptime @hasDecl(T, "serde")) {
+        inline for (struct_only_options) |option| {
+            if (comptime serdeHasField(T, option)) {
+                @compileError("`" ++ option ++ "` applies to the members of a struct, and a packed struct is one integer: " ++ @typeName(T));
+            }
+        }
+    }
+    inline for (info.field_names, info.field_types) |name, FieldType| {
+        switch (@typeInfo(FieldType)) {
+            .@"union" => @compileError("a packed union has no checked form, since its members are views of the same bits and the bits may name no value of one of them: " ++ @typeName(T) ++ "." ++ name),
+            .int => if (isTargetSized(FieldType)) {
+                @compileError("a packed struct on the wire is the same integer on every target, so no field is usize, isize or a C integer type: " ++ @typeName(T) ++ "." ++ name);
+            },
+            .@"enum" => |enum_info| if (isTargetSized(enum_info.tag_type)) {
+                @compileError("a packed struct on the wire is the same integer on every target, so no field is an enum of usize, isize or a C integer type: " ++ @typeName(T) ++ "." ++ name);
+            },
+            .@"struct" => if (isPacked(FieldType)) checkPacked(FieldType),
+            else => {},
+        }
+    }
+}
+
+/// The backing integer of `value`: its bits, as they are.
+pub fn packedToInt(comptime T: type, value: T) PackedInt(T) {
+    comptime checkPacked(T);
+    return @bitCast(value);
+}
+
+/// The packed struct whose bits are `int`, or `error.InvalidValue` for a bit pattern the type does not define: a set bit of a
+/// field named `_`, a field of an exhaustive enum type whose bits name no tag, and the same in a nested packed struct. A field
+/// of an integer, float, bool or non-exhaustive enum type defines every pattern.
+pub fn packedFromInt(comptime T: type, int: PackedInt(T)) error{InvalidValue}!T {
+    comptime checkPacked(T);
+    if (!bitsDefined(T, @bitCast(int))) return error.InvalidValue;
+    // `@bitCast`, since `@backingInt` and `@fromBackingInt` refuse a packed struct whose backing integer is inferred.
+    return @bitCast(int);
+}
+
+fn bitsDefined(comptime T: type, bits: @Int(.unsigned, @bitSizeOf(T))) bool {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |name, FieldType| {
+        const width = @bitSizeOf(FieldType);
+        if (width != 0) {
+            const field_bits: @Int(.unsigned, width) = @truncate(bits >> @bitOffsetOf(T, name));
+            if (comptime std.mem.eql(u8, name, "_")) {
+                if (field_bits != 0) return false;
+            } else switch (@typeInfo(FieldType)) {
+                .@"enum" => |enum_info| if (enum_info.mode == .exhaustive) {
+                    if (std.enums.fromInt(FieldType, @as(enum_info.tag_type, @bitCast(field_bits))) == null) return false;
+                },
+                .@"struct" => if (isPacked(FieldType)) {
+                    if (!bitsDefined(FieldType, field_bits)) return false;
+                },
+                else => {},
+            }
+        }
+    }
+    return true;
+}
 
 /// A format's field order: the order it uses when neither the call site nor the type names one,
 /// and whether it requires that order. A deterministic encoding requires its order, so asking such
@@ -229,7 +322,7 @@ pub fn effectiveFieldKey(comptime T: type, comptime field_name: []const u8, comp
 pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, comptime cfg: anytype) Bounds {
     @setEvalBranchQuota(20_000);
     var bounds: Bounds = .{};
-    inline for (.{ "min_len", "max_len", "min", "max", "validate" }) |option| {
+    inline for (.{ "min_len", "max_len", "min", "max", "validate", "validate_bytes" }) |option| {
         const found: ?@FieldType(Bounds, option) = comptime blk: {
             if (fieldOverrideHas(cfg, field_name, option)) break :blk fieldOverride(cfg, field_name, option);
             if (@hasDecl(T, "serde") and fieldOverrideHas(T.serde, field_name, option)) break :blk fieldOverride(T.serde, field_name, option);
@@ -250,7 +343,7 @@ pub fn effectiveBounds(comptime T: type, comptime field_name: []const u8, compti
 /// The bounds a struct literal states, as `.{ .max_len = 8, .elem = .{ .min = 0 } }`.
 fn boundsOf(comptime attrs: anytype) Bounds {
     var bounds: Bounds = .{};
-    inline for (.{ "min_len", "max_len", "min", "max", "validate" }) |option| {
+    inline for (.{ "min_len", "max_len", "min", "max", "validate", "validate_bytes" }) |option| {
         if (comptime hasField(@TypeOf(attrs), option)) @field(bounds, option) = @field(attrs, option);
     }
     if (comptime hasField(@TypeOf(attrs), "elem")) {

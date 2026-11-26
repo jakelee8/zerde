@@ -107,6 +107,7 @@ When adding invalid fixtures:
 - parser hardening fuzzers seeded from `tests/corpus_invalid/<format>`
 - invalid-input tests that assert parse failure without leaks
 - typed-layer behaviour tests for the formats that carry untrusted bodies (`tests/typed_tests.zig`): byte strings, unions, optional fields, integer keys, strict and lenient input, and duplicate keys
+- compile-fail tests: each source in `tests/compile_fail` must fail to compile, with the error that its entry in the table in `build.zig` ends in. A compile error that a rule raises is tested there; a guard that only a runtime input reaches is tested in `tests/typed_tests.zig`
 
 `tests/mutants.py` removes or weakens one guard at a time and checks that `zig build test` fails. Add a mutant for each new guard. Run `python3 tests/mutants.py` (or `python3 tests/mutants.py 12 13` for selected mutants) before you commit. Do not commit while it runs, because it edits `src/`. `python3 tests/mutants.py --check` lists the patterns that the source no longer contains. CI runs it.
 

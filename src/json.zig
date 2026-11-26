@@ -10,6 +10,7 @@ const diagnostic_mod = @import("diagnostic.zig");
 const typed = @import("typed.zig");
 const meta = @import("meta.zig");
 const bulk = @import("bulk.zig");
+const sizing = @import("sizing.zig");
 const repeat = @import("repeat.zig");
 const Number = typed.Number;
 const StringToken = typed.StringToken;
@@ -768,9 +769,11 @@ pub fn JsonDeserializer(comptime Config: type) type {
 
         /// The next value as the text it was read from, without the whitespace around it.
         pub fn readRaw(self: *Self, allocator: Allocator) !StringToken {
+            // The item is checked, not kept: what it decodes on the way (an escaped string or member name) is the reader's own, as in CBOR.
+            _ = allocator;
             self.parser.skipWhitespace();
             const start = self.parser.index;
-            try self.skipValue(allocator);
+            try self.skipValue(self.allocator);
             return .{ .bytes = self.input[start..self.parser.index], .allocated = false };
         }
 
@@ -1817,6 +1820,23 @@ const ExtraEntry = struct { key_start: usize, key_len: usize, value_start: usize
 /// A member name the deserializer has read: the string literal, quotes included, and whether it has an escape, found once
 /// when it is recorded.
 pub const RecordedKey = struct { literal: []const u8, escaped: bool };
+
+/// The most a read keeps of a fixed buffer while it checks one item of `n` bytes: the name of each member it records for the repeat
+/// check (`RecordedKey`; a member takes four bytes at least, so `n / 4 + 1` of them), and the strings it decodes, an escaped string or
+/// member name. The decoded strings are at most `n` bytes in all, since each is no longer than its escaped text and those do not overlap
+/// in the item, and they are a sum and not the largest: a member name is decoded before its record is added, so once the records
+/// grow past it, freeing the name does not give its bytes back.
+pub fn itemScratch(comptime n: u64) u64 {
+    return sizing.growth(n / 4 + 1, @sizeOf(RecordedKey), @alignOf(RecordedKey)) + n;
+}
+
+/// The most a validator takes of a fixed buffer when it reads one item of `n` bytes with `pullReader(allocator, bytes, cfg)`: the reader's
+/// own object, which is large (the container stack), and `itemScratch`.
+pub fn pullReaderScratch(comptime cfg: anytype, comptime n: u64) u64 {
+    comptime checkLimits(cfg);
+    const object = @sizeOf(JsonDeserializer(@TypeOf(cfg))) + @alignOf(JsonDeserializer(@TypeOf(cfg))) - 1;
+    return object + itemScratch(n);
+}
 
 fn recordedKey(literal: []const u8) RecordedKey {
     return .{ .literal = literal, .escaped = std.mem.indexOfScalar(u8, literal, '\\') != null };

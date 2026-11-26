@@ -25,6 +25,10 @@
 - `sliceDeserializer` and `readerDeserializer` of CBOR, JSON, MessagePack and BSON allocate while reading. A caller that uses one directly must call `deinit`, also for borrowed input. `parseSlice*`, `deserialize*` and `value.parse*` already do.
 - `cbor.CborSerializer` takes a second comptime parameter after `Config`: `deterministic`. `cbor.serializer` builds the type from the write config.
 - A field `rename` that is not valid UTF-8 is a compile error.
+- A `Raw` field's `validate` under a wire read (`wire.decode`, `wire.decodeInto`, `wire.Resumable`, `wire.StreamResumable`) needs the new field option `validate_bytes`, the most bytes the validator allocates for one item, and is a compile error without it; use `0` for a validator that allocates nothing. A typed read is unchanged unless it states `validate_bytes`.
+- A struct with a `check` that holds a text or byte string is a compile error under `wire.StreamResumable` itself, and under `streamRegionSizes`: the string stays in the stream and the check read output bytes at its stream offset (or got `error.OffsetOutOfRange`) instead of the text. A `Raw` and a sorted map's key are copied into the output and keep working.
+- `wire.encode` takes the read config of a decode of the same type as a new last comptime parameter, `read_cfg`, and holds its rebuild to that read's limits (`error.LengthOutOfBounds`, `error.TooManyItems`, the format's nesting error). Every list that is not a list of scalars needs a bound for it (a field's `max_len`, or `max_items` in `read_cfg`): a compile error otherwise. `wire.fromWire` takes a new second parameter, `limited`: `null` for what it did, or `wire.Limited(Format, serde_cfg, read_cfg)`.
+- `reflect.Kind` has a new value, `.@"packed"`, so a `switch` over every value of it no longer compiles until it handles it.
 
 ### Added
 
@@ -70,9 +74,22 @@
 - `zerde.wire`: `Wire(T)`, a fixed-layout (C) type generated from a schema type. It uses `Span`, `Opt` and tagged unions as `{ tag, payload }`. A bool is a `u8` checked as 0 or 1. An enum is an 8-, 16-, 32- or 64-bit integer. The module provides `decode`, `encode`, `toWire`, `fromWire`, `describe`, `Hooked(T)` and `HookedWith`.
   - `decode` reads straight into `Wire(T)` from one `*std.heap.FixedBufferAllocator`, which it restores on an error.
   - `fromWire` and `encode` take a `wire.Memory` and reject a span that is outside it, misaligned or overflowing (`Memory.resolve`).
+- `wire.encodeArenaSize(Format, T, serde_cfg, read_cfg)` is the size of the arena that `wire.encode` needs for any wire value it accepts, and `wire.Limited` holds a rebuild to a read's limits. The arena of `encode` had no size function, and a wire value the caller built was bound by no limit (a list could be longer than its `max_len`, spans could alias, a span could name its own container).
 - `wire.maxArenaSize(Format, T, ...)` is a compile-time upper bound, computed in 64 bits, on what `decode` allocates. `decode` rejects text over twice `max_input_bytes` (`error.InputTooLarge`).
 - `wire.decodeInto(Format, T, output, scratch, base, input, serde_cfg, format_cfg)` decodes into caller byte regions without an allocator. `wire.regionSizes` gives their sizes at compile time.
 - `zerde.typed` is exported: the typed walk, generic over a sink. `typed.TypedSink` builds the Zig value and `wire.WireSink` builds the fixed layout.
+
+#### Packed structs
+
+- A `packed struct` is one integer, its backing integer, in every format and in `wire.Wire(T)` (widened to 8, 16, 32 or 64 bits, with its signedness). It was read as a struct of its fields, so a field of the type could not be read and `Wire(T)` did not compile for a type that held one. A read refuses a pattern the type does not define with `error.InvalidValue` (a set `_` bit, an exhaustive enum field that names no tag, the same in a nested packed struct); a number too wide for the backing integer is `error.IntegerOverflow`. `wire.fromWire` refuses with `error.InvalidValue` (`wire.Error`). The type's own `check` runs after the read. Hooks win.
+- A packed struct with a `packed union` field, or with a `usize`, `isize`, C integer or enum-of-those field (in it or in a packed struct nested in it), is a compile error, as is a backing integer of more than 64 bits on the wire, a bound on a field that holds one, and a struct-only option (`rename_all`, `fields`, `extras`, `omit_null_fields`, `deny_unknown_fields`, `field_order`, `declared_in_order`) in the packed type's `serde`.
+- `reflect.kindOf` gives `.@"packed"` and `reflect.backing(T)` its integer type.
+- `zig build test` compiles the sources in `tests/compile_fail` and expects each to fail with the error its table in `build.zig` names.
+
+#### Raw validators
+
+- `serde.fields.<f>` option `validate_bytes` (with `validate`): the most bytes a `Raw` validator allocates for one item. Every read runs the validator on a block of that size taken from its allocator and given back after the call, so a validator that needs more fails with `error.OutOfMemory`, also in a typed read. A wire read takes the block from the reader's scratch region (`decodeInto`, `decode`) or from the end of the output (`Resumable`, `StreamResumable`), and `regionSizes`, `resumableRegionSizes`, `streamRegionSizes` and `maxArenaSize` count the largest one.
+- `cbor.validateScratch(n)`, `cbor.pullReaderScratch(cfg, n)` and `json.pullReaderScratch(cfg, n)` are the bytes that `cbor.validate`, and a validator that reads an item of at most `n` bytes with `cbor.pullReader` or `json.pullReader`, take. They use the list-growth rule of the arena bounds (`sizing.growth`), as `.raw` fields do. `cbor.itemScratch` and `json.itemScratch` are the terms of a lenient CBOR and a JSON `Raw` that the size functions use.
 
 #### Chunked and windowed I/O
 
@@ -104,6 +121,10 @@
 - Named `ReadConfig` values (`json.ReadConfig{ .borrow_strings = true }`) compile. Only anonymous literals did.
 - BSON: a dynamic `Value` can be read from a document. The root had no kind.
 - The ZON reader freed memory twice when a document had compile errors.
+- The rebuild walks that the sizes use (`check` and `encode`) count a sorted map as one container, as a read does, and apply the `elem` bound of the field that holds it to each entry's value. A struct with a `check` below a sorted map, at `max_depth`, was missed.
+- Under a wire decode a `Raw` validator ran with the output region as its allocator, which no size counted: the README's own validator (a pull reader is some 8 KB) failed on the first item with `error.OutOfMemory`. It now runs on a block of `validate_bytes` from the scratch region, or from the end of the output in a resumable read. `json.Raw` decoded an escaped string or member name into the output as it checked it; it now uses the reader's memory, as `cbor.Raw` does, and the JSON scratch size counts those strings.
+- The arena bound of a list that draws on the shared `max_items` budget (`regionSizes`, `maxArenaSize`, the resumable sizes, `encodeArenaSize`) ignored the element size of the lists nested below it, so a larger nested list could exceed the bound; it also dropped the largest `validate_bytes` below such a list. Both are counted now.
+- The documented bound of a wire decode (`wire.regionSizes`, `resumableRegionSizes`, `streamRegionSizes`, `maxArenaSize`) was not enough for a type with a struct `check`. The check runs on a typed copy that the sink rebuilds in the output region once the read has filled it, and no size counted that rebuild (a list of non-scalar elements can take twice its wire size). Each size now adds the largest rebuild over the structs with a `check`, so a region of the documented size is enough; the sizes grow for such a type. A stream read checked the wrong bytes of a text that stays in the stream; see Breaking.
 
 ## 0.1.0
 

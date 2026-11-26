@@ -90,7 +90,7 @@ fn longestKey(comptime T: type, comptime cfg: anytype, comptime path: []const ty
         var longest: usize = 0;
         switch (@typeInfo(T)) {
             .@"struct" => |info| {
-                if (typed.isRaw(T) or T == typed.ByteString) break :blk 0;
+                if (typed.isRaw(T) or T == typed.ByteString or meta.isPacked(T)) break :blk 0;
                 for (info.field_types) |FieldType| longest = @max(longest, longestKey(FieldType, cfg, inner));
                 longest = @max(longest, typed.longestFieldName(T, cfg));
             },
@@ -134,7 +134,7 @@ fn wrapFrames(comptime T: type) usize {
         },
         .array => |info| if (info.child == u8) 0 else 1,
         .@"union" => 1,
-        .@"struct" => if (typed.isRaw(T) or T == typed.ByteString) 0 else 1,
+        .@"struct" => if (typed.isRaw(T) or T == typed.ByteString or meta.isPacked(T)) 0 else 1,
         else => 0,
     };
 }
