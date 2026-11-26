@@ -29,6 +29,7 @@
 - A struct with a `check` that holds a text or byte string is a compile error under `wire.StreamResumable` itself, and under `streamRegionSizes`: the string stays in the stream and the check read output bytes at its stream offset (or got `error.OffsetOutOfRange`) instead of the text. A `Raw` and a sorted map's key are copied into the output and keep working.
 - `wire.encode` takes the read config of a decode of the same type as a new last comptime parameter, `read_cfg`, and holds its rebuild to that read's limits (`error.LengthOutOfBounds`, `error.TooManyItems`, the format's nesting error). Every list that is not a list of scalars needs a bound for it (a field's `max_len`, or `max_items` in `read_cfg`): a compile error otherwise. `wire.fromWire` takes a new second parameter, `limited`: `null` for what it did, or `wire.Limited(Format, serde_cfg, read_cfg)`.
 - `reflect.Kind` has a new value, `.@"packed"`, so a `switch` over every value of it no longer compiles until it handles it.
+- `Diagnostic.pushField`, `pushIndex` and `pop` are removed. A path longer than 64 segments now keeps its innermost segments and prints `root[...]` before them.
 
 ### Added
 
@@ -68,6 +69,7 @@
 - `cbor.valueWriter` and `json.valueWriter`: writers for runtime-defined values with `writeEvent`. CBOR lengths are definite. Maps are sorted on close (CBOR deterministic: encoded-key order; JSON: length-first `sort_keys`). A repeated key gives `error.DuplicateField`.
 - `max_container_bytes` for both value writers (unbounded by default) limits the output one open container buffers. A write or close past it gives `error.ContainerTooLarge`, before any allocation.
 - Wire-type hooks `zerdeDecode` (over a pull reader), `zerdeEncode` and `zerdeFree` for CBOR and JSON. `zerdeEncode` receives a streaming `Encoder` that enforces its stated lengths, nesting, UTF-8 and, when deterministic, ascending keys. An unfinished hook gives `error.HookIncomplete`. `zerde.free` leaves a type with a hook and no `zerdeFree` alone.
+- `Diagnostic.detail` (`zerde.DiagnosticDetail`, `zerde.DiagnosticKind`) gives the expected and found kind, the bounds or range, or the missing, duplicate or unknown field; for JSON and CBOR a value's failure points at the value's first byte.
 
 #### Fixed-layout decoding
 

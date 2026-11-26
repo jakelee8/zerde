@@ -29,6 +29,30 @@ The current large case produces a JSON document of about `107.58 MiB`.
 
 Runs before `8a3a0a9` used the older simpler payload, so they are not directly comparable to the newer mixed-payload runs.
 
+## 2026-11-26 - f785b34
+
+Changes since previous run: diagnostics carry a detail (expected and found kind, bounds, range, field names), and in a diagnostic parse the field path is recorded as an error unwinds instead of pushed and popped around every field and element. The `parse zerde diag` row (`parseSliceWithDiagnostics`, borrowed strings) is new in this run; the base has it too.
+
+Base is `2d9901b` (the commit that adds the `parse zerde diag` row); tip is `f785b34`. Environment: `Linux x86_64` (WSL2, 24 cores, AMD Ryzen 9 9900X, AVX-512, shared), Zig `0.17.1`. Command: `zig build bench-json -Doptimize=ReleaseFast`, three rounds, each running base then tip, load 1.5 to 3.6. The `std.json` rows are the control. The last column is tip over base, run by run.
+
+| Scenario | Row | Base ns/op (3 runs) | Tip ns/op (3 runs) | Tip / base |
+| --- | --- | ---: | ---: | ---: |
+| small | parse zerde | 4,570 / 4,603 / 4,247 | 4,748 / 4,734 / 4,596 | 1.03 to 1.08 |
+| small | parse zerde diag | 4,578 / 4,661 / 4,184 | 4,715 / 4,409 / 4,629 | 0.95 to 1.11 |
+| small | parse std.json | 8,489 / 8,653 / 8,028 | 9,271 / 8,763 / 8,470 | 1.01 to 1.09 |
+| medium | parse zerde | 1,381,450 / 1,355,524 / 1,298,032 | 1,427,362 / 1,367,278 / 1,347,096 | 1.01 to 1.04 |
+| medium | parse zerde diag | 1,345,114 / 1,365,333 / 1,326,511 | 1,398,572 / 1,287,713 / 1,296,579 | 0.94 to 1.04 |
+| medium | parse std.json | 2,440,861 / 2,445,364 / 2,546,778 | 2,457,838 / 2,444,645 / 2,469,156 | 0.97 to 1.01 |
+| large | parse zerde | 138,023,964 / 142,966,855 / 136,347,437 | 144,363,939 / 148,552,043 / 136,083,509 | 1.00 to 1.05 |
+| large | parse zerde diag | 134,421,115 / 153,392,086 / 133,107,967 | 141,666,730 / 148,700,908 / 133,352,386 | 0.97 to 1.05 |
+| large | parse std.json | 253,774,402 / 259,807,048 / 257,670,056 | 247,607,730 / 256,546,224 / 245,190,108 | 0.95 to 0.99 |
+
+Notes:
+
+- Rule: the tip's median is at most the base's median plus the base's spread (max minus min of its three runs). Every `parse zerde` and `parse zerde diag` row passes.
+- `parse zerde` (no diagnostics) is 1.00 to 1.08 of the base in all nine runs, medians 1.01 to 1.05; the `std.json` control moves 0.95 to 1.09 in the same runs, so a cost of a few percent on the untracked JSON path is not ruled out at this resolution.
+- `parse zerde diag` is 0.94 to 1.11 of the base: recording the path on unwind costs about what the push and pop did.
+
 ## 2026-11-25 - 4542079
 
 Changes since previous run: on targets with 64-byte vectors, the string scan takes two 32-byte steps before it switches to 64-byte steps. Most strings in this payload end within the first step.

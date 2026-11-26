@@ -249,7 +249,12 @@ pub fn deserializeWithDiagnostics(
     diagnostics: ?*diagnostic_mod.Diagnostic,
 ) anyerror!T {
     var result: T = undefined;
-    try deserializeValue(TypedSink{}, T, &result, allocator, deserializer, cfg, diagnostics, true, NoRead{});
+    const at = startOf(deserializer, true);
+    deserializeValue(TypedSink{}, T, &result, allocator, deserializer, cfg, diagnostics, true, NoRead{}) catch |err| {
+        noteFailure(T, cfg, .{}, deserializer, diagnostics.?, at, err);
+        diagnostics.?.finishPath();
+        return err;
+    };
     return result;
 }
 
@@ -1625,14 +1630,14 @@ fn deserializeStruct(
                         defer key.deinit(allocator);
                         try deserializer.captureExtra(allocator, key.bytes);
                     } else {
-                        if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
+                        if (meta.effectiveDenyUnknownFields(T, cfg)) return unknownField(allocator, deserializer, null, diagnostics, track_diagnostics);
                         try deserializer.skipValue(allocator);
                     }
                 },
                 .field_index => |field_index| {
                     inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
                         if (field_index == i) {
-                            if (seen[i]) return error.DuplicateField;
+                            if (seen[i]) return duplicateField(field_name, diagnostics, track_diagnostics);
                             try deserializeStructField(s, T, field_name, field_type, &@field(dest.*, field_name), allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
                             seen[i] = true;
                         }
@@ -1642,7 +1647,7 @@ fn deserializeStruct(
         }
 
         if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, dest, &seen);
-        try fillMissingFields(s, T, info, cfg, allocator, dest, &seen);
+        try fillMissingFields(s, T, info, cfg, allocator, dest, &seen, diagnostics, track_diagnostics);
         try s.check(T, allocator, dest);
         return;
     }
@@ -1653,7 +1658,7 @@ fn deserializeStruct(
         if (matchStructFieldIndexInfo(T, info, cfg, object_field.bytes)) |field_index| {
             inline for (info.field_names, info.field_types, 0..) |struct_field_name, field_type, i| {
                 if (field_index == i) {
-                    if (seen[i]) return error.DuplicateField;
+                    if (seen[i]) return duplicateField(struct_field_name, diagnostics, track_diagnostics);
                     try deserializeStructField(s, T, struct_field_name, field_type, &@field(dest.*, struct_field_name), allocator, deserializer, cfg, diagnostics, track_diagnostics, rc);
                     seen[i] = true;
                 }
@@ -1663,14 +1668,14 @@ fn deserializeStruct(
                 try deserializer.captureExtra(allocator, object_field.bytes);
             } else {
                 // Unknown-field policy also lives at the typed layer so every format behaves the same way.
-                if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
+                if (meta.effectiveDenyUnknownFields(T, cfg)) return unknownField(allocator, deserializer, object_field.bytes, diagnostics, track_diagnostics);
                 try deserializer.skipValue(allocator);
             }
         }
     }
 
     if (comptime extras_name != null) try storeExtras(s, T, info, allocator, deserializer, extras_mark, dest, &seen);
-    try fillMissingFields(s, T, info, cfg, allocator, dest, &seen);
+    try fillMissingFields(s, T, info, cfg, allocator, dest, &seen, diagnostics, track_diagnostics);
     try s.check(T, allocator, dest);
 }
 
@@ -1789,7 +1794,7 @@ fn mergeStruct(
         switch (try deserializer.nextObjectFieldIndex(T, cfg)) {
             .end => break,
             .unknown => {
-                if (meta.effectiveDenyUnknownFields(T, cfg)) return error.UnknownField;
+                if (meta.effectiveDenyUnknownFields(T, cfg)) return unknownField(allocator, deserializer, null, diagnostics, track_diagnostics);
                 try deserializer.skipValue(allocator);
             },
             .field_index => |field_index| {
@@ -1797,7 +1802,7 @@ fn mergeStruct(
                     if (field_index == i) {
                         inline for (0..i) |absent| {
                             if (absent >= cursor) {
-                                try fillField(s, T, info, cfg, allocator, dest, absent);
+                                try fillFieldTracked(s, T, info, cfg, allocator, dest, absent, diagnostics, track_diagnostics);
                                 cursor = absent + 1;
                             }
                         }
@@ -1810,7 +1815,7 @@ fn mergeStruct(
     }
     inline for (0..info.field_names.len) |i| {
         if (i >= cursor) {
-            try fillField(s, T, info, cfg, allocator, dest, i);
+            try fillFieldTracked(s, T, info, cfg, allocator, dest, i, diagnostics, track_diagnostics);
             cursor = i + 1;
         }
     }
@@ -1897,7 +1902,7 @@ pub fn deserializeStructField(
         const level: *ReadLevel = if (comptime @TypeOf(rc) != NoRead) rc.enter() else &local;
         defer if (comptime @TypeOf(rc) != NoRead) rc.leave();
         if (level.phase == 0) {
-            if (try deserializer.peekKind() == .null) return error.UnexpectedType;
+            if (try deserializer.peekKind() == .null) return refuseNull(FieldType, cfg, field_name, deserializer, diagnostics, track_diagnostics);
             level.phase = 1;
         }
         try deserializeFieldValue(s, FieldType, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, field_name, bounds, rc);
@@ -1917,9 +1922,11 @@ fn fillMissingFields(
     allocator: Allocator,
     result: *@TypeOf(s).Of(T),
     seen: *const [info.field_names.len]bool,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track: bool,
 ) anyerror!void {
     inline for (0..info.field_names.len) |i| {
-        if (!seen[i]) try fillField(s, T, info, cfg, allocator, result, i);
+        if (!seen[i]) try fillFieldTracked(s, T, info, cfg, allocator, result, i, diagnostics, track);
     }
 }
 
@@ -1970,9 +1977,14 @@ pub fn deserializeElement(
 ) anyerror!void {
     if (comptime bounds.elem == null) return deserializeIndexedValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, index, rc);
     const elem = comptime bounds.elem.?;
-    if (track_diagnostics) diagnostics.?.pushIndex(index);
-    deserializeBounded(s, T, elem.*, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| return err;
-    if (track_diagnostics) diagnostics.?.pop();
+    const at = startOf(deserializer, track_diagnostics);
+    deserializeBounded(s, T, elem.*, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| {
+        if (track_diagnostics) {
+            noteFailure(T, cfg, elem.*, deserializer, diagnostics.?, at, err);
+            diagnostics.?.unwindIndex(index);
+        }
+        return err;
+    };
 }
 
 pub fn deserializeIndexedValue(
@@ -1987,9 +1999,14 @@ pub fn deserializeIndexedValue(
     index: usize,
     rc: anytype,
 ) anyerror!void {
-    if (track_diagnostics) diagnostics.?.pushIndex(index);
-    deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| return err;
-    if (track_diagnostics) diagnostics.?.pop();
+    const at = startOf(deserializer, track_diagnostics);
+    deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc) catch |err| {
+        if (track_diagnostics) {
+            noteFailure(T, cfg, .{}, deserializer, diagnostics.?, at, err);
+            diagnostics.?.unwindIndex(index);
+        }
+        return err;
+    };
 }
 
 /// Whether the field has a `max_len`.
@@ -2069,12 +2086,181 @@ pub fn deserializeFieldValue(
     comptime bounds: meta.Bounds,
     rc: anytype,
 ) anyerror!void {
-    if (track_diagnostics) diagnostics.?.pushField(field_name);
+    const at = startOf(deserializer, track_diagnostics);
     (if (comptime bounds.isDefault())
         deserializeValue(s, T, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)
     else
-        deserializeBounded(s, T, bounds, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)) catch |err| return err;
-    if (track_diagnostics) diagnostics.?.pop();
+        deserializeBounded(s, T, bounds, dest, allocator, deserializer, cfg, diagnostics, track_diagnostics, rc)) catch |err| {
+        if (track_diagnostics) {
+            noteFailure(T, cfg, bounds, deserializer, diagnostics.?, at, err);
+            diagnostics.?.unwindField(field_name);
+        }
+        return err;
+    };
+}
+
+/// Where a value starts, kept for a diagnostic: an offset when the read tracks diagnostics and the format can describe a value.
+fn Start(comptime D: type, comptime track: bool) type {
+    return if (track and @hasDecl(D, "valueAt")) usize else void;
+}
+
+fn startOf(deserializer: anytype, comptime track: bool) Start(@TypeOf(deserializer.*), track) {
+    return if (comptime Start(@TypeOf(deserializer.*), track) == void) {} else deserializer.errorOffset();
+}
+
+/// The kinds of input value a read of `T` accepts, as a diagnostic names them.
+fn expectedKinds(comptime T: type, comptime cfg: anytype, comptime D: type) diagnostic_mod.KindSet {
+    const Set = diagnostic_mod.KindSet;
+    if (hasHook(T, "zerdeDecode")) return .full;
+    // A packed struct is read as its backing integer.
+    if (meta.isPacked(T)) return Set.initOne(.integer);
+    return switch (@typeInfo(T)) {
+        .bool => Set.initOne(.bool),
+        .int => Set.initOne(.integer),
+        .float => Set.initMany(&.{ .integer, .float }),
+        .optional => |info| expectedKinds(info.child, cfg, D).unionWith(Set.initOne(.null)),
+        .@"enum" => if (meta.effectiveEnumRepr(T, cfg) == .integer) Set.initOne(.integer) else Set.initMany(&.{ .string, .integer }),
+        .@"union" => |info| if (unionHasIntegerKeys(T, info, cfg)) Set.initMany(&.{ .string, .object, .integer }) else Set.initMany(&.{ .string, .object }),
+        .array => |info| if (info.child == u8) bytesKinds(D) else Set.initOne(.array),
+        .pointer => |info| switch (info.size) {
+            .slice => if (info.child == u8) Set.initOne(.string) else Set.initOne(.array),
+            .one => expectedKinds(info.child, cfg, D),
+            else => .full,
+        },
+        .@"struct" => |info| if (T == ByteString)
+            bytesKinds(D)
+        else if (isRaw(T) or info.is_tuple)
+            .full
+        else
+            Set.initOne(.object),
+        else => .full,
+    };
+}
+
+/// Bytes are a byte string where the format has one, and text where it does not.
+fn bytesKinds(comptime D: type) diagnostic_mod.KindSet {
+    return diagnostic_mod.KindSet.initOne(if (@hasDecl(D, "readBytes")) .bytes else .string);
+}
+
+/// The integer type a value out of range was read into: `T`, or the child of an optional `T`.
+fn intOf(comptime T: type) ?type {
+    return switch (@typeInfo(T)) {
+        .int => T,
+        .optional => |info| if (@typeInfo(info.child) == .int) info.child else null,
+        else => null,
+    };
+}
+
+/// Records what a failed read of `T` that started at `at` tells: the expected and found kinds, the bounds or range, and
+/// where the value starts. The innermost failure wins; outer wrappers only add path segments.
+fn noteFailure(
+    comptime T: type,
+    comptime cfg: anytype,
+    comptime bounds: meta.Bounds,
+    deserializer: anytype,
+    d: *diagnostic_mod.Diagnostic,
+    at: anytype,
+    err: anyerror,
+) void {
+    @branchHint(.cold);
+    if (d.detail != .none or d.location.offset != null) return;
+    const D = @TypeOf(deserializer.*);
+    const describes = comptime @hasDecl(D, "valueAt");
+    switch (err) {
+        error.UnexpectedType, error.UnexpectedToken, error.InvalidNumber => if (comptime describes) {
+            const found = deserializer.valueAt(at);
+            const kind = found.kind orelse return;
+            const expected = comptime expectedKinds(T, cfg, D);
+            if (expected.contains(kind)) return;
+            d.detail = .{ .type_mismatch = .{ .expected = expected, .found = kind } };
+            d.location.offset = found.offset;
+        },
+        error.UnexpectedTag => if (comptime describes) {
+            // Only a tag at the head of this value is its own; a strict read refuses 55799 too, which `kind` reads through.
+            if (!deserializer.valueAt(at).tagged) return;
+            const expected = comptime expectedKinds(T, cfg, D);
+            if (expected.contains(.tag)) return;
+            d.detail = .{ .type_mismatch = .{ .expected = expected, .found = .tag } };
+            d.location.offset = at;
+        },
+        error.LengthOutOfBounds => if (comptime (bounds.min_len != 0 or bounds.max_len != std.math.maxInt(usize))) {
+            d.detail = .{ .length_out_of_bounds = .{ .min_len = bounds.min_len, .max_len = bounds.max_len } };
+            if (comptime describes) d.location.offset = deserializer.valueAt(at).offset;
+        },
+        error.ValueOutOfRange => if (comptime (bounds.min != null or bounds.max != null)) {
+            d.detail = .{ .value_out_of_range = .{ .min = bounds.min, .max = bounds.max } };
+            if (comptime describes) d.location.offset = deserializer.valueAt(at).offset;
+        },
+        error.IntegerOverflow => if (comptime intOf(T)) |I| {
+            d.detail = .{ .value_out_of_range = .{ .min = std.math.cast(i128, std.math.minInt(I)), .max = std.math.cast(i128, std.math.maxInt(I)) } };
+            if (comptime describes) d.location.offset = deserializer.valueAt(at).offset;
+        },
+        error.InvalidEnumTag => if (comptime describes) {
+            d.location.offset = deserializer.valueAt(at).offset;
+        },
+        else => {},
+    }
+}
+
+/// A field with the `.absent` policy refuses null before its value is read, so it names itself in the path here.
+inline fn refuseNull(
+    comptime FieldType: type,
+    comptime cfg: anytype,
+    comptime field_name: []const u8,
+    deserializer: anytype,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track: bool,
+) error{UnexpectedType} {
+    if (track) {
+        const D = @TypeOf(deserializer.*);
+        if (comptime @hasDecl(D, "valueAt")) {
+            const found = deserializer.valueAt(deserializer.errorOffset());
+            diagnostics.?.detail = .{ .type_mismatch = .{ .expected = comptime expectedKinds(@typeInfo(FieldType).optional.child, cfg, D), .found = .null } };
+            diagnostics.?.location.offset = found.offset;
+        }
+        diagnostics.?.unwindField(field_name);
+    }
+    return error.UnexpectedType;
+}
+
+inline fn duplicateField(comptime name: []const u8, diagnostics: ?*diagnostic_mod.Diagnostic, comptime track: bool) error{DuplicateField} {
+    if (track) diagnostics.?.detail = .{ .duplicate_field = name };
+    return error.DuplicateField;
+}
+
+/// An undeclared key under `deny_unknown_fields`; `known` is its text when the caller has it.
+inline fn unknownField(allocator: Allocator, deserializer: anytype, known: ?[]const u8, diagnostics: ?*diagnostic_mod.Diagnostic, comptime track: bool) error{UnknownField} {
+    if (track) {
+        const d = diagnostics.?;
+        d.detail = .unknown_field;
+        if (known) |bytes| {
+            d.setKey(bytes);
+        } else if (comptime @hasDecl(@TypeOf(deserializer.*), "unknownKey")) {
+            // A key that is not text (a CBOR integer key) has no text to report.
+            if (deserializer.unknownKey(allocator)) |key| {
+                d.setKey(key.bytes);
+                key.deinit(allocator);
+            } else |_| {}
+        }
+    }
+    return error.UnknownField;
+}
+
+inline fn fillFieldTracked(
+    s: anytype,
+    comptime T: type,
+    comptime info: std.builtin.Type.Struct,
+    comptime cfg: anytype,
+    allocator: Allocator,
+    result: *@TypeOf(s).Of(T),
+    comptime i: usize,
+    diagnostics: ?*diagnostic_mod.Diagnostic,
+    comptime track: bool,
+) anyerror!void {
+    fillField(s, T, info, cfg, allocator, result, i) catch |err| {
+        if (track and err == error.MissingField) diagnostics.?.detail = .{ .missing_field = info.field_names[i] };
+        return err;
+    };
 }
 
 /// Index of the field whose wire key is the text `actual`.

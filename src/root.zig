@@ -33,6 +33,8 @@ pub const SerdeConfig = meta.SerdeConfig;
 pub const Diagnostic = diagnostic_impl.Diagnostic;
 pub const DiagnosticLocation = diagnostic_impl.Location;
 pub const DiagnosticPathSegment = diagnostic_impl.PathSegment;
+pub const DiagnosticDetail = diagnostic_impl.Detail;
+pub const DiagnosticKind = diagnostic_impl.Kind;
 
 /// Reflection over schema types, for generators; see `reflect.zig`.
 pub const reflect = @import("reflect.zig");
@@ -606,7 +608,7 @@ test "parseSliceWithDiagnostics captures json path and location" {
     try diagnostic.format(&out.writer, captured_err);
 
     try std.testing.expectEqualStrings(
-        "InvalidNumber at root.crew[0].bounty (offset 19, line 1, column 20)",
+        "InvalidNumber at root.crew[0].bounty (offset 19, line 1, column 20): expected integer, found string",
         out.written(),
     );
 }
