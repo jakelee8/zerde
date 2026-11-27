@@ -11,6 +11,5 @@
 
 ## Open
 
-1. **bson large parse.** Settling it needs runs pinned to one core, alternating order, for example `taskset -c 3 zig build bench-bson -Doptimize=ReleaseFast` three times on each tree. One run takes about 16 minutes, mostly the `zig-bson` rows. The hot-path candidate is `typed.readIntOf` (`anyerror!T`), which replaces the inline int read. Add a `bench/BSON.md` entry only if a change moves the benchmark.
+1. **bson large parse.** Deferred by the user to a later session. In round 3, `zig-bson` held level (1.344 against 1.346 s) while zerde was 7% slower (70.9 against 76.1 ms). The candidate is `typed.readIntOf` (`anyerror!T`), which replaces the inline int read; large BSON carries many integer fields. Recommended method: measure that read against the inline one directly rather than more full rounds. A full pinned run, `taskset -c 3 zig build bench-bson -Doptimize=ReleaseFast`, takes about 16 minutes, mostly the `zig-bson` rows. Add a `bench/BSON.md` entry only if a change moves the benchmark.
 2. The big-endian branch of `vectorStep` in `src/bulk.zig` compiles for `s390x-linux-gnu` but has not run. The user chose not to run it under qemu.
-3. Downstream code that refuses an unsorted `SortedMap` in every mode, and downstream helpers that detect repeated JSON keys, can now change. A downstream prototype can now use the wire fixes and `Diagnostic.detail`.
