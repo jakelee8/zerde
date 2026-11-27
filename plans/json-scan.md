@@ -75,10 +75,12 @@ vendor is not consulted: the compiler fixes the width from the target CPU.
 - Candidate 1 (inference): in the parser the next read waits on where the string ended, so the latency of the scan, not
   its throughput, sets the cost. No published Zen 5 latency figure for a split 64-byte load was found.
 - Candidate 2: code size and layout. Inlining alone moves the parse by 13% (F6: 124.2 against 109.7 ms), more than the
-  whole width effect. A wider scan also inlines a larger body at each call site. The two-stage scan adds direct evidence:
-  on the `code 1` text (`tests/typed_tests.zig`, 493,090 bytes) it runs the same 64-byte loop after 64 bytes of 32-byte steps, but out of line, and the
-  row is 0.90 to 0.92 of the inlined loop (`bench/BULK.md`, `2026-11-25 - 4542079`). No per-string latency is involved
-  there.
+  whole width effect. A wider scan also inlines a larger body at each call site. The two-stage scan is consistent with
+  this but does not isolate it: on the `code 1` text (`tests/typed_tests.zig` at `aaaf864` and `4542079`, 493,062
+  bytes) the `find special` row, two 32-byte steps and then the 64-byte loop out of line, is 0.90 to 0.92 of the inlined
+  64-byte loop (`bench/BULK.md`, `2026-11-25 - 4542079`). That row changes the first steps and the inlining together,
+  and it chains each scan's start off the previous result over short runs between quotes, backslashes and line ends, so
+  per-string latency is in it too. F6 is the measurement that separates inlining.
 - The sizes do not match. The parse gap is about 9 ms over 7.57 million strings, about 1.2 ns per string. The
   microbenchmarks give 0.05 ns (independent) and 0.3 to 0.7 ns (chained). Neither candidate is established.
 
